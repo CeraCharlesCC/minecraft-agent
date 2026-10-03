@@ -56,4 +56,9 @@ describe("output responses", () => {
     expect(formatDefaultText("plain")).toBe("plain");
     expect(formatDefaultText({ nested: true })).toBe(JSON.stringify({ nested: true }, null, 2));
   });
+  it("preserves typed runtime details in machine-readable failures", () => {
+    const details = { trackId: "runtime:p1", worldEpoch: 3 };
+    expect(failure(new CliError("TRACK_LOST", "lost", "observe", 1, details))).toMatchObject({ ok:false, error: {code:"TRACK_LOST", details} });
+  });
+
 });

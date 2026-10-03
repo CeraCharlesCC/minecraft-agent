@@ -52,6 +52,41 @@ function makeProgram(version = "0.0.0") {
 }
 
 describe("CLI protocol", () => {
+
+  it("parses frame projection, scoped deltas, tracked actions, and sample rates", async () => {
+    const { program, handlers } = makeProgram();
+    await program.parseAsync(["node", "mc-agent", "observe", "frame", "--since", "r7:f2", "--track", "r7:p1,r7:e2", "--track", "r7:e3", "--max-entities", "100", "--radius", "40"]);
+    expect(handlers.observeFrame).toHaveBeenCalledWith({ session: "default", since: "r7:f2", maxEntities: 100, radius: 40, tracks: ["r7:p1", "r7:e2", "r7:e3"] });
+    await program.parseAsync(["node", "mc-agent", "observe", "watch", "--track", "r7:p1", "--fields", "position,velocity", "--rate", "3"]);
+    expect(handlers.observeWatch).toHaveBeenCalledWith({ session: "default", since: 0, types: [], track: "r7:p1", fields: ["position", "velocity"], rate: 3 });
+    await program.parseAsync(["node", "mc-agent", "look", "track", "--track", "r7:p1", "--runtime", "r7", "--world-epoch", "2"]);
+    expect(handlers.lookTrack).toHaveBeenCalledWith({ session: "default", track: "r7:p1", runtimeId: "r7", worldEpoch: 2 });
+    await program.parseAsync(["node", "mc-agent", "action", "status", "--action", "r7:a1"]);
+    expect(handlers.actionStatus).toHaveBeenCalledWith({ session: "default", action: "r7:a1" });
+    await program.parseAsync(["node", "mc-agent", "action", "cancel", "--action", "r7:a1", "--runtime", "r7", "--world-epoch", "2"]);
+    expect(handlers.actionCancel).toHaveBeenCalledWith({ session: "default", action: "r7:a1", runtimeId: "r7", worldEpoch: 2 });
+  });
+
+  it.each([
+    ["observe", "events", "--since", "42"],
+    ["control", "set", "--state", "forward", "--runtime", "r7", "--world-epoch", "-1"],
+    ["navigate", "configure", "--runtime", "r7", "--world-epoch", "-1"],
+    ["observe", "frame", "--max-entities", "201"],
+    ["observe", "watch", "--track", "r7:p1", "--rate", "11"],
+    ["observe", "watch", "--rate", "2"],
+    ["observe", "watch", "--track", "r7:p1", "--fields", "raw"],
+    ["observe", "watch", "--track", "r7:p1", "--since", "r7:s3"],
+  ])("rejects unsafe observation inputs %j", async (...args) => {
+    const { program } = makeProgram();
+    await expect(program.parseAsync(["node", "mc-agent", ...args])).rejects.toMatchObject({ code: "BAD_INPUT" });
+  });
+
+  it("forwards observation context on ordinary coordinate actions", async () => {
+    const { program, handlers } = makeProgram();
+    await program.parseAsync(["node", "mc-agent", "world", "dig", "--x", "1", "--y", "2", "--z", "3", "--runtime", "r7", "--world-epoch", "4"]);
+    expect(handlers.worldDig).toHaveBeenCalledWith({ session: "default", x: 1, y: 2, z: 3, runtimeId: "r7", worldEpoch: 4 });
+  });
+
   it("parses session start defaults and writes JSON success", async () => {
     const { program, handlers, stdout } = makeProgram();
     vi.spyOn(handlers, "startSession").mockResolvedValue({ session: "default" });
@@ -108,7 +143,7 @@ describe("CLI protocol", () => {
   it("exposes all planned top-level command groups", () => {
     const { program } = makeProgram();
     const names = program.commands.map((command) => command.name());
-    expect(names).toEqual(["session", "observe", "chat", "bot", "control", "look", "navigate", "collect", "inventory", "world", "window", "entity", "skills", "daemon"]);
+    expect(names).toEqual(["session", "observe", "chat", "bot", "control", "look", "navigate", "collect", "inventory", "world", "window", "entity", "action", "debug", "skills", "daemon"]);
   });
 
   it("prints bundled skill content directly", async () => {
@@ -117,8 +152,8 @@ describe("CLI protocol", () => {
     await program.parseAsync(["node", "mc-agent", "skills", "get", "core"]);
 
     expect(stdout.value).toContain("# mc-agent core");
-    expect(stdout.value).toContain("The observe-decide-act loop");
-    expect(stdout.value).toContain("Waiting and refreshing");
+    expect(stdout.value).toContain("## Operating loop");
+    expect(stdout.value).toContain("keep the returned `nextCursor`");
   });
 
   it("writes structured errors for streaming and raw-output commands", async () => {
@@ -169,11 +204,10 @@ describe("CLI protocol", () => {
       "--max-drop-down",
       "8",
       "--search-radius",
-      "64",
-    ]);
+      "64", "--runtime", "r7", "--world-epoch", "1"]);
 
     expect(handlers.navigateConfigure).toHaveBeenCalledWith({
-      session: "s",
+      session: "s", runtimeId: "r7", worldEpoch: 1,
       allowDig: false,
       allowSprinting: false,
       allowParkour: false,
@@ -215,23 +249,23 @@ describe("CLI protocol", () => {
     await program.parseAsync(["node", "mc-agent", "session", "status", "--session", "s"]);
     await program.parseAsync(["node", "mc-agent", "session", "list"]);
     await program.parseAsync(["node", "mc-agent", "session", "stop", "--session", "s"]);
-    await program.parseAsync(["node", "mc-agent", "observe", "events", "--session", "s", "--since", "2", "--limit", "3"]);
-    await program.parseAsync(["node", "mc-agent", "observe", "watch", "--session", "s", "--since", "4"]);
+    await program.parseAsync(["node", "mc-agent", "observe", "events", "--session", "s", "--since", "r7:s2", "--limit", "3"]);
+    await program.parseAsync(["node", "mc-agent", "observe", "watch", "--session", "s", "--since", "r7:s4"]);
     await program.parseAsync(["node", "mc-agent", "chat", "send", "--session", "s", "--message", "/say hi", "--allow-command"]);
     await program.parseAsync(["node", "mc-agent", "bot", "position", "--session", "s"]);
     await program.parseAsync(["node", "mc-agent", "bot", "inventory", "--session", "s"]);
     await program.parseAsync(["node", "mc-agent", "bot", "players", "--session", "s"]);
     await program.parseAsync(["node", "mc-agent", "bot", "entities", "--session", "s", "--radius", "16", "--limit", "4"]);
-    await program.parseAsync(["node", "mc-agent", "control", "tap", "--session", "s", "--state", "jump", "--duration-ms", "25"]);
-    await program.parseAsync(["node", "mc-agent", "look", "at", "--session", "s", "--x", "1", "--y", "2", "--z", "3"]);
+    await program.parseAsync(["node", "mc-agent", "control", "tap", "--session", "s", "--state", "jump", "--duration-ms", "25", "--runtime", "r7", "--world-epoch", "1"]);
+    await program.parseAsync(["node", "mc-agent", "look", "at", "--session", "s", "--x", "1", "--y", "2", "--z", "3", "--runtime", "r7", "--world-epoch", "1"]);
     await program.parseAsync(["node", "mc-agent", "world", "block", "--session", "s", "--x", "4", "--y", "5", "--z", "6"]);
     await program.parseAsync(["node", "mc-agent", "world", "find-blocks", "--session", "s", "--name", "farmland", "--radius", "12", "--count", "3"]);
-    await program.parseAsync(["node", "mc-agent", "navigate", "goto", "--session", "s", "--x", "7", "--y", "8", "--z", "9", "--range", "2"]);
-    await program.parseAsync(["node", "mc-agent", "navigate", "follow", "--session", "s", "--player", "Steve", "--range", "3"]);
-    await program.parseAsync(["node", "mc-agent", "navigate", "stop", "--session", "s"]);
+    await program.parseAsync(["node", "mc-agent", "navigate", "goto", "--session", "s", "--x", "7", "--y", "8", "--z", "9", "--range", "2", "--runtime", "r7", "--world-epoch", "1"]);
+    await program.parseAsync(["node", "mc-agent", "navigate", "follow", "--session", "s", "--track", "r7:p1", "--range", "3", "--runtime", "r7", "--world-epoch", "1"]);
+    await program.parseAsync(["node", "mc-agent", "navigate", "stop", "--session", "s", "--runtime", "r7", "--world-epoch", "1"]);
     await program.parseAsync(["node", "mc-agent", "navigate", "status", "--session", "s"]);
-    await program.parseAsync(["node", "mc-agent", "inventory", "equip", "--session", "s", "--item", "dirt", "--destination", "hand"]);
-    await program.parseAsync(["node", "mc-agent", "world", "dig", "--session", "s", "--x", "10", "--y", "11", "--z", "12"]);
+    await program.parseAsync(["node", "mc-agent", "inventory", "equip", "--session", "s", "--item", "dirt", "--destination", "hand", "--runtime", "r7", "--world-epoch", "1"]);
+    await program.parseAsync(["node", "mc-agent", "world", "dig", "--session", "s", "--x", "10", "--y", "11", "--z", "12", "--runtime", "r7", "--world-epoch", "1"]);
     await program.parseAsync([
       "node",
       "mc-agent",
@@ -248,35 +282,34 @@ describe("CLI protocol", () => {
       "--face",
       "east",
       "--item",
-      "dirt",
-    ]);
-    await program.parseAsync(["node", "mc-agent", "world", "activate", "--session", "s", "--x", "16", "--y", "17", "--z", "18"]);
-    await program.parseAsync(["node", "mc-agent", "window", "click", "--session", "s", "--slot", "5", "--mouse-button", "1", "--mode", "0"]);
+      "dirt", "--runtime", "r7", "--world-epoch", "1"]);
+    await program.parseAsync(["node", "mc-agent", "world", "activate", "--session", "s", "--x", "16", "--y", "17", "--z", "18", "--runtime", "r7", "--world-epoch", "1"]);
+    await program.parseAsync(["node", "mc-agent", "window", "click", "--session", "s", "--slot", "5", "--mouse-button", "1", "--mode", "0", "--runtime", "r7", "--world-epoch", "1"]);
     await program.parseAsync(["node", "mc-agent", "daemon", "run", "--control-port", "4567"]);
 
     expect(handlers.sessionStatus).toHaveBeenCalledWith({ session: "s" });
     expect(handlers.listSessions).toHaveBeenCalledWith();
     expect(handlers.stopSession).toHaveBeenCalledWith({ session: "s" });
-    expect(handlers.observeEvents).toHaveBeenCalledWith({ session: "s", since: 2, limit: 3, types: [] });
-    expect(handlers.observeWatch).toHaveBeenCalledWith({ session: "s", since: 4, types: [] });
+    expect(handlers.observeEvents).toHaveBeenCalledWith({ session: "s", since: "r7:s2", limit: 3, types: [] });
+    expect(handlers.observeWatch).toHaveBeenCalledWith({ session: "s", since: "r7:s4", types: [] });
     expect(handlers.sendChat).toHaveBeenCalledWith({ session: "s", message: "/say hi", allowCommand: true });
     expect(handlers.botPosition).toHaveBeenCalledWith({ session: "s" });
     expect(handlers.botInventory).toHaveBeenCalledWith({ session: "s" });
     expect(handlers.botPlayers).toHaveBeenCalledWith({ session: "s" });
     expect(handlers.botEntities).toHaveBeenCalledWith({ session: "s", radius: 16, limit: 4 });
-    expect(handlers.controlTap).toHaveBeenCalledWith({ session: "s", state: "jump", durationMs: 25 });
-    expect(handlers.lookAt).toHaveBeenCalledWith({ session: "s", x: 1, y: 2, z: 3 });
+    expect(handlers.controlTap).toHaveBeenCalledWith({ session: "s", runtimeId: "r7", worldEpoch: 1, state: "jump", durationMs: 25 });
+    expect(handlers.lookAt).toHaveBeenCalledWith({ session: "s", runtimeId: "r7", worldEpoch: 1, x: 1, y: 2, z: 3 });
     expect(handlers.worldBlock).toHaveBeenCalledWith({ session: "s", x: 4, y: 5, z: 6 });
     expect(handlers.worldFindBlocks).toHaveBeenCalledWith({ session: "s", name: "farmland", radius: 12, count: 3 });
-    expect(handlers.navigateGoto).toHaveBeenCalledWith({ session: "s", x: 7, y: 8, z: 9, range: 2 });
-    expect(handlers.navigateFollow).toHaveBeenCalledWith({ session: "s", player: "Steve", range: 3 });
-    expect(handlers.navigateStop).toHaveBeenCalledWith({ session: "s" });
+    expect(handlers.navigateGoto).toHaveBeenCalledWith({ session: "s", runtimeId: "r7", worldEpoch: 1, x: 7, y: 8, z: 9, range: 2 });
+    expect(handlers.navigateFollow).toHaveBeenCalledWith({ session: "s", runtimeId: "r7", worldEpoch: 1, track: "r7:p1", range: 3 });
+    expect(handlers.navigateStop).toHaveBeenCalledWith({ session: "s", runtimeId: "r7", worldEpoch: 1 });
     expect(handlers.navigateStatus).toHaveBeenCalledWith({ session: "s" });
-    expect(handlers.inventoryEquip).toHaveBeenCalledWith({ session: "s", item: "dirt", destination: "hand" });
-    expect(handlers.worldDig).toHaveBeenCalledWith({ session: "s", x: 10, y: 11, z: 12 });
-    expect(handlers.worldPlace).toHaveBeenCalledWith({ session: "s", x: 13, y: 14, z: 15, face: "east", item: "dirt" });
-    expect(handlers.worldActivate).toHaveBeenCalledWith({ session: "s", x: 16, y: 17, z: 18 });
-    expect(handlers.windowClick).toHaveBeenCalledWith({ session: "s", slot: 5, mouseButton: 1, mode: 0 });
+    expect(handlers.inventoryEquip).toHaveBeenCalledWith({ session: "s", runtimeId: "r7", worldEpoch: 1, item: "dirt", destination: "hand" });
+    expect(handlers.worldDig).toHaveBeenCalledWith({ session: "s", runtimeId: "r7", worldEpoch: 1, x: 10, y: 11, z: 12 });
+    expect(handlers.worldPlace).toHaveBeenCalledWith({ session: "s", runtimeId: "r7", worldEpoch: 1, x: 13, y: 14, z: 15, face: "east", item: "dirt" });
+    expect(handlers.worldActivate).toHaveBeenCalledWith({ session: "s", runtimeId: "r7", worldEpoch: 1, x: 16, y: 17, z: 18 });
+    expect(handlers.windowClick).toHaveBeenCalledWith({ session: "s", runtimeId: "r7", worldEpoch: 1, slot: 5, mouseButton: 1, mode: 0 });
     expect(handlers.daemonRun).toHaveBeenCalledWith({
       session: "default",
       host: "localhost",
@@ -298,22 +331,22 @@ describe("CLI protocol", () => {
       "observe",
       "events",
       "--type",
-      "chat,whisper",
+      "chat.player,chat.whisper",
       "--type",
-      "message",
+      "server.message",
     ]);
-    await program.parseAsync(["node", "mc-agent", "observe", "watch", "--type", "chat"]);
+    await program.parseAsync(["node", "mc-agent", "observe", "watch", "--type", "chat.player"]);
 
     expect(handlers.observeEvents).toHaveBeenCalledWith({
       session: "default",
       since: 0,
       limit: 50,
-      types: ["chat", "whisper", "message"],
+      types: ["chat.player", "chat.whisper", "server.message"],
     });
     expect(handlers.observeWatch).toHaveBeenCalledWith({
       session: "default",
       since: 0,
-      types: ["chat"],
+      types: ["chat.player"],
     });
   });
 

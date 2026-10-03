@@ -14,6 +14,7 @@ export interface ApiFailure {
     code: string;
     message: string;
     remediation: string;
+    details?: Record<string, unknown>;
   };
 }
 
@@ -30,6 +31,7 @@ export function failure(error: CliError): ApiFailure {
       code: error.code,
       message: error.message,
       remediation: error.remediation,
+      ...(error.details ? { details: error.details } : {}),
     },
   };
 }

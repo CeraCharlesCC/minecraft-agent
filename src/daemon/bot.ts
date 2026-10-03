@@ -1,8 +1,13 @@
 import { EventEmitter } from "node:events";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createBot } from "mineflayer";
 import pathfinderPackage from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import { EventStore } from "../core/events.js";
+import { WorldModel, FrameOptions } from "../core/world.js";
+import { CanonicalChat } from "../core/chat.js";
+import { ActionManager, ActionResource } from "../core/actions.js";
+import { CliError, commandBlocked } from "../output/errors.js";
 
 const { goals, Movements, pathfinder } = pathfinderPackage;
 
@@ -18,6 +23,7 @@ export interface BotOptions {
 }
 
 type MineflayerBot = EventEmitter & {
+  _client?: { write(name: string, params: unknown): unknown };
   username?: string;
   entity?: { position?: { x: number; y: number; z: number } };
   entities?: Record<string, MineflayerEntity>;
@@ -122,7 +128,7 @@ type MineflayerBlock = {
   position: Vec3;
   getProperties?(): Record<string, unknown>;
 };
-type MineflayerEntity = { id?: number; username?: string; name?: string; type?: string; position?: { x: number; y: number; z: number } };
+type MineflayerEntity = { uuid?: string; velocity?: { x: number; y: number; z: number }; id?: number; username?: string; name?: string; type?: string; position?: { x: number; y: number; z: number } };
 type MineflayerWindow = {
   id?: number;
   type?: string;
@@ -298,13 +304,26 @@ export class BotController {
   private spawned = false;
   private lastError?: string;
   private readonly controlState: Record<string, boolean> = {};
+  readonly world: WorldModel;
+  readonly actions: ActionManager;
+  private chatReceiver?: CanonicalChat;
+  private lookTracking?: { track: string; action: string };
+  private lookBusy = false;
+  private lifecycleReset = false;
+  private readonly execution = new AsyncLocalStorage<{ action: string; worldEpoch: number; target?: string; binding?: unknown }>();
+  private readonly pendingWindowListeners = new Set<() => void>();
   private readonly navigationMovementConfig: NavigationMovementConfig = {};
 
   constructor(
     private readonly options: BotOptions,
     private readonly events: EventStore,
     private readonly createBotFn: CreateBotFn = createBot as unknown as CreateBotFn,
-  ) {}
+  ) {
+    this.world = new WorldModel(events);
+    this.actions = new ActionManager(events);
+    this.world.onTrackLost = (track) => this.actions.failTarget(track);
+    this.world.onWorldReset = (reason) => this.invalidateWorld(reason);
+  }
 
   start(): void {
     this.bot = this.createBotFn({
@@ -316,107 +335,88 @@ export class BotController {
     });
     this.bot.loadPlugin?.(pathfinder as unknown as (bot: unknown) => void);
     this.configurePathfinderMovements();
+    this.guardActionPackets();
+    // Mineflayer's block/entity operations await lookAt before sending packets.
+    // Guard that continuation so replacement, target loss, or reset cannot send
+    // the operation after its owner has already terminated.
+    const originalLookAt = this.bot.lookAt.bind(this.bot);
+    this.bot.lookAt = (position) => {
+      const verify = this.continuationGuard(["look"]);
+      const result = originalLookAt(position);
+      if (result && typeof result.then === "function") return result.then(() => { verify(); });
+      verify();
+    };
+    // Some Mineflayer container adapters launch activation without awaiting it.
+    // Observe rejection on that promise as well as returning it to direct callers.
+    for (const name of ["activateBlock", "activateEntity"] as const) {
+      const original = this.bot[name];
+      if (!original) continue;
+      (this.bot as any)[name] = (...args: unknown[]) => {
+        const action = this.execution.getStore()?.action;
+        const result = (original as Function).apply(this.bot, args);
+        Promise.resolve(result).catch((error) => { if (action) this.actions.fail(action, error); });
+        return result;
+      };
+    }
 
     this.bot.on("login", () => {
       this.connected = true;
       this.spawned = false;
-      this.events.add({ type: "login", text: "Bot logged in." });
+      this.events.add({ type: "connection.login", text: "Bot logged in." });
     });
     this.bot.on("spawn", () => {
+      if (this.spawned) this.world.reset("RESPAWN");
       this.connected = true;
       this.spawned = true;
-      this.events.add({ type: "spawn", text: "Bot spawned." });
+      this.lifecycleReset = false;
+      this.events.add({ type: "connection.ready", text: "Bot spawned." });
+      this.reconcile();
     });
-    this.bot.on("end", (reason) => {
+    const disconnected = (reason: string) => {
       this.connected = false;
       this.spawned = false;
-      this.events.add({ type: "end", text: String(reason ?? "Connection ended."), raw: reason });
-    });
-    this.bot.on("kicked", (reason) => {
-      this.connected = false;
-      this.spawned = false;
-      this.events.add({ type: "kicked", text: String(reason), raw: reason });
-    });
+      if (!this.lifecycleReset) this.world.reset(reason);
+      this.lifecycleReset = true;
+      this.events.add({ type: "connection.disconnected", reason });
+    };
+    this.bot.on("end", (reason) => disconnected(String(reason ?? "DISCONNECTED")));
+    this.bot.on("kicked", (reason) => disconnected(`KICKED: ${String(reason)}`));
     this.bot.on("error", (error) => {
       this.lastError = error instanceof Error ? error.message : String(error);
-      this.events.add({ type: "error", text: this.lastError, raw: this.lastError });
+      this.events.add({ type: "connection.error", text: this.lastError });
     });
     this.bot.on("death", () => {
       this.spawned = false;
-      this.events.add({ type: "death", text: "Bot died." });
+      this.world.reset("DEATH");
+      this.lifecycleReset = true;
+      this.events.add({ type: "self.died" });
     });
-    this.bot.on("health", () => {
-      this.events.add({ type: "health", text: "Bot health changed.", raw: { health: this.bot?.health, food: this.bot?.food, foodSaturation: this.bot?.foodSaturation } });
+    this.bot.on("respawn", () => {
+      if (!this.lifecycleReset) this.world.reset("RESPAWN");
+      this.spawned = false;
+      this.lifecycleReset = true;
     });
-    this.bot.on("breath", () => {
-      this.events.add({ type: "breath", text: "Bot oxygen changed.", raw: { oxygenLevel: this.bot?.oxygenLevel } });
-    });
-    this.bot.on("experience", () => {
-      this.events.add({ type: "experience", text: "Bot experience changed.", raw: safePlain(this.bot?.experience) });
-    });
-    this.bot.on("rain", () => {
-      this.events.add({ type: "rain", text: "Weather changed.", raw: { isRaining: this.bot?.isRaining, thunderState: this.bot?.thunderState } });
-    });
-    this.bot.on("time", () => {
-      this.events.add({ type: "time", text: "World time changed.", raw: safePlain(this.bot?.time) });
-    });
-    this.bot.on("heldItemChanged", (item) => {
-      this.events.add({ type: "heldItemChanged", text: "Held item changed.", raw: safePlain(item) });
-    });
-    this.bot.on("entitySpawn", (entity) => {
-      this.events.add({ type: "entitySpawn", text: "Entity spawned.", raw: serializeEntity(entity, this.bot?.entity?.position) });
-    });
-    this.bot.on("entityGone", (entity) => {
-      this.events.add({ type: "entityGone", text: "Entity left view.", raw: serializeEntity(entity, this.bot?.entity?.position) });
-    });
-    this.bot.on("entityMoved", (entity) => {
-      this.events.add({ type: "entityMoved", text: "Entity moved.", raw: serializeEntity(entity, this.bot?.entity?.position) });
-    });
-    this.bot.on("itemDrop", (entity) => {
-      this.events.add({ type: "itemDrop", text: "Item dropped.", raw: serializeEntity(entity, this.bot?.entity?.position) });
-    });
-    this.bot.on("playerCollect", (collector, collected) => {
-      this.events.add({
-        type: "playerCollect",
-        text: "Entity collected item.",
-        raw: { collector: serializeEntity(collector, this.bot?.entity?.position), collected: serializeEntity(collected, this.bot?.entity?.position) },
+    // Routine changes update state without filling the retained semantic log.
+    for (const name of ["health", "breath", "experience", "rain", "time", "heldItemChanged",
+      "entitySpawn", "entityMoved", "entityUpdate", "move", "playerJoined", "playerLeft",
+      "windowOpen", "windowClose"]) this.bot.on(name, () => {
+        this.reconcile();
+        this.updateLookTracking();
       });
-    });
-    this.bot.on("blockUpdate", (oldBlock, newBlock) => {
-      this.events.add({ type: "blockUpdate", text: "Block updated.", raw: { oldBlock: serializeBlock(oldBlock), newBlock: serializeBlock(newBlock) } });
-    });
-    this.bot.on("windowOpen", (window) => {
-      this.events.add({ type: "windowOpen", text: "Window opened.", raw: serializeWindow(window) });
-    });
-    this.bot.on("windowClose", (window) => {
-      this.events.add({ type: "windowClose", text: "Window closed.", raw: serializeWindow(window) });
-    });
-    this.bot.on("scoreboardCreated", (scoreboard) => {
-      this.events.add({ type: "scoreboardCreated", text: "Scoreboard created.", raw: safePlain(scoreboard) });
-    });
-    this.bot.on("scoreUpdated", (scoreboard, item) => {
-      this.events.add({ type: "scoreUpdated", text: "Score updated.", raw: { scoreboard: safePlain(scoreboard), item } });
-    });
-    this.bot.on("teamCreated", (team) => {
-      this.events.add({ type: "teamCreated", text: "Team created.", raw: safePlain(team) });
-    });
-    this.bot.on("teamUpdated", (team) => {
-      this.events.add({ type: "teamUpdated", text: "Team updated.", raw: safePlain(team) });
-    });
-    this.bot.on("chat", (sender, text, translate, jsonMsg) => {
-      this.events.add({ type: "chat", sender: String(sender), text: String(text), raw: { translate: safePlain(translate), jsonMsg: safePlain(jsonMsg) } });
-    });
-    this.bot.on("whisper", (sender, text, translate, jsonMsg) => {
-      this.events.add({ type: "whisper", sender: String(sender), text: String(text), raw: { translate: safePlain(translate), jsonMsg: safePlain(jsonMsg) } });
-    });
-    this.bot.on("message", (jsonMsg, position, sender) => {
-      const text = typeof jsonMsg?.toString === "function" ? jsonMsg.toString() : String(jsonMsg);
-      this.events.add({ type: "message", sender: sender ? String(sender) : undefined, text, raw: { jsonMsg: safePlain(jsonMsg), position: safePlain(position) } });
-    });
+    this.bot.prependListener("physicsTick", () => { this.reconcile(); this.updateLookTracking(); });
+    this.bot.on("entityGone", (entity) => this.world.invalidate(entity, "lost"));
+    this.bot.on("entityDead", (entity) => this.world.invalidate(entity, "dead"));
+    this.chatReceiver = new CanonicalChat(this.events, (sender, uuid) => this.world.playerIdentity(sender, uuid));
+    this.chatReceiver.attach(this.bot);
   }
 
   status() {
+    this.flushChat();
     return {
+      apiVersion: 2,
+      runtimeId: this.world.runtimeId,
+      worldEpoch: this.world.worldEpoch,
+      eventCursor: this.events.getCursor(),
       connected: this.connected,
       spawned: this.spawned,
       username: this.bot?.username ?? this.options.username,
@@ -442,11 +442,175 @@ export class BotController {
     };
   }
 
-  sendChat(message: string): void {
+  frame(options: FrameOptions = {}) {
+    this.flushChat();
+    return this.world.frame(this.requireBot(), this.observationContext(), options);
+  }
+
+  flushChat() { this.chatReceiver?.flush(); }
+
+  sample(track: string, fields: string[]) {
+    this.reconcile();
+    const entity = this.world.resolveTrack(track) as MineflayerEntity;
+    const values: Record<string, unknown> = {};
+    if (fields.includes("position")) values.position = serializePosition(entity.position);
+    if (fields.includes("velocity")) values.velocity = serializePosition(entity.velocity);
+    if (fields.includes("status")) values.status = "loaded";
+    return { type: "track.sample", runtimeId: this.world.runtimeId, worldEpoch: this.world.worldEpoch,
+      trackId: track, observedAt: new Date().toISOString(), values };
+  }
+
+  validateContext(input: { runtimeId?: unknown; worldEpoch?: unknown }, requireReady = true) {
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      throw new CliError("BAD_INPUT", "Action body must be an object.", "Send runtimeId and worldEpoch from a frame.", 3);
+    }
+    this.reconcile();
+    if (typeof input.runtimeId !== "string" || !Number.isSafeInteger(input.worldEpoch)) {
+      throw new CliError("BAD_INPUT", "Actions require runtimeId and worldEpoch from a frame.",
+        "Observe a frame and pass --runtime and --world-epoch.", 3);
+    }
+    if (input.runtimeId !== undefined && input.runtimeId !== this.world.runtimeId) {
+      throw new CliError("RUNTIME_MISMATCH", "Action belongs to another runtime.", "Observe a fresh frame.", 1,
+        { runtimeId: this.world.runtimeId, expectedRuntimeId: input.runtimeId });
+    }
+    if (input.worldEpoch !== undefined && input.worldEpoch !== this.world.worldEpoch) {
+      throw new CliError("WORLD_CHANGED", "World context has changed.", "Observe a fresh frame.", 1,
+        { worldEpoch: this.world.worldEpoch, expectedWorldEpoch: input.worldEpoch });
+    }
+    if (requireReady && (!this.connected || !this.spawned)) {
+      throw new CliError("NOT_READY", "Bot has no ready world context.", "Wait for connection readiness in a frame.");
+    }
+  }
+
+  runAction(kind: string, resources: ActionResource[], run: () => unknown | Promise<unknown>,
+    target?: string, continuous = false) {
+    if (target) this.getRequiredEntity(target);
+    const expected = { runtimeId: this.world.runtimeId, worldEpoch: this.world.worldEpoch };
+    return this.actions.start(kind, expected.worldEpoch, resources, {
+      target, continuous, run: () => {
+        this.validateContext(expected);
+        const binding = target ? this.getRequiredEntity(target) : undefined;
+        const action = this.actions.owner(resources[0]);
+        return action ? this.execution.run({ action, worldEpoch: expected.worldEpoch, target, binding }, run) : run();
+      },
+      stop: () => this.stopResources(resources),
+    });
+  }
+
+  followTrack(track: string, range: number) {
+    this.getRequiredEntity(track);
+    return this.runAction("navigate.follow", ["movement", "look"], () => {
+      this.configurePathfinderMovements();
+      const target = this.getRequiredEntity(track);
+      this.requirePathfinder().setGoal(new goals.GoalFollow(target as never, range), true);
+      return { range };
+    }, track, true);
+  }
+
+  trackLook(track: string) {
+    this.getRequiredEntity(track);
+    const action = this.runAction("look.track", ["look"], () => undefined, track, true);
+    this.lookTracking = { track, action: action.action };
+    this.updateLookTracking();
+    return action;
+  }
+
+  private observationContext() {
+    return { connected: this.connected, spawned: this.spawned,
+      controls: { ...this.bot?.controlState, ...this.controlState }, actions: this.actions.list(), getActions: () => this.actions.list(),
+      getControls: () => ({ ...this.bot?.controlState, ...this.controlState }),
+      getReadiness: () => ({ connected: this.connected, spawned: this.spawned }) };
+  }
+
+  private reconcile() {
+    if (this.bot) this.world.reconcile(this.bot, this.observationContext());
+  }
+
+  private invalidateWorld(reason: string) {
+    if (reason === "dimension_changed") this.spawned = false;
+    this.actions.failAll(reason);
+    this.stopResources(["movement", "look", "item", "window"]);
+    if (this.bot) {
+      this.bot.entities = {};
+      for (const player of Object.values(this.bot.players ?? {})) player.entity = undefined;
+      this.bot.currentWindow = null;
+    }
+  }
+
+  private stopResources(resources: ActionResource[]) {
+    this.execution.exit(() => this.clearResources(resources));
+  }
+
+  private clearResources(resources: ActionResource[]) {
+    if (resources.includes("movement")) {
+      this.bot?.pathfinder?.setGoal(null);
+      this.bot?.pathfinder?.stop();
+      this.bot?.clearControlStates?.();
+      for (const key of Object.keys(this.controlState)) delete this.controlState[key];
+    }
+    if (resources.includes("look")) this.lookTracking = undefined;
+    if (resources.includes("item")) {
+      this.bot?.stopDigging?.();
+      this.bot?.deactivateItem?.();
+    }
+    if (resources.includes("window")) {
+      for (const cleanup of this.pendingWindowListeners) cleanup();
+      this.pendingWindowListeners.clear();
+      const window = this.bot?.currentWindow;
+      if (window?.close) window.close();
+      else if (window) this.bot?.closeWindow?.(window);
+    }
+  }
+
+  private guardActionPackets() {
+    const client = this.bot?._client;
+    if (!client) return;
+    const write = client.write.bind(client);
+    const mutations = new Set(["use_entity", "block_place", "block_dig", "window_click", "held_item_slot",
+      "arm_animation", "entity_action", "use_item", "vehicle_move", "steer_vehicle", "update_sign", "close_window"]);
+    client.write = (name, params) => {
+      const context = this.execution.getStore();
+      if (context && mutations.has(name)) {
+        // AsyncLocalStorage follows Mineflayer's internal promises and timers.
+        // Already-sent operations remain server-owned, but a stale continuation
+        // may not send the next operation after cancellation or rebinding.
+        try {
+          this.reconcile();
+          if (this.actions.get(context.action).state !== "running") return;
+          if (context.worldEpoch !== this.world.worldEpoch) {
+            this.actions.fail(context.action, new CliError("WORLD_CHANGED", "World changed before packet submission.", "Observe a fresh frame."));
+            return;
+          }
+          if (context.target && this.world.resolveTrack(context.target) !== context.binding) {
+            this.actions.fail(context.action, new CliError("TRACK_LOST", "Target binding changed before packet submission.", "Observe a fresh frame."));
+            return;
+          }
+        } catch (error) { this.actions.fail(context.action, error); return; }
+      }
+      return write(name, params);
+    };
+  }
+
+  private updateLookTracking() {
+    const tracking = this.lookTracking;
+    if (!tracking || this.lookBusy) return;
+    try {
+      const entity = this.world.resolveTrack(tracking.track) as MineflayerEntity;
+      if (!entity.position) throw new CliError("TRACK_LOST", "Target has no current position.", "Observe a fresh frame.");
+      this.lookBusy = true;
+      Promise.resolve(this.requireBot().lookAt(new Vec3(entity.position.x, entity.position.y, entity.position.z)))
+        .catch((error) => this.actions.fail(tracking.action, error))
+        .finally(() => { this.lookBusy = false; });
+    } catch (error) { this.actions.fail(tracking.action, error); }
+  }
+
+  sendChat(message: string, allowCommand = false): void {
+    if (message.startsWith("/") && !allowCommand) throw commandBlocked("Refusing to send a server command as chat.", "Pass --allow-command with explicit authorization.");
     this.requireBot().chat(message);
   }
 
   sendWhisper(username: string, message: string): void {
+    if (!/^[A-Za-z0-9_]{1,16}$/.test(username)) throw new CliError("BAD_INPUT", "Invalid whisper username.", "Use a Minecraft username.", 3);
     this.requireMethod("whisper").call(this.requireBot(), username, message);
   }
 
@@ -586,13 +750,17 @@ export class BotController {
 
   async tap(state: string, durationMs: number): Promise<void> {
     const bot = this.requireBot();
+    const owner = this.actions.owner("movement");
+    const epoch = this.world.worldEpoch;
     bot.setControlState(state, true);
     this.controlState[state] = true;
     try {
       await new Promise((resolve) => setTimeout(resolve, durationMs));
     } finally {
-      bot.setControlState(state, false);
-      this.controlState[state] = false;
+      if (epoch === this.world.worldEpoch && owner === this.actions.owner("movement")) {
+        bot.setControlState(state, false);
+        this.controlState[state] = false;
+      }
     }
   }
 
@@ -688,7 +856,7 @@ export class BotController {
     };
   }
 
-  async collectItem(id: number, range: number) {
+  async collectItem(id: number | string, range: number) {
     const entity = this.getRequiredEntity(id);
     const position = entity.position;
     if (!position) {
@@ -810,18 +978,22 @@ export class BotController {
   }
 
   async place(x: number, y: number, z: number, face: string, itemName?: string): Promise<{ placed: true; referenceBlock: ReturnType<typeof serializeBlock>; face: string }> {
+    const verify = this.continuationGuard(["item", "look"]);
     if (itemName) {
       await this.equip(itemName, "hand");
     }
+    verify();
     const block = this.getRequiredBlock(x, y, z);
     await this.requireMethod("placeBlock").call(this.requireBot(), block, faceVector(face));
     return { placed: true, referenceBlock: serializeBlock(block), face };
   }
 
   async placeEntity(x: number, y: number, z: number, face: string, itemName?: string) {
+    const verify = this.continuationGuard(["item", "look"]);
     if (itemName) {
       await this.equip(itemName, "hand");
     }
+    verify();
     const block = this.getRequiredBlock(x, y, z);
     const entity = await this.requireMethod("placeEntity").call(this.requireBot(), block, faceVector(face));
     return { placed: true, entity: serializeEntity(entity), referenceBlock: serializeBlock(block), face };
@@ -856,14 +1028,19 @@ export class BotController {
   }
 
   async openWindowAt(x: number, y: number, z: number) {
+    const verify = this.continuationGuard(["window"]);
     const block = this.getRequiredBlock(x, y, z);
-    const window = await this.requireMethod("openContainer").call(this.requireBot(), block);
+    const window = await this.openContainerObserved(block);
+    try { verify(); } catch (error) { window.close?.(); throw error; }
     return { opened: true, block: serializeBlock(block), window: serializeWindow(window) };
   }
 
-  async openEntityWindow(id: number) {
+  async openEntityWindow(id: number | string) {
+    const verify = this.continuationGuard(["window"]);
     const entity = this.getRequiredEntity(id);
-    const window = await this.requireMethod("openContainer").call(this.requireBot(), entity);
+    const window = await this.openContainerObserved(entity);
+    try { verify(); if (typeof id === "string") this.getRequiredEntity(id); }
+    catch (error) { window.close?.(); throw error; }
     return { opened: true, entity: serializeEntity(entity, this.requireBot().entity?.position), window: serializeWindow(window) };
   }
 
@@ -905,19 +1082,19 @@ export class BotController {
     return { closed: true };
   }
 
-  async activateEntity(id: number) {
+  async activateEntity(id: number | string) {
     const entity = this.getRequiredEntity(id);
     await this.requireMethod("activateEntity").call(this.requireBot(), entity);
     return { activated: true, entity: serializeEntity(entity, this.requireBot().entity?.position) };
   }
 
-  useOnEntity(id: number) {
+  useOnEntity(id: number | string) {
     const entity = this.getRequiredEntity(id);
     this.requireMethod("useOn").call(this.requireBot(), entity);
     return { usedOn: true, entity: serializeEntity(entity, this.requireBot().entity?.position) };
   }
 
-  attackEntity(id: number, options: { allowPlayers?: boolean; allowPassive?: boolean } = {}) {
+  attackEntity(id: number | string, options: { allowPlayers?: boolean; allowPassive?: boolean } = {}) {
     const entity = this.getRequiredEntity(id);
     this.assertAttackAllowed(entity, options);
     this.requireMethod("attack").call(this.requireBot(), entity);
@@ -929,7 +1106,7 @@ export class BotController {
     return { swung: true, hand, showHand };
   }
 
-  mountEntity(id: number) {
+  mountEntity(id: number | string) {
     const entity = this.getRequiredEntity(id);
     this.requireMethod("mount").call(this.requireBot(), entity);
     return { mounted: true, entity: serializeEntity(entity, this.requireBot().entity?.position) };
@@ -946,6 +1123,10 @@ export class BotController {
   }
 
   stop(): void {
+    this.connected = false;
+    this.spawned = false;
+    this.world.reset("STOPPED");
+    this.chatReceiver?.dispose();
     this.bot?.quit("mc-agent session stop");
   }
 
@@ -954,6 +1135,28 @@ export class BotController {
       throw new Error("Bot is not started.");
     }
     return this.bot;
+  }
+
+  private continuationGuard(resources: ActionResource[]): () => void {
+    const epoch = this.world.worldEpoch;
+    const owners = resources.map((resource) => this.actions.owner(resource));
+    return () => {
+      if (epoch !== this.world.worldEpoch) throw new CliError("WORLD_CHANGED", "World changed during action.", "Observe a fresh frame.");
+      if (resources.some((resource, index) => owners[index] !== this.actions.owner(resource))) {
+        throw new CliError("COMMAND_BLOCKED", "Action was replaced or cancelled.", "Inspect current actions.");
+      }
+    };
+  }
+
+  private async openContainerObserved(target: MineflayerBlock | MineflayerEntity): Promise<MineflayerWindow> {
+    const bot = this.requireBot();
+    const before = new Set(bot.rawListeners("windowOpen"));
+    const result = this.requireMethod("openContainer").call(bot, target);
+    const added = bot.rawListeners("windowOpen").filter((listener) => !before.has(listener));
+    const cleanup = () => { for (const listener of added) bot.removeListener("windowOpen", listener); };
+    this.pendingWindowListeners.add(cleanup);
+    try { return await result; }
+    finally { cleanup(); this.pendingWindowListeners.delete(cleanup); }
   }
 
   private requirePathfinder(): NonNullable<MineflayerBot["pathfinder"]> {
@@ -1006,7 +1209,11 @@ export class BotController {
     return item;
   }
 
-  private getRequiredEntity(id: number): MineflayerEntity {
+  private getRequiredEntity(id: number | string): MineflayerEntity {
+    if (typeof id === "string") {
+      this.reconcile();
+      return this.world.resolveTrack(id) as MineflayerEntity;
+    }
     const entity = this.requireBot().entities?.[String(id)];
     if (!entity) {
       throw new Error(`Entity '${id}' is not visible.`);
@@ -1078,10 +1285,10 @@ export class BotController {
 
   private assertAttackAllowed(entity: MineflayerEntity, options: { allowPlayers?: boolean; allowPassive?: boolean }): void {
     if (this.isPlayerEntity(entity) && !options.allowPlayers) {
-      throw new Error("Refusing to attack a player without allowPlayers.");
+      throw commandBlocked("Refusing to attack a player without allowPlayers.", "Only pass --allow-players when authorized.");
     }
     if (this.isPassiveEntity(entity) && !options.allowPassive) {
-      throw new Error("Refusing to attack a passive mob without allowPassive.");
+      throw commandBlocked("Refusing to attack a passive mob without allowPassive.", "Only pass --allow-passive when authorized.");
     }
   }
 

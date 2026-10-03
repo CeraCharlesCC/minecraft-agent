@@ -1,4 +1,4 @@
 interface:
   display_name: "Minecraft"
   short_description: "Operate a Minecraft bot through mc-agent."
-  default_prompt: "Use $minecraft to start or reuse a Minecraft bot session, monitor authorized chat mentions, and perform bounded in-world actions through mc-agent."
+  default_prompt: "Use $minecraft to start or reuse a bot session, inspect current state, and carry out the requested in-world task through mc-agent."
