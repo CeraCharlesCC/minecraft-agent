@@ -1,9 +1,11 @@
 import { EventEmitter } from "node:events";
+import { createRequire } from "node:module";
 import { describe, expect, it, vi } from "vitest";
 import { BotController } from "../src/daemon/bot.js";
 import { EventStore } from "../src/core/events.js";
 
 const UUID = "aabbccdd-1122-3344-5566-778899aabbcc";
+const require = createRequire(import.meta.url);
 class LiveBot extends EventEmitter {
   packetWrites = vi.fn();
   _client = { write: this.packetWrites };
@@ -19,6 +21,7 @@ class LiveBot extends EventEmitter {
   currentWindow: any = { id: 1, slots: [{ name: "stone", count: 2 }], close: vi.fn() };
   controlState: Record<string, boolean> = {};
   heldItem = { name: "dirt" };
+  setQuickBarSlot = vi.fn();
   setControlState = vi.fn((state: string, value: boolean) => { this.controlState[state] = value; });
   clearControlStates = vi.fn(() => { this.controlState = {}; });
   chat = vi.fn(); quit = vi.fn(); lookAtCalls = vi.fn(); lookAt = this.lookAtCalls; activateEntity = vi.fn(); equip = vi.fn(); placeBlock = vi.fn();
@@ -94,7 +97,8 @@ describe("runtime integration", () => {
     expect(dead.worldEpoch).toBeGreaterThan(frame.worldEpoch);
     expect(dead.connection.ready).toBe(false); expect(dead.self.position).toBeUndefined(); expect(dead.window).toBeNull();
     expect(dead.entities[0].position).toBeUndefined(); expect(dead.entities[0].status).toBe("lost");
-    expect(dead.actions.find((a: any) => a.action === follow.action)).toMatchObject({ state: "failed", reason: "WORLD_CHANGED", error: { details: { reason: "DEATH" } } });
+    expect(dead.actions.find((a: any) => a.action === follow.action)).toMatchObject({ state: "failed", reason: "WORLD_CHANGED", error: { code: "WORLD_CHANGED" } });
+    expect(controller.actions.get(follow.action)).toMatchObject({ error: { details: { reason: "DEATH" } } });
     expect(() => controller.validateContext({ runtimeId: frame.runtimeId, worldEpoch: frame.worldEpoch })).toThrow(/World context/);
   });
 
@@ -181,6 +185,81 @@ describe("runtime integration", () => {
     expect(bot.listenerCount("windowOpen")).toBe(baseline+1);
     controller.actions.cancel(action.action);
     expect(bot.listenerCount("windowOpen")).toBe(baseline);
+  });
+
+  it.each(["cancel", "replace", "target-loss", "world-reset"])("observes rejected background turns after %s while awaited turns still reject", async transition => {
+    const events = new EventStore(), bot = new LiveBot(), pending = deferred();
+    bot.lookAtCalls.mockReturnValue(pending.promise);
+    const controller = new BotController({host:"localhost",port:25565,username:"AgentBot",auth:"offline"},events,()=>bot);
+    controller.start(); bot.emit("spawn");
+    const track = controller.world.trackFor(bot.entities["7"])!;
+    const action = controller.runAction("navigate.goto", ["movement", "look"], () => new Promise(() => {}), track);
+    // Match pathfinder's unawaited call outside the action's async context.
+    void bot.lookAt(bot.entities["7"].position);
+    const awaited = bot.lookAt(bot.entities["7"].position);
+    if (transition === "cancel") controller.actions.cancel(action.action);
+    if (transition === "replace") controller.followTrack(track, 2);
+    if (transition === "target-loss") bot.emit("entityGone", bot.entities["7"]);
+    if (transition === "world-reset") bot.emit("death");
+    const rejection = expect(awaited).rejects.toMatchObject({ code: transition === "world-reset" ? "WORLD_CHANGED" : "COMMAND_BLOCKED" });
+    pending.resolve(); await rejection;
+    // Let Node detect any unhandled background rejection (Vitest fails on it).
+    await new Promise(resolve => setImmediate(resolve));
+    expect(controller.actions.get(action.action).state).not.toBe("running");
+  });
+
+  it("retains Mineflayer's self binding for effect and metadata packets across death and respawn", () => {
+    const bot = new LiveBot() as any, events = new EventStore();
+    const registry = require("prismarine-registry")("1.21.4");
+    bot.registry = registry; bot.version = "1.21.4"; bot.supportFeature = registry.supportFeature;
+    bot._client = Object.assign(new EventEmitter(), { write: bot.packetWrites, username: bot.username });
+    require("mineflayer/lib/plugins/entities.js")(bot);
+    bot._client.emit("login", { entityId: 42 });
+    const self = bot.entity;
+    self.position.y = 64;
+    bot.entities[7] = { id: 7, type: "player", position: { x: 4, y: 64, z: 0 } };
+    const controller = new BotController({host:"localhost",port:25565,username:"AgentBot",auth:"offline"},events,()=>bot);
+    controller.start(); bot.emit("spawn");
+    expect(controller.frame().entities).toHaveLength(1);
+    for (const lifecycle of ["death", "respawn"]) {
+      bot.emit(lifecycle);
+      expect(bot.entities).toEqual({ 42: self });
+      bot._client.emit("entity_effect", { entityId: 42, effectId: 1, amplifier: 2, duration: 100 });
+      bot._client.emit("entity_metadata", { entityId: 42, metadata: [{ key: 0, type: "byte", value: 2 }] });
+      expect(bot.entity).toBe(self); expect(bot.entities[42]).toBe(self);
+      expect(self.effects[1]).toEqual({ id: 1, amplifier: 2, duration: 100 });
+      expect(self.metadata[0]).toBe(2);
+      bot.emit("spawn");
+      expect(controller.frame().entities).toEqual([]);
+      bot._client.emit("remove_entity_effect", { entityId: 42, effectId: 1 });
+      expect(self.effects[1]).toBeUndefined();
+    }
+  });
+
+  it("bounds frame action summaries and deltas while preserving running targets and full status results", async () => {
+    const { controller, bot, track } = runtime();
+    const running = controller.followTrack(track, 2);
+    let oldest = "";
+    for (let n = 0; n < 256; n++) {
+      const action = controller.runAction("inventory.quickbar", ["item"], () => controller.setQuickBarSlot(n % 9));
+      oldest ||= action.action;
+      await Promise.resolve(); await Promise.resolve();
+    }
+    const frame = controller.frame({ maxEntities: 0, radius: 0 });
+    expect(frame.actions).toHaveLength(9);
+    expect(frame.actions.some((a: any) => a.action === running.action)).toBe(true);
+    expect(frame.entities.map((e: any) => e.trackId)).toContain(track);
+    expect(frame.actions.every((a: any) => !("result" in a))).toBe(true);
+    expect(bot.setQuickBarSlot).toHaveBeenCalledTimes(256);
+    expect(controller.actions.get(oldest).result).toEqual({ quickBarSlot: 0 });
+    expect(JSON.stringify(frame).length).toBeLessThan(6000);
+    const next = controller.runAction("inventory.quickbar", ["item"], () => ({ pages: "y".repeat(10000) }));
+    await Promise.resolve(); await Promise.resolve();
+    const delta = controller.frame({ maxEntities: 0, radius: 0, since: frame.frame });
+    expect(delta.delta.changed.actions).toHaveLength(9);
+    expect(delta.delta.changed.actions.at(-1).action).toBe(next.action);
+    expect(controller.actions.get(next.action).result).toEqual({ pages: "y".repeat(10000) });
+    expect(JSON.stringify(delta).length).toBeLessThan(5000);
   });
 
 });

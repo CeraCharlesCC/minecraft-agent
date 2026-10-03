@@ -25,7 +25,7 @@ export interface BotOptions {
 type MineflayerBot = EventEmitter & {
   _client?: { write(name: string, params: unknown): unknown };
   username?: string;
-  entity?: { position?: { x: number; y: number; z: number } };
+  entity?: MineflayerEntity;
   entities?: Record<string, MineflayerEntity>;
   players?: Record<string, { username?: string; entity?: MineflayerEntity }>;
   tablist?: unknown;
@@ -343,7 +343,13 @@ export class BotController {
     this.bot.lookAt = (position) => {
       const verify = this.continuationGuard(["look"]);
       const result = originalLookAt(position);
-      if (result && typeof result.then === "function") return result.then(() => { verify(); });
+      if (result && typeof result.then === "function") {
+        const guarded = result.then(() => { verify(); });
+        // Pathfinder launches turns without awaiting them. Observe rejection
+        // while preserving the rejected promise for operations that do await it.
+        void guarded.catch(() => {});
+        return guarded;
+      }
       verify();
     };
     // Some Mineflayer container adapters launch activation without awaiting it.
@@ -517,7 +523,7 @@ export class BotController {
 
   private observationContext() {
     return { connected: this.connected, spawned: this.spawned,
-      controls: { ...this.bot?.controlState, ...this.controlState }, actions: this.actions.list(), getActions: () => this.actions.list(),
+      controls: { ...this.bot?.controlState, ...this.controlState }, getActions: () => this.actions.observation(),
       getControls: () => ({ ...this.bot?.controlState, ...this.controlState }),
       getReadiness: () => ({ connected: this.connected, spawned: this.spawned }) };
   }
@@ -531,7 +537,10 @@ export class BotController {
     this.actions.failAll(reason);
     this.stopResources(["movement", "look", "item", "window"]);
     if (this.bot) {
-      this.bot.entities = {};
+      // Mineflayer packet handlers fetch self through this dictionary; respawn
+      // does not perform the login-time assignment of bot.entity again.
+      const self = this.bot.entity;
+      this.bot.entities = self?.id === undefined ? {} : { [self.id]: self };
       for (const player of Object.values(this.bot.players ?? {})) player.entity = undefined;
       this.bot.currentWindow = null;
     }

@@ -11,6 +11,15 @@ export type ResolveChatSender = (username?: string, uuid?: string) => ChatSender
 type Callback = "message" | "chat" | "whisper";
 type Channel = "player" | "whisper" | "server" | "game_info";
 type Attribution = "verified" | "structured" | "pattern" | "unknown";
+const translationLayouts: Record<string, { sender?: number; content: number; recipient?: number; team?: number; direction?: "incoming" | "outgoing" }> = {
+  "commands.message.display.incoming": { sender: 0, content: 1, direction: "incoming" },
+  "commands.message.display.outgoing": { recipient: 0, content: 1, direction: "outgoing" },
+  "chat.type.text": { sender: 0, content: 1 },
+  "chat.type.announcement": { sender: 0, content: 1 },
+  "chat.type.emote": { sender: 0, content: 1 },
+  "chat.type.team.text": { team: 0, sender: 1, content: 2, direction: "incoming" },
+  "chat.type.team.sent": { team: 0, sender: 1, content: 2, direction: "outgoing" },
+};
 
 interface Receipt {
   object?: object;
@@ -21,6 +30,10 @@ interface Receipt {
   channel: Channel;
   sender: ChatSender;
   attribution: Attribution;
+  structuredLayout?: boolean;
+  direction?: "incoming" | "outgoing";
+  recipient?: ChatSender;
+  team?: string;
   verified?: boolean;
   raw: Record<string, unknown>;
 }
@@ -68,23 +81,30 @@ export class CanonicalChat {
     if (senderUuid) receipt.sender.uuid = senderUuid;
     if (typeof sender === "string" && !senderUuid) receipt.sender.username ??= sender;
     if (typeof verified === "boolean") receipt.verified = verified;
+    const layout = translation ? translationLayouts[translation] : undefined;
+    if (layout && parts[layout.content] !== undefined) {
+      receipt.structuredLayout = true;
+      receipt.channel = translation?.startsWith("commands.message.display.") ? "whisper" : "player";
+      receipt.text = text(parts[layout.content]);
+      receipt.direction = layout.direction;
+      if (layout.team !== undefined) receipt.team = text(parts[layout.team]);
+      if (layout.sender !== undefined) receipt.sender.username = text(parts[layout.sender]);
+      if (layout.recipient !== undefined) {
+        receipt.recipient = { username: text(parts[layout.recipient]) };
+        const self = this.bot as (EventEmitter & { username?: string; entity?: { uuid?: string } }) | undefined;
+        const selfUuid = uuid(self?.entity?.uuid) ?? senderUuid;
+        receipt.sender = { ...(self?.username ? { username: self.username } : {}), ...(selfUuid ? { uuid: selfUuid } : {}) };
+      }
+      receipt.attribution = receipt.sender.uuid && verified === true ? "verified" : "structured";
+      return;
+    }
     if (receipt.callbacks.has("whisper") || receipt.callbacks.has("chat")) {
       if (senderUuid) receipt.attribution = verified === true ? "verified" : "structured";
       return;
     }
     receipt.text = text(message);
-    if (translation?.startsWith("commands.message.display.")) {
-      receipt.channel = "whisper";
-      if (parts[0] !== undefined) receipt.sender.username = text(parts[0]);
-      if (parts.length > 1) receipt.text = text(parts.at(-1));
-      receipt.attribution = "structured";
-    } else if (translation?.startsWith("chat.type.") || position === "chat") {
+    if (translation?.startsWith("chat.type.") || position === "chat") {
       receipt.channel = "player";
-      if (translation?.startsWith("chat.type.") && parts.length >= 2) {
-        receipt.sender.username = text(parts[0]);
-        receipt.text = text(parts.at(-1));
-        receipt.attribution = "structured";
-      }
       if (senderUuid) receipt.attribution = verified === true ? "verified" : "structured";
     } else {
       receipt.channel = position === "game_info" ? "game_info" : "server";
@@ -124,6 +144,7 @@ export class CanonicalChat {
   private classify(callback: "chat" | "whisper", sender: string, message: string, translate: unknown, json: unknown): void {
     const receipt = this.receive(callback, json);
     receipt.raw[callback] = detachData({ sender, message, translate, json });
+    if (receipt.structuredLayout) return;
     // A whisper pattern wins over a broad player-chat pattern for the same receipt.
     if (callback === "chat" && receipt.callbacks.has("whisper")) return;
     receipt.channel = callback === "whisper" ? "whisper" : "player";
@@ -177,7 +198,9 @@ export class CanonicalChat {
       if (!queue.length) this.byObject.delete(receipt.object);
     }
     const resolved = this.resolveSender?.(receipt.sender.username, receipt.sender.uuid);
-    const sender = { ...resolved, ...receipt.sender };
+    const sender = { ...resolved, ...receipt.sender,
+      ...(receipt.sender.uuid && resolved?.username ? { username: resolved.username } : {}) };
+    const recipient = receipt.recipient ? { ...this.resolveSender?.(receipt.recipient.username, receipt.recipient.uuid), ...receipt.recipient } : undefined;
     const eventType = receipt.channel === "player" ? "chat.player" : receipt.channel === "whisper" ? "chat.whisper" : "server.message";
     this.events.add({
       type: eventType,
@@ -186,6 +209,9 @@ export class CanonicalChat {
       receivedAt: receipt.receivedAt,
       text: receipt.text,
       channel: receipt.channel,
+      ...(receipt.direction ? { direction: receipt.direction } : {}),
+      ...(recipient ? { recipientIdentity: recipient } : {}),
+      ...(receipt.team === undefined ? {} : { team: receipt.team }),
       ...(sender.username ? { sender: sender.username } : {}),
       senderIdentity: sender,
       attribution: receipt.attribution,

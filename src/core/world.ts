@@ -219,7 +219,7 @@ export class WorldModel {
       inventory: ready ? copy(bot.inventory?.slots ?? bot.inventory?.items?.() ?? []) : [],
       window: ready ? this.serializeWindow(bot.currentWindow) : null,
       actions: copy(context.getActions?.() ?? context.actions ?? []),
-      navigation: ready ? { moving: bot.pathfinder?.isMoving?.() ?? false, goal: copy(bot.pathfinder?.goal) } : { moving: false, goal: null },
+      navigation: ready ? { moving: bot.pathfinder?.isMoving?.() ?? false, goal: this.serializeGoal(bot.pathfinder?.goal) } : { moving: false, goal: null },
     };
     // Observation timestamps are excluded so repeated observations do not invent state changes.
     const stable = copy(state);
@@ -293,6 +293,18 @@ export class WorldModel {
     const tracks = [...new Set(options.tracks ?? [])].sort();
     for (const id of tracks) this.validateRuntime(id);
     return { maxEntities, radius, tracks };
+  }
+  private serializeGoal(value: unknown): Record<string, unknown> | null {
+    if (!value || typeof value !== "object") return null;
+    const goal = value as Record<string, unknown>;
+    const parameters: Record<string, number> = {};
+    // Only scalar goal parameters are public. Entity/world objects and item NBT
+    // must never bypass the entity projection through a pathfinder goal.
+    for (const key of ["x", "y", "z", "rangeSq", "reach", "entityHeight"]) {
+      if (typeof goal[key] === "number" && Number.isFinite(goal[key])) parameters[key] = goal[key];
+    }
+    const target = this.trackFor(goal.entity);
+    return { kind: value.constructor.name, parameters, ...(target ? { target } : {}) };
   }
   private validateRuntime(id: string): void {
     if (typeof id !== "string" || !id.startsWith(`${this.runtimeId}:`)) throw failure("RUNTIME_MISMATCH", `Handle '${id}' belongs to another runtime.`, { handle: id, runtimeId: this.runtimeId });

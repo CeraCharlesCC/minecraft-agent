@@ -76,6 +76,8 @@ mc-agent window deposit --help
 
 A frame is a coherent local observation of the connected bot, not a server-wide snapshot. It includes the current `runtimeId`, `worldEpoch`, frame handle, event cursor, bot state, loaded entity tracks, inventory, window, and managed actions.
 
+Frame `actions` contain summaries of all running actions and the eight most recently settled actions, including targets, state, reason, and error code. Results and error details are available through `action status`; the runtime retains up to 256 settled action records. Navigation goals contain `kind`, finite scalar `parameters`, and an available target track instead of live entity data.
+
 Runtime-scoped handles are valid only for the daemon instance that created them. A daemon restart invalidates frame, track, cursor, and action handles. World changes invalidate world-dependent state and actions.
 
 Physical mutations require `--runtime` and `--world-epoch` values copied from a recent frame. Entity actions use loaded `--track` handles rather than guessed names or numeric entity IDs.

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { EventStore } from "../src/core/events.js";
 import { WorldModel } from "../src/core/world.js";
+import { goals } from "mineflayer-pathfinder";
 
 const ready = { connected: true, spawned: true };
 const UUID = "12345678-1234-1234-1234-123456789abc";
@@ -133,6 +134,27 @@ describe("observed world model", () => {
     const projected = world.frame(live, { ...ready, actions: [{ target: far, state: "running" }] }, { maxEntities: 0, radius: 0, tracks: [chosen] });
     expect(projected.entities.map((item: any) => item.trackId).sort()).toEqual([far, chosen].sort());
     expect(projected.projection).toMatchObject({ omitted: 1, truncated: true, aggregates: { player: 1 } });
+  });
+
+  it("projects follow goals to compact track references and detects only public navigation changes", () => {
+    const world = new WorldModel(new EventStore());
+    const target = Object.assign(entity(), { equipment: [{ name: "written_book", nbt: { pages: Array(100).fill("x".repeat(1024)) } }], metadata: { secret: "raw" }, passengers: [{ id: 99 }] });
+    const live = Object.assign(bot(target), { pathfinder: { goal: new goals.GoalFollow(target as never, 2), isMoving: () => true } });
+    const first = world.frame(live, ready, { maxEntities: 0 });
+    const track = world.trackFor(target);
+    expect(first.entities).toEqual([]);
+    expect(first.navigation).toEqual({ moving: true, goal: { kind: "GoalFollow", parameters: { x: 5, y: 64, z: 0, rangeSq: 4 }, target: track } });
+    expect(JSON.stringify(first.navigation).length).toBeLessThan(300);
+    target.equipment[0].nbt.pages[0] = "new raw NBT";
+    const unchanged = world.frame(live, ready, { maxEntities: 0, since: first.frame });
+    expect(unchanged.delta.changed).not.toHaveProperty("navigation");
+    expect(unchanged.stateRevision).toBe(first.stateRevision);
+    live.pathfinder.goal.rangeSq = 9;
+    const changed = world.frame(live, ready, { maxEntities: 0, since: first.frame });
+    expect(changed.delta.changed.navigation.goal.parameters.rangeSq).toBe(9);
+    expect(first.navigation.goal.parameters.rangeSq).toBe(4);
+    const near = world.frame({ ...live, pathfinder: { goal: new goals.GoalNear(10, 65, 3, 1) } }, ready, { maxEntities: 0 });
+    expect(near.navigation.goal).toEqual({ kind: "GoalNear", parameters: { x: 10, y: 65, z: 3, rangeSq: 1 } });
   });
 
   it("returns deltas for changed state and classifies removal as loss or projection omission", () => {

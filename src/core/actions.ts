@@ -71,6 +71,16 @@ export class ActionManager {
     return [...this.records.values()].map((record) => detachData(record));
   }
 
+  /** Frames retain all running targets and only the eight latest settlements. */
+  observation(): (Omit<RuntimeAction, "result" | "error"> & { error?: { code: string } })[] {
+    const recent = new Set(this.terminalOrder.slice(-8));
+    return [...this.records.values()]
+      .filter((record) => record.state === "running" || recent.has(record.action))
+      .map(({ result: _result, error, ...summary }) => detachData({
+        ...summary, ...(error ? { error: { code: error.code } } : {}),
+      }));
+  }
+
   owner(resource: ActionResource): string | undefined { return this.owners.get(resource); }
 
   cancel(id: string, reason = "CANCELLED"): RuntimeAction {
