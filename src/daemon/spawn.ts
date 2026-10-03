@@ -25,6 +25,7 @@ async function getFreePort(): Promise<number> {
   });
 }
 
+// Startup confirms only HTTP control readiness. ensure-ready separately waits for spawn.
 async function waitForDaemon(session: string, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -75,8 +76,11 @@ export async function spawnSessionDaemon(input: StartSessionInput, entryPoint: s
     input.auth,
   ];
   if (input.version) {
-    args.push("--version", input.version);
+    args.push("--minecraft-version", input.version);
   }
+  if (input.autoReconnect) args.push("--auto-reconnect");
+  if (input.reconnectMaxAttempts !== undefined) args.push("--reconnect-max-attempts", String(input.reconnectMaxAttempts));
+  if (input.reconnectBackoff !== undefined) args.push("--reconnect-backoff", String(input.reconnectBackoff));
 
   const child = spawn(process.execPath, args, {
     detached: true,

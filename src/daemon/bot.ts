@@ -3,10 +3,11 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { createBot } from "mineflayer";
 import pathfinderPackage from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
-import { EventStore } from "../core/events.js";
+import { EventStore, detachData } from "../core/events.js";
 import { WorldModel, FrameOptions } from "../core/world.js";
 import { CanonicalChat } from "../core/chat.js";
 import { ActionManager, ActionResource } from "../core/actions.js";
+import { decodeActionContext } from "../core/context.js";
 import { CliError, commandBlocked } from "../output/errors.js";
 
 const { goals, Movements, pathfinder } = pathfinderPackage;
@@ -20,7 +21,20 @@ export interface BotOptions {
   username: string;
   auth: string;
   version?: string;
+  autoReconnect?: boolean;
+  reconnectMaxAttempts?: number;
+  reconnectBackoff?: number;
 }
+
+export interface EnsureReadyOptions {
+  timeout?: number;
+  maxAttempts?: number;
+  backoff?: number;
+}
+
+type ConnectionError = { code: string; message: string; occurredAt: string; generation: number };
+const transientTransportCodes = new Set(["EPIPE", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "ENETUNREACH", "EHOSTUNREACH", "ENOTFOUND", "EAI_AGAIN"]);
+const terminalAuthCodes = new Set(["EAUTH", "AUTHENTICATION_FAILED", "INVALID_CREDENTIALS", "UNAUTHORIZED"]);
 
 type MineflayerBot = EventEmitter & {
   _client?: { write(name: string, params: unknown): unknown };
@@ -128,7 +142,7 @@ type MineflayerBlock = {
   position: Vec3;
   getProperties?(): Record<string, unknown>;
 };
-type MineflayerEntity = { uuid?: string; velocity?: { x: number; y: number; z: number }; id?: number; username?: string; name?: string; type?: string; position?: { x: number; y: number; z: number } };
+type MineflayerEntity = { uuid?: string; velocity?: { x: number; y: number; z: number }; onGround?: boolean; id?: number; username?: string; name?: string; type?: string; position?: { x: number; y: number; z: number } };
 type MineflayerWindow = {
   id?: number;
   type?: string;
@@ -145,6 +159,7 @@ type MineflayerWindow = {
 };
 type NavigationMovementConfig = {
   canDig?: boolean;
+  canPlace?: boolean;
   allowSprinting?: boolean;
   allowParkour?: boolean;
   canOpenDoors?: boolean;
@@ -303,6 +318,18 @@ export class BotController {
   private connected = false;
   private spawned = false;
   private lastError?: string;
+  private connectionEnded = false;
+  private lastDisconnectReason?: string;
+  private lastConnectionError?: ConnectionError;
+  private stopping = false;
+  private generation = 0;
+  private terminalFailure = false;
+  private authentication: "unknown" | "intervention_required" | "authenticated" | "rejected" = "unknown";
+  private readonly lifecycle = new EventEmitter();
+  private readonly botListeners: Array<{ bot: MineflayerBot; event: string; listener: (...args: any[]) => void }> = [];
+  private readonly transitions: Array<{ state: string; at: string; generation: number; reason?: string }> = [];
+  private recovery?: Promise<ReturnType<BotController["recoveryResult"]>>;
+  private retryState = { active: false, automatic: false, attempts: 0, maxAttempts: 0, nextRetryAt: undefined as string | undefined };
   private readonly controlState: Record<string, boolean> = {};
   readonly world: WorldModel;
   readonly actions: ActionManager;
@@ -312,7 +339,8 @@ export class BotController {
   private lifecycleReset = false;
   private readonly execution = new AsyncLocalStorage<{ action: string; worldEpoch: number; target?: string; binding?: unknown }>();
   private readonly pendingWindowListeners = new Set<() => void>();
-  private readonly navigationMovementConfig: NavigationMovementConfig = {};
+  private readonly navigationMovementConfig: NavigationMovementConfig = { canDig: false, canPlace: false };
+  private readonly placementDefaults = new WeakMap<PathfinderMovements, { blocks: number[]; towers: boolean }>();
 
   constructor(
     private readonly options: BotOptions,
@@ -326,21 +354,155 @@ export class BotController {
   }
 
   start(): void {
-    this.bot = this.createBotFn({
-      host: this.options.host,
-      port: this.options.port,
-      username: this.options.username,
-      auth: this.options.auth,
-      version: this.options.version,
+    this.assertNotStopping();
+    if (this.bot) {
+      this.connected = false;
+      this.spawned = false;
+      if (!this.lifecycleReset) this.world.reset("RECONNECT");
+      this.lifecycleReset = true;
+      this.disposeBot();
+    }
+    const generation = ++this.generation;
+    this.connectionEnded = false;
+    this.lastDisconnectReason = undefined;
+    this.lastError = undefined;
+    this.terminalFailure = false;
+    this.authentication = "unknown";
+    const current = () => generation === this.generation && !this.stopping;
+    const bot = this.createBotFn({
+      host: this.options.host, port: this.options.port, username: this.options.username,
+      auth: this.options.auth, version: this.options.version,
+      // Evidence comes from the auth adapter itself, never from log text.
+      onMsaCode: (challenge: { message?: string }) => {
+        if (!current()) return;
+        this.authentication = "intervention_required";
+        if (typeof challenge?.message === "string") console.log(challenge.message);
+        this.transition("authentication_pending");
+      },
     });
-    this.bot.loadPlugin?.(pathfinder as unknown as (bot: unknown) => void);
+    this.bot = bot;
+    const on = (event: string, listener: (...args: any[]) => void, prepend = false) => {
+      const guarded = (...args: any[]) => { if (current()) listener(...args); };
+      this.botListeners.push({ bot, event, listener: guarded });
+      if (prepend) bot.prependListener(event, guarded); else bot.on(event, guarded);
+    };
+    bot.loadPlugin?.(pathfinder as unknown as (bot: unknown) => void);
+    if (typeof bot.lookAt === "function") this.initializeBotMethods();
+    else on("inject_allowed", () => this.initializeBotMethods());
+    on("login", () => {
+      if (this.connectionEnded) return;
+      this.lastError = undefined;
+      this.connected = true;
+      this.spawned = false;
+      this.authentication = "authenticated";
+      this.transition("waiting_for_spawn");
+      this.events.add({ type: "connection.login", text: "Bot logged in." });
+    });
+    on("spawn", () => {
+      if (this.connectionEnded) return;
+      this.lastError = undefined;
+      if (this.spawned) this.world.reset("RESPAWN");
+      this.connected = true;
+      this.spawned = true;
+      this.lifecycleReset = false;
+      this.transition("ready");
+      this.events.add({ type: "connection.ready", text: "Bot spawned." });
+      this.world.syncBindings(bot, this.observationContext());
+      this.world.observeHealth(bot, this.observationContext());
+    });
+    const disconnected = (reason: string, terminal = false) => {
+      const wasEnded = this.connectionEnded;
+      this.connectionEnded = true;
+      if (terminal) this.lastDisconnectReason = reason;
+      else this.lastDisconnectReason ??= reason;
+      this.terminalFailure ||= terminal;
+      this.connected = false;
+      this.spawned = false;
+      if (!this.lifecycleReset) this.world.reset(reason);
+      this.lifecycleReset = true;
+      this.chatReceiver?.dispose();
+      this.transition("disconnected", this.lastDisconnectReason);
+      this.events.add({ type: "connection.disconnected", reason });
+      if (!wasEnded) this.maybeAutoReconnect();
+    };
+    on("end", (reason) => disconnected(String(reason ?? "DISCONNECTED")));
+    on("kicked", (reason) => disconnected(`KICKED: ${typeof reason === "string" ? reason : JSON.stringify(detachData(reason)) ?? "DISCONNECTED"}`, true));
+    on("error", (error) => {
+      this.recordConnectionError(error);
+      if (terminalAuthCodes.has(this.lastConnectionError!.code)) {
+        this.authentication = "rejected";
+        this.terminalFailure = true;
+      }
+      this.events.add({ type: "connection.error", text: this.lastError, error: this.lastConnectionError });
+      disconnected(this.lastConnectionError!.code, terminalAuthCodes.has(this.lastConnectionError!.code));
+    });
+    on("death", () => {
+      this.spawned = false;
+      this.world.reset("DEATH");
+      this.lifecycleReset = true;
+      this.transition("waiting_for_spawn");
+      this.events.add({ type: "self.died" });
+    });
+    on("respawn", () => {
+      if (!this.lifecycleReset) this.world.reset("RESPAWN");
+      this.spawned = false;
+      this.lifecycleReset = true;
+      this.transition("waiting_for_spawn");
+    });
+    on("health", () => this.world.observeHealth(bot, this.observationContext()));
+    on("game", () => this.checkWorld());
+    for (const name of ["entitySpawn", "entityMoved", "entityUpdate"])
+      on(name, (entity) => { this.world.updateEntity(bot, this.observationContext(), entity); this.updateLookTracking(); });
+    on("move", () => { this.world.updateProximity(bot, this.observationContext()); this.updateLookTracking(); });
+    for (const name of ["playerJoined", "playerLeft"])
+      on(name, () => this.world.syncPlayers(bot, this.connected));
+    on("physicsTick", () => { this.checkWorld(); this.checkActionTargets(); this.world.flushProximity(bot, this.observationContext()); this.updateLookTracking(); }, true);
+    on("entityGone", (entity) => this.world.invalidate(entity, "lost"));
+    on("entityDead", (entity) => this.world.invalidate(entity, "dead"));
+    this.chatReceiver = new CanonicalChat(this.events, (sender, uuid) => this.world.playerIdentity(sender, uuid));
+    this.chatReceiver.attach(bot);
+    this.transition("connecting");
+  }
+
+  private recordConnectionError(error: unknown) {
+    const code = error && typeof error === "object" && typeof (error as { code?: unknown }).code === "string"
+      ? (error as { code: string }).code : "UNKNOWN";
+    this.lastError = error instanceof Error ? error.message : String(error);
+    this.lastConnectionError = { code, message: this.lastError, occurredAt: new Date().toISOString(), generation: this.generation };
+  }
+
+  private transition(state: string, reason?: string) {
+    this.transitions.push({ state, at: new Date().toISOString(), generation: this.generation, ...(reason ? { reason } : {}) });
+    if (this.transitions.length > 32) this.transitions.shift();
+    this.lifecycle.emit("change");
+  }
+
+  private disposeBot() {
+    const bot = this.bot;
+    if (!bot) return;
+    ++this.generation;
+    this.chatReceiver?.dispose();
+    this.chatReceiver = undefined;
+    for (const { bot: source, event, listener } of this.botListeners.splice(0)) source.off(event, listener);
+    // A retired protocol adapter can still deliver an error while quit drains.
+    // This listener has no controller/world access and avoids unhandled errors.
+    bot.on("error", () => {});
+    this.lookBusy = false;
+    try { bot.quit(this.stopping ? "mc-agent session stop" : "mc-agent reconnect"); }
+    catch (error) { this.recordConnectionError(error); }
+    this.bot = undefined;
+  }
+
+  private initializeBotMethods() {
+    const bot = this.requireBot();
+    const generation = this.generation;
     this.configurePathfinderMovements();
     this.guardActionPackets();
     // Mineflayer's block/entity operations await lookAt before sending packets.
     // Guard that continuation so replacement, target loss, or reset cannot send
     // the operation after its owner has already terminated.
-    const originalLookAt = this.bot.lookAt.bind(this.bot);
-    this.bot.lookAt = (position) => {
+    const originalLookAt = bot.lookAt.bind(bot);
+    bot.lookAt = (position) => {
       const verify = this.continuationGuard(["look"]);
       const result = originalLookAt(position);
       if (result && typeof result.then === "function") {
@@ -355,65 +517,73 @@ export class BotController {
     // Some Mineflayer container adapters launch activation without awaiting it.
     // Observe rejection on that promise as well as returning it to direct callers.
     for (const name of ["activateBlock", "activateEntity"] as const) {
-      const original = this.bot[name];
+      const original = bot[name];
       if (!original) continue;
-      (this.bot as any)[name] = (...args: unknown[]) => {
+      (bot as any)[name] = (...args: unknown[]) => {
         const action = this.execution.getStore()?.action;
-        const result = (original as Function).apply(this.bot, args);
+        const result = (original as Function).apply(bot, args);
         Promise.resolve(result).catch((error) => { if (action) this.actions.fail(action, error); });
         return result;
       };
     }
-
-    this.bot.on("login", () => {
-      this.connected = true;
-      this.spawned = false;
-      this.events.add({ type: "connection.login", text: "Bot logged in." });
-    });
-    this.bot.on("spawn", () => {
-      if (this.spawned) this.world.reset("RESPAWN");
-      this.connected = true;
-      this.spawned = true;
-      this.lifecycleReset = false;
-      this.events.add({ type: "connection.ready", text: "Bot spawned." });
-      this.reconcile();
-    });
-    const disconnected = (reason: string) => {
-      this.connected = false;
-      this.spawned = false;
-      if (!this.lifecycleReset) this.world.reset(reason);
-      this.lifecycleReset = true;
-      this.events.add({ type: "connection.disconnected", reason });
+    // Pathfinder's equip().then(...) callbacks run outside action ALS. Bind those
+    // reactions to their originating movement owner, rather than a future owner.
+    const originalEquip = bot.equip;
+    if (originalEquip) bot.equip = (item, destination) => {
+      const context = this.execution.getStore();
+      const owner = context?.action ?? this.actions.owner("movement");
+      const action = owner ? this.actions.get(owner) : undefined;
+      const result = originalEquip.call(bot, item, destination);
+      if (!action || !(action.kind.startsWith("navigate.") || action.kind === "collect.item")) return result;
+      const execution = context ?? { action: action.action, worldEpoch: action.worldEpoch, target: action.target,
+        binding: action.target ? this.world.resolveTrack(action.target) : undefined };
+      const verify = this.continuationGuard(["movement", "look"]);
+      const bound = Promise.resolve(result).then(value => value);
+      const then = bound.then.bind(bound);
+      bound.then = ((fulfilled: ((value: void) => unknown) | undefined | null, rejected: ((error: unknown) => unknown) | undefined | null) =>
+        this.execution.run(execution, () => then(value => {
+          if (bot !== this.bot || generation !== this.generation) throw commandBlocked("Connection changed during navigation equipment preparation.", "Observe a fresh frame.");
+          verify();
+          return fulfilled ? fulfilled(value) : value;
+        }, rejected))) as typeof bound.then;
+      return bound;
     };
-    this.bot.on("end", (reason) => disconnected(String(reason ?? "DISCONNECTED")));
-    this.bot.on("kicked", (reason) => disconnected(`KICKED: ${String(reason)}`));
-    this.bot.on("error", (error) => {
-      this.lastError = error instanceof Error ? error.message : String(error);
-      this.events.add({ type: "connection.error", text: this.lastError });
-    });
-    this.bot.on("death", () => {
-      this.spawned = false;
-      this.world.reset("DEATH");
-      this.lifecycleReset = true;
-      this.events.add({ type: "self.died" });
-    });
-    this.bot.on("respawn", () => {
-      if (!this.lifecycleReset) this.world.reset("RESPAWN");
-      this.spawned = false;
-      this.lifecycleReset = true;
-    });
-    // Routine changes update state without filling the retained semantic log.
-    for (const name of ["health", "breath", "experience", "rain", "time", "heldItemChanged",
-      "entitySpawn", "entityMoved", "entityUpdate", "move", "playerJoined", "playerLeft",
-      "windowOpen", "windowClose"]) this.bot.on(name, () => {
-        this.reconcile();
-        this.updateLookTracking();
-      });
-    this.bot.prependListener("physicsTick", () => { this.reconcile(); this.updateLookTracking(); });
-    this.bot.on("entityGone", (entity) => this.world.invalidate(entity, "lost"));
-    this.bot.on("entityDead", (entity) => this.world.invalidate(entity, "dead"));
-    this.chatReceiver = new CanonicalChat(this.events, (sender, uuid) => this.world.playerIdentity(sender, uuid));
-    this.chatReceiver.attach(this.bot);
+    // Pathfinder performs terrain work from physics callbacks, outside action ALS.
+    // Enforce the movement policy again at the actual physical method boundary.
+    for (const [name, permission] of [["dig", "canDig"], ["placeBlock", "canPlace"]] as const) {
+      const original = bot[name];
+      if (!original) continue;
+      (bot as any)[name] = (...args: unknown[]) => {
+        try {
+          if (bot !== this.bot || generation !== this.generation) throw commandBlocked("Connection changed before terrain modification.", "Observe a fresh frame.");
+          this.checkWorld();
+          this.checkActionTargets();
+          const context = this.execution.getStore();
+          const owner = context?.action ?? this.actions.owner("movement");
+          const action = owner ? this.actions.get(owner) : undefined;
+          if (!action || action.state !== "running") throw commandBlocked("Terrain modification has no active action owner.", "Start an explicit terrain action or authorized navigation.");
+          if (action.worldEpoch !== this.world.worldEpoch) throw new CliError("WORLD_CHANGED", "World changed before terrain modification.", "Observe a fresh frame.");
+          const navigation = action.kind.startsWith("navigate.") || action.kind === "collect.item";
+          if (navigation && this.navigationMovementConfig[permission] !== true) {
+            const error = new CliError("NAVIGATION_FAILED", "Navigation attempted an unauthorized terrain change.",
+              "Choose another route or explicitly enable the required navigation permission.", 1,
+              { reason: "TERRAIN_MODIFICATION_BLOCKED", operation: name,
+                policy: { canDig: this.navigationMovementConfig.canDig === true, canPlace: this.navigationMovementConfig.canPlace === true } });
+            this.actions.fail(action.action, error);
+            throw error;
+          }
+          if (!navigation && action.kind !== (name === "dig" ? "world.dig" : "world.place")) throw commandBlocked("This action does not own terrain modification.", "Use an explicit terrain action.");
+          if (navigation && this.actions.owner("movement") !== action.action) throw commandBlocked("Navigation was replaced before terrain modification.", "Inspect current actions.");
+          const binding = action.target ? this.world.resolveTrack(action.target) : undefined;
+          return this.execution.run({ action: action.action, worldEpoch: action.worldEpoch, target: action.target, binding },
+            () => (original as Function).apply(bot, args));
+        } catch (error) {
+          const rejected = Promise.reject(error);
+          void rejected.catch(() => {});
+          return rejected;
+        }
+      };
+    }
   }
 
   status() {
@@ -425,6 +595,7 @@ export class BotController {
       eventCursor: this.events.getCursor(),
       connected: this.connected,
       spawned: this.spawned,
+      connection: this.connectionStatus(),
       username: this.bot?.username ?? this.options.username,
       host: this.options.host,
       port: this.options.port,
@@ -456,7 +627,7 @@ export class BotController {
   flushChat() { this.chatReceiver?.flush(); }
 
   sample(track: string, fields: string[]) {
-    this.reconcile();
+    this.checkWorld();
     const entity = this.world.resolveTrack(track) as MineflayerEntity;
     const values: Record<string, unknown> = {};
     if (fields.includes("position")) values.position = serializePosition(entity.position);
@@ -466,25 +637,36 @@ export class BotController {
       trackId: track, observedAt: new Date().toISOString(), values };
   }
 
-  validateContext(input: { runtimeId?: unknown; worldEpoch?: unknown }, requireReady = true) {
+  validateContext(input: { runtimeId?: unknown; worldEpoch?: unknown; context?: unknown }, requireReady = true) {
     if (!input || typeof input !== "object" || Array.isArray(input)) {
       throw new CliError("BAD_INPUT", "Action body must be an object.", "Send runtimeId and worldEpoch from a frame.", 3);
     }
-    this.reconcile();
-    if (typeof input.runtimeId !== "string" || !Number.isSafeInteger(input.worldEpoch)) {
-      throw new CliError("BAD_INPUT", "Actions require runtimeId and worldEpoch from a frame.",
-        "Observe a frame and pass --runtime and --world-epoch.", 3);
+    let runtimeId = input.runtimeId, worldEpoch = input.worldEpoch;
+    if (input.context !== undefined) {
+      if (typeof input.context !== "string") throw new CliError("BAD_INPUT", "Invalid action context.", "Copy context from a current observation.", 3);
+      const decoded = decodeActionContext(input.context);
+      if ((runtimeId !== undefined && runtimeId !== decoded.runtimeId) || (worldEpoch !== undefined && worldEpoch !== decoded.worldEpoch)) {
+        throw new CliError("BAD_INPUT", "Context conflicts with runtimeId or worldEpoch.", "Use one consistent observation context.", 3);
+      }
+      runtimeId = decoded.runtimeId; worldEpoch = decoded.worldEpoch;
     }
-    if (input.runtimeId !== undefined && input.runtimeId !== this.world.runtimeId) {
+    this.checkWorld();
+    if (typeof runtimeId !== "string" || !runtimeId || !Number.isSafeInteger(worldEpoch) || (worldEpoch as number) < 0) {
+      throw new CliError("BAD_INPUT", "Actions require an observation context.",
+        "Observe a frame or find entities and pass --context, or --runtime and --world-epoch.", 3);
+    }
+    const connection = this.connectionStatus();
+    if (runtimeId !== this.world.runtimeId) {
       throw new CliError("RUNTIME_MISMATCH", "Action belongs to another runtime.", "Observe a fresh frame.", 1,
-        { runtimeId: this.world.runtimeId, expectedRuntimeId: input.runtimeId });
+        { runtimeId: this.world.runtimeId, expectedRuntimeId: runtimeId, connection });
     }
-    if (input.worldEpoch !== undefined && input.worldEpoch !== this.world.worldEpoch) {
-      throw new CliError("WORLD_CHANGED", "World context has changed.", "Observe a fresh frame.", 1,
-        { worldEpoch: this.world.worldEpoch, expectedWorldEpoch: input.worldEpoch });
+    if (worldEpoch !== this.world.worldEpoch) {
+      throw new CliError("WORLD_CHANGED", "World context has changed.", connection.state === "ready" ? "Observe a fresh frame." : connection.remediation ?? "Inspect session diagnose, then observe a fresh frame.", 1,
+        { worldEpoch: this.world.worldEpoch, expectedWorldEpoch: worldEpoch, connection });
     }
+    this.assertNotStopping();
     if (requireReady && (!this.connected || !this.spawned)) {
-      throw new CliError("NOT_READY", "Bot has no ready world context.", "Wait for connection readiness in a frame.");
+      throw new CliError("NOT_READY", "Bot has no ready world context.", connection.remediation!, 1, connection);
     }
   }
 
@@ -525,11 +707,162 @@ export class BotController {
     return { connected: this.connected, spawned: this.spawned,
       controls: { ...this.bot?.controlState, ...this.controlState }, getActions: () => this.actions.observation(),
       getControls: () => ({ ...this.bot?.controlState, ...this.controlState }),
-      getReadiness: () => ({ connected: this.connected, spawned: this.spawned }) };
+      getReadiness: () => ({ connected: this.connected, spawned: this.spawned }),
+      getConnectionStatus: () => this.connectionStatus() };
   }
 
-  private reconcile() {
-    if (this.bot) this.world.reconcile(this.bot, this.observationContext());
+  connectionStatus() {
+    const state = this.stopping ? "stopping" : this.connectionEnded ? "disconnected" : this.connected
+      ? this.spawned ? "ready" : "waiting_for_spawn" : this.lastError ? "error" : "connecting";
+    const remediation = this.stopping ? "Wait for daemon shutdown completion."
+      : state === "ready" ? undefined
+      : this.terminalFailure ? "Resolve the server kick or authentication rejection, then restart the session explicitly with 'mc-agent session stop' and 'mc-agent session start'."
+      : "Inspect 'mc-agent session diagnose', then run 'mc-agent session ensure-ready' with a bounded timeout. Automatic reconnect is disabled unless explicitly enabled; device login is required only when authentication reports intervention_required.";
+    return { state, connected: this.connected, spawned: this.spawned, ready: this.connected && this.spawned && !this.stopping,
+      stopping: this.stopping, terminalFailure: this.terminalFailure, reason: this.lastDisconnectReason, lastError: this.lastConnectionError,
+      authentication: { state: this.authentication }, remediation };
+  }
+
+  diagnose() {
+    return { apiVersion: 2, daemonResponsive: true, runtimeId: this.world.runtimeId, worldEpoch: this.world.worldEpoch,
+      ready: this.connectionStatus().ready, connection: this.connectionStatus(),
+      lastError: this.lastConnectionError, transitions: this.transitions.map((transition) => ({ ...transition })),
+      retry: { ...this.retryState, enabled: this.options.autoReconnect === true },
+      recommendedOperation: this.stopping ? "wait-for-stop" : this.connectionStatus().ready ? "observe-frame"
+        : this.authentication === "intervention_required" ? "complete-authentication"
+        : this.terminalFailure ? "resolve-terminal-failure" : "ensure-ready" };
+  }
+
+  assertNotStopping() {
+    if (this.stopping) throw new CliError("COMMAND_BLOCKED", "Session is stopping.", "Wait for shutdown completion before starting a new session.");
+  }
+
+  private recoveryResult(timedOut = false, attempts = this.retryState.attempts, attemptLimitReached = false) {
+    return { ...this.diagnose(), timedOut, attempts, attemptLimitReached };
+  }
+
+  ensureReady(input: EnsureReadyOptions = {}) {
+    this.assertNotStopping();
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw new CliError("BAD_INPUT", "Recovery options must be an object.", "Provide timeout, maxAttempts, and backoff in milliseconds.", 3);
+    const timeout = input.timeout ?? 10_000;
+    const maxAttempts = input.maxAttempts ?? 3;
+    const backoff = input.backoff ?? 250;
+    if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 120_000 ||
+        !Number.isSafeInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10 ||
+        !Number.isSafeInteger(backoff) || backoff < 0 || backoff > 30_000)
+      throw new CliError("BAD_INPUT", "Recovery timeout must be 1-120000ms, maxAttempts 1-10, and backoff 0-30000ms.", "Choose bounded recovery options.", 3);
+    if (this.connectionStatus().ready) return Promise.resolve(this.recoveryResult());
+    if (!this.recovery) {
+      this.retryState = { active: true, automatic: false, attempts: 0, maxAttempts, nextRetryAt: undefined };
+      const flight = this.recover(timeout, maxAttempts, backoff);
+      this.recovery = flight;
+      void flight.finally(() => {
+        if (this.recovery === flight) this.recovery = undefined;
+        this.retryState.active = false;
+        this.retryState.nextRetryAt = undefined;
+      }).catch(() => {});
+    }
+    return this.withRecoveryDeadline(this.recovery, timeout);
+  }
+
+  private async recover(timeout: number, maxAttempts: number, backoff: number) {
+    const deadline = Date.now() + timeout;
+    let consumedAttempts = 0;
+    for (let attempt = 0; attempt < maxAttempts && Date.now() < deadline; attempt++) {
+      if (this.connectionStatus().ready || this.stopping || this.terminalFailure ||
+          (this.retryState.automatic && this.connectionEnded && this.lastConnectionError && !transientTransportCodes.has(this.lastConnectionError.code))) break;
+      consumedAttempts = attempt + 1;
+      if (this.authentication === "intervention_required" && this.bot && !this.connectionEnded) {
+        // Preserve the current login attempt while the user completes its challenge.
+        while (!this.stopping && !this.connectionEnded && !this.connectionStatus().ready && Date.now() < deadline)
+          await this.waitForLifecycle(deadline - Date.now());
+        break;
+      }
+      if (!this.bot || this.connectionEnded || attempt > 0) {
+        if (attempt > 0 || this.connectionEnded) {
+          const delay = Math.min(backoff * 2 ** Math.max(0, attempt - 1), 30_000, Math.max(0, deadline - Date.now()));
+          this.retryState.nextRetryAt = new Date(Date.now() + delay).toISOString();
+          await this.waitForLifecycle(delay, true);
+          this.retryState.nextRetryAt = undefined;
+          if (this.connectionStatus().ready) break;
+          // A kick/auth rejection may arrive while the transport retry sleeps.
+          // Recheck evidence before start() clears the prior attempt state.
+          if (this.stopping || Date.now() >= deadline || this.terminalFailure ||
+              this.authentication === "intervention_required" ||
+              (this.retryState.automatic && this.lastConnectionError && !transientTransportCodes.has(this.lastConnectionError.code))) break;
+        }
+        try { this.start(); }
+        catch (error) {
+          this.recordConnectionError(error);
+          this.connectionEnded = true;
+          this.terminalFailure = terminalAuthCodes.has(this.lastConnectionError!.code);
+          if (this.terminalFailure) this.authentication = "rejected";
+          this.transition("error");
+        }
+        this.retryState.attempts++;
+      }
+      // An existing in-flight startup occupies one attempt budget too.
+      const sliceDeadline = Math.min(deadline, Date.now() + Math.max(1, Math.floor((deadline - Date.now()) / (maxAttempts - attempt))));
+      while (!this.stopping && !this.connectionEnded && !this.connectionStatus().ready && Date.now() < sliceDeadline) {
+        await this.waitForLifecycle(sliceDeadline - Date.now());
+      }
+      if (this.connectionStatus().ready || this.stopping || this.terminalFailure) break;
+    }
+    this.retryState.active = false;
+    this.retryState.nextRetryAt = undefined;
+    const failed = !this.connectionStatus().ready && !this.stopping && !this.terminalFailure;
+    return this.recoveryResult(failed && Date.now() >= deadline, this.retryState.attempts,
+      failed && Date.now() < deadline && consumedAttempts >= maxAttempts && this.authentication !== "intervention_required");
+  }
+
+  private waitForLifecycle(timeout: number, delayOnly = false) {
+    if (this.stopping || timeout <= 0) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const done = () => { clearTimeout(timer); this.lifecycle.off("change", changed); resolve(); };
+      const changed = () => { if (!delayOnly || this.stopping || this.terminalFailure || this.connectionStatus().ready || this.authentication === "intervention_required") done(); };
+      const timer = setTimeout(done, timeout);
+      this.lifecycle.on("change", changed);
+    });
+  }
+
+  private withRecoveryDeadline(flight: Promise<ReturnType<BotController["recoveryResult"]>>, timeout: number) {
+    return new Promise<ReturnType<BotController["recoveryResult"]>>((resolve, reject) => {
+      const timer = setTimeout(() => resolve(this.recoveryResult(true)), timeout);
+      flight.then((result) => { clearTimeout(timer); resolve(result); }, (error) => { clearTimeout(timer); reject(error); });
+    });
+  }
+
+  private maybeAutoReconnect() {
+    if (this.stopping || this.options.autoReconnect !== true || this.recovery || this.terminalFailure ||
+        !this.lastConnectionError || this.lastConnectionError.generation !== this.generation ||
+        !transientTransportCodes.has(this.lastConnectionError.code)) return;
+    // Defer until the error/kick/end burst is fully classified.
+    queueMicrotask(() => {
+      if (this.stopping || this.terminalFailure || this.recovery) return;
+      try {
+        const recovery = this.ensureReady({ timeout: 30_000,
+          maxAttempts: this.options.reconnectMaxAttempts ?? 3, backoff: this.options.reconnectBackoff ?? 250 });
+        this.retryState.automatic = true;
+        void recovery.catch(() => {});
+      } catch (error) {
+        this.recordConnectionError(error);
+        this.transition("error");
+      }
+    });
+  }
+
+  private checkWorld() {
+    if (this.bot) this.world.checkWorld(this.bot, this.observationContext());
+  }
+
+  private checkActionTargets() {
+    const owners = new Set((["movement", "look", "item", "window"] as ActionResource[]).map((resource) => this.actions.owner(resource)).filter((id): id is string => Boolean(id)));
+    for (const owner of owners) {
+      const action = this.actions.get(owner);
+      if (!action.target) continue;
+      try { this.world.resolveTrack(action.target); }
+      catch (error) { this.actions.fail(owner, error); }
+    }
   }
 
   private invalidateWorld(reason: string) {
@@ -572,19 +905,22 @@ export class BotController {
   }
 
   private guardActionPackets() {
-    const client = this.bot?._client;
+    const bot = this.bot;
+    const generation = this.generation;
+    const client = bot?._client;
     if (!client) return;
     const write = client.write.bind(client);
     const mutations = new Set(["use_entity", "block_place", "block_dig", "window_click", "held_item_slot",
       "arm_animation", "entity_action", "use_item", "vehicle_move", "steer_vehicle", "update_sign", "close_window"]);
     client.write = (name, params) => {
+      if (bot !== this.bot || generation !== this.generation) return;
       const context = this.execution.getStore();
       if (context && mutations.has(name)) {
         // AsyncLocalStorage follows Mineflayer's internal promises and timers.
         // Already-sent operations remain server-owned, but a stale continuation
         // may not send the next operation after cancellation or rebinding.
         try {
-          this.reconcile();
+          this.checkWorld();
           if (this.actions.get(context.action).state !== "running") return;
           if (context.worldEpoch !== this.world.worldEpoch) {
             this.actions.fail(context.action, new CliError("WORLD_CHANGED", "World changed before packet submission.", "Observe a fresh frame."));
@@ -604,12 +940,14 @@ export class BotController {
     const tracking = this.lookTracking;
     if (!tracking || this.lookBusy) return;
     try {
+      this.checkWorld();
       const entity = this.world.resolveTrack(tracking.track) as MineflayerEntity;
       if (!entity.position) throw new CliError("TRACK_LOST", "Target has no current position.", "Observe a fresh frame.");
       this.lookBusy = true;
+      const generation = this.generation;
       Promise.resolve(this.requireBot().lookAt(new Vec3(entity.position.x, entity.position.y, entity.position.z)))
         .catch((error) => this.actions.fail(tracking.action, error))
-        .finally(() => { this.lookBusy = false; });
+        .finally(() => { if (generation === this.generation) this.lookBusy = false; });
     } catch (error) { this.actions.fail(tracking.action, error); }
   }
 
@@ -681,25 +1019,15 @@ export class BotController {
   findEntities(input: {
     name?: string;
     type?: string;
+    types?: string[];
     radius?: number;
     limit?: number;
     includePlayers?: boolean;
     includePassive?: boolean;
   }) {
     const bot = this.requireBot();
-    const origin = bot.entity?.position;
-    const radius = input.radius ?? 32;
-    const limit = input.limit ?? 50;
-    const entities = Object.values(bot.entities ?? {})
-      .filter((entity) => !input.name || entity.name === input.name || entity.username === input.name)
-      .filter((entity) => !input.type || entity.type === input.type)
-      .filter((entity) => input.includePlayers || !this.isPlayerEntity(entity))
-      .filter((entity) => input.includePassive || !this.isPassiveEntity(entity))
-      .map((entity) => serializeEntity(entity, origin))
-      .filter((entity) => entity && (entity.distance === undefined || entity.distance <= radius))
-      .sort((a, b) => (a?.distance ?? Number.POSITIVE_INFINITY) - (b?.distance ?? Number.POSITIVE_INFINITY))
-      .slice(0, limit);
-    return { entities };
+    this.flushChat();
+    return this.world.searchLoaded(bot, this.observationContext(), input);
   }
 
   tablist() {
@@ -797,8 +1125,59 @@ export class BotController {
   }
 
   async goto(x: number, y: number, z: number, range: number): Promise<void> {
-    this.configurePathfinderMovements();
-    await this.requirePathfinder().goto(new goals.GoalNear(x, y, z, range));
+    await this.navigateNear(x, y, z, range);
+  }
+
+  private async navigateNear(x: number, y: number, z: number, range: number): Promise<void> {
+    const expected = { runtimeId: this.world.runtimeId, worldEpoch: this.world.worldEpoch };
+    this.validateContext(expected);
+    const bot = this.requireBot();
+    const movements = this.configurePathfinderMovements();
+    const pathfinder = this.requirePathfinder();
+    const goal = new goals.GoalNear(x, y, z, range);
+    const verify = this.continuationGuard(["movement", "look"]);
+    let pathStatus: string | undefined;
+    const onUpdate = (result: { status?: unknown }) => {
+      if (typeof result?.status === "string") pathStatus = result.status;
+    };
+    const atGoal = () => {
+      const position = bot.entity?.position;
+      if (!position || ![position.x, position.y, position.z].every(Number.isFinite)) return false;
+      const node = new Vec3(Math.floor(position.x), Math.floor(position.y), Math.floor(position.z));
+      // Match pathfinder's node height when standing on a partial solid block.
+      const block = bot.blockAt?.(node);
+      if (position.y - node.y > 0.001 && bot.entity?.onGround && block && movements && !movements.emptyBlocks.has(block.type)) node.y += 1;
+      // GoalNear only reads coordinates; supply the declared Move shape as well.
+      return goal.isEnd(Object.assign(node, { remainingBlocks: 0, cost: 0, toBreak: [], toPlace: [], parkour: false, hash: `${node.x},${node.y},${node.z}` }));
+    };
+    const details = (reason: string) => ({ reason, pathStatus,
+      goal: { x: goal.x, y: goal.y, z: goal.z, range },
+      position: serializePosition(bot.entity?.position),
+      policy: { canDig: this.navigationMovementConfig.canDig === true, canPlace: this.navigationMovementConfig.canPlace === true },
+      searchRadius: pathfinder.searchRadius, thinkTimeout: pathfinder.thinkTimeout });
+    if (atGoal()) return;
+    bot.on("path_update", onUpdate);
+    try {
+      try { await pathfinder.goto(goal); }
+      catch (error) {
+        verify();
+        this.validateContext(expected);
+        if (error instanceof CliError) throw error;
+        const namedReason = error instanceof Error ? error.name : "Unknown";
+        const reason = pathStatus === "noPath" || namedReason === "NoPath" ? "NO_PATH"
+          : pathStatus === "timeout" || namedReason === "Timeout" ? "TIMEOUT"
+          : namedReason === "PathStopped" ? "PATH_STOPPED" : namedReason === "GoalChanged" ? "GOAL_CHANGED" : "PATHFINDER_ERROR";
+        throw new CliError("NAVIGATION_FAILED", error instanceof Error ? error.message : String(error),
+          "Observe the current position and nearby terrain, then choose a reachable goal or explicitly adjust navigation policy.", 1, details(reason));
+      }
+      verify();
+      this.validateContext(expected);
+      if (pathStatus === "noPath" || pathStatus === "timeout" || !atGoal()) {
+        const reason = pathStatus === "noPath" ? "NO_PATH" : pathStatus === "timeout" ? "TIMEOUT" : "GOAL_NOT_REACHED";
+        throw new CliError("NAVIGATION_FAILED", "Pathfinder stopped without reaching the goal.",
+          "Observe the current position and nearby terrain; no digging or placement permission is granted automatically.", 1, details(reason));
+      }
+    } finally { bot.off("path_update", onUpdate); }
   }
 
   follow(player: string, range: number): { following: string; range: number; targetPosition?: { x: number; y: number; z: number } } {
@@ -830,6 +1209,7 @@ export class BotController {
 
   configureNavigation(input: {
     allowDig?: boolean;
+    allowPlace?: boolean;
     allowSprinting?: boolean;
     allowParkour?: boolean;
     canOpenDoors?: boolean;
@@ -840,6 +1220,7 @@ export class BotController {
   }) {
     const pathfinder = this.requirePathfinder();
     if (input.allowDig !== undefined) this.navigationMovementConfig.canDig = input.allowDig;
+    if (input.allowPlace !== undefined) this.navigationMovementConfig.canPlace = input.allowPlace;
     if (input.allowSprinting !== undefined) this.navigationMovementConfig.allowSprinting = input.allowSprinting;
     if (input.allowParkour !== undefined) this.navigationMovementConfig.allowParkour = input.allowParkour;
     if (input.canOpenDoors !== undefined) this.navigationMovementConfig.canOpenDoors = input.canOpenDoors;
@@ -856,6 +1237,7 @@ export class BotController {
       movements: movements
         ? {
             canDig: movements.canDig,
+            canPlace: this.navigationMovementConfig.canPlace === true,
             allowSprinting: movements.allowSprinting,
             allowParkour: movements.allowParkour,
             canOpenDoors: movements.canOpenDoors,
@@ -871,8 +1253,7 @@ export class BotController {
     if (!position) {
       throw new Error(`Entity '${id}' has no position.`);
     }
-    this.configurePathfinderMovements();
-    await this.requirePathfinder().goto(new goals.GoalNear(position.x, position.y, position.z, range));
+    await this.navigateNear(position.x, position.y, position.z, range);
     return { collectedTarget: serializeEntity(entity, this.requireBot().entity?.position), inventory: this.inventory() };
   }
 
@@ -1132,11 +1513,19 @@ export class BotController {
   }
 
   stop(): void {
+    if (this.stopping) return;
+    this.stopping = true;
+    this.connectionEnded = true;
+    this.lastDisconnectReason = "STOPPED";
     this.connected = false;
     this.spawned = false;
-    this.world.reset("STOPPED");
-    this.chatReceiver?.dispose();
-    this.bot?.quit("mc-agent session stop");
+    try { this.world.reset("STOPPED"); }
+    catch (error) { this.recordConnectionError(error); }
+    finally {
+      this.lifecycleReset = true;
+      this.transition("stopping", "STOPPED");
+      this.disposeBot();
+    }
   }
 
   private requireBot(): MineflayerBot {
@@ -1150,6 +1539,8 @@ export class BotController {
     const epoch = this.world.worldEpoch;
     const owners = resources.map((resource) => this.actions.owner(resource));
     return () => {
+      this.checkWorld();
+      this.checkActionTargets();
       if (epoch !== this.world.worldEpoch) throw new CliError("WORLD_CHANGED", "World changed during action.", "Observe a fresh frame.");
       if (resources.some((resource, index) => owners[index] !== this.actions.owner(resource))) {
         throw new CliError("COMMAND_BLOCKED", "Action was replaced or cancelled.", "Inspect current actions.");
@@ -1220,7 +1611,7 @@ export class BotController {
 
   private getRequiredEntity(id: number | string): MineflayerEntity {
     if (typeof id === "string") {
-      this.reconcile();
+      this.checkWorld();
       return this.world.resolveTrack(id) as MineflayerEntity;
     }
     const entity = this.requireBot().entities?.[String(id)];
@@ -1324,6 +1715,12 @@ export class BotController {
 
   private applyNavigationMovementConfig(movements: PathfinderMovements): void {
     if (this.navigationMovementConfig.canDig !== undefined) movements.canDig = this.navigationMovementConfig.canDig;
+    if (!this.placementDefaults.has(movements)) {
+      this.placementDefaults.set(movements, { blocks: [...(movements.scafoldingBlocks ?? [])], towers: movements.allow1by1towers });
+    }
+    const defaults = this.placementDefaults.get(movements)!;
+    movements.scafoldingBlocks = this.navigationMovementConfig.canPlace ? [...defaults.blocks] : [];
+    movements.allow1by1towers = this.navigationMovementConfig.canPlace ? defaults.towers : false;
     if (this.navigationMovementConfig.allowSprinting !== undefined) movements.allowSprinting = this.navigationMovementConfig.allowSprinting;
     if (this.navigationMovementConfig.allowParkour !== undefined) movements.allowParkour = this.navigationMovementConfig.allowParkour;
     if (this.navigationMovementConfig.canOpenDoors !== undefined) movements.canOpenDoors = this.navigationMovementConfig.canOpenDoors;

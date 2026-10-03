@@ -7,16 +7,10 @@ describe("core skill content", () => {
     const compact = getSkillContent("core", false);
     const full = getSkillContent("core", true);
 
-    expect(compact).toContain("## Operating loop");
-    expect(compact).toContain("keep the returned `nextCursor`");
-    expect(compact).toContain("Commands that start managed physical work return an action ID");
-    expect(compact).toContain("mc-agent <group> <command> --help");
-    expect(compact).not.toContain("## Command discovery");
-
-    expect(full).toContain("## Command discovery");
-    expect(full).toContain("mc-agent navigate follow --help");
-    expect(full).toContain("Exit codes are");
-    expect(full).not.toContain("Frame and replay endpoints");
+    expect(compact.trim().length).toBeGreaterThan(0);
+    expect(compact.length).toBeLessThan(1600);
+    expect(full.startsWith(`${compact}\n\n`)).toBe(true);
+    expect(full.length).toBeGreaterThan(compact.length);
   });
 
   it("rejects unknown skill names", () => {

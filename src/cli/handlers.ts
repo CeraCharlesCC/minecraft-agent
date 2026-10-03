@@ -5,21 +5,27 @@ export interface StartSessionInput {
   username: string;
   auth: string;
   version?: string;
+  autoReconnect?: boolean;
+  reconnectMaxAttempts?: number;
+  reconnectBackoff?: number;
 }
 
 export interface SessionInput {
   session: string;
+  context?: string;
   runtimeId?: string;
   worldEpoch?: number;
 }
 
 export interface EventsInput extends SessionInput {
+  profile?: "all" | "agent";
   since: 0 | string;
   limit: number;
   types: string[];
 }
 
 export interface WatchInput extends SessionInput {
+  profile?: "all" | "agent";
   since: 0 | string;
   types: string[];
   track?: string;
@@ -28,6 +34,7 @@ export interface WatchInput extends SessionInput {
 }
 
 export interface FrameInput extends SessionInput {
+  detail?: "compact" | "full";
   since?: string;
   maxEntities: number;
   radius: number;
@@ -41,6 +48,10 @@ export interface DebugEventsInput extends SessionInput {
 export interface ActionInput extends SessionInput {
   action: string;
 }
+
+export interface ActionWaitInput extends ActionInput { timeout: number }
+
+export interface EnsureReadyInput extends SessionInput { timeout: number; maxAttempts: number; backoff: number }
 
 export interface ChatInput extends SessionInput {
   message: string;
@@ -118,6 +129,7 @@ export interface NavigateFollowInput extends SessionInput {
 
 export interface NavigateConfigureInput extends SessionInput {
   allowDig?: boolean;
+  allowPlace?: boolean;
   allowSprinting?: boolean;
   allowParkour?: boolean;
   canOpenDoors?: boolean;
@@ -190,6 +202,7 @@ export interface EntityAttackInput extends EntityInput {
 export interface EntityFindInput extends SessionInput {
   name?: string;
   type?: string;
+  types?: string[];
   radius: number;
   limit: number;
   includePlayers: boolean;
@@ -224,6 +237,9 @@ export interface DaemonRunInput extends StartSessionInput {
 export interface CliHandlers {
   observeFrame?(input: FrameInput): Promise<unknown>;
   debugEvents?(input: DebugEventsInput): Promise<unknown>;
+  sessionDiagnose?(input: SessionInput): Promise<unknown>;
+  sessionEnsureReady?(input: EnsureReadyInput): Promise<unknown>;
+  actionWait?(input: ActionWaitInput): Promise<unknown>;
   actionStatus?(input: ActionInput): Promise<unknown>;
   actionCancel?(input: ActionInput): Promise<unknown>;
   lookTrack?(input: EntityInput): Promise<unknown>;

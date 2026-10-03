@@ -11,7 +11,36 @@ export interface BotEvent {
   [field: string]: unknown;
 }
 
-export interface EventQuery {
+export type EventProfile = "all" | "agent";
+
+/** Stable allowlist: new event types require an intentional profile update. */
+export const AGENT_EVENT_TYPES: readonly string[] = Object.freeze([
+  "chat.player", "chat.whisper", "chat.unverified", "server.message",
+  "self.damaged", "self.health_critical", "self.died", "world.reset",
+  "connection.login", "connection.ready", "connection.disconnected", "connection.error",
+  "action.started", "action.completed", "action.failed", "action.cancelled",
+]);
+
+export interface EventFilter {
+  profile: EventProfile;
+  /** Exact resolved types; empty with unknownTypes=included means every type. */
+  types: string[];
+  unknownTypes: "included" | "excluded";
+}
+
+/** Explicit types narrow a profile. Cursors belong to a fixed profile/filter subscription. */
+export function resolveEventFilter(profile: string = "all", types: readonly string[] = []): EventFilter {
+  if (profile !== "all" && profile !== "agent") throw badInput("Event profile must be all or agent.");
+  const selected = [...new Set(types)];
+  return { profile, types: profile === "agent" ? AGENT_EVENT_TYPES.filter(type => !selected.length || selected.includes(type)) : selected,
+    unknownTypes: profile === "all" && selected.length === 0 ? "included" : "excluded" };
+}
+
+export function eventMatchesFilter(event: { type: string }, filter: EventFilter): boolean {
+  return filter.unknownTypes === "included" || filter.types.includes(event.type);
+}
+
+export interface EventQuery extends EventFilter {
   events: BotEvent[];
   nextCursor: string;
   latestCursor: string;
@@ -111,22 +140,22 @@ export class EventStore {
   }
 
   /** A cursor is a runtime capability; a bare sequence cannot survive a restart safely. */
-  query(since: string | number = 0, limit = 50, types: readonly string[] = []): EventQuery {
+  query(since: string | number = 0, limit = 50, types: readonly string[] = [], profile: string = "all"): EventQuery {
     const sequence = this.parseCursor(since);
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw badInput("Event limit must be between 1 and 1000.");
-    const filter = types.length ? new Set(types) : undefined;
-    const expiredTypes = [...this.evicted].filter(([type, highWater]) => highWater > sequence && (!filter || filter.has(type))).map(([type]) => type).sort();
+    const filter = resolveEventFilter(profile, types);
+    const expiredTypes = [...this.evicted].filter(([type, highWater]) => highWater > sequence && eventMatchesFilter({ type }, filter)).map(([type]) => type).sort();
     const events: BotEvent[] = [];
     let examined = sequence;
     for (const event of this.ordered()) {
       if (event.id <= sequence) continue;
       examined = event.id;
-      if (!filter || filter.has(event.type)) events.push(detachData(event));
+      if (eventMatchesFilter(event, filter)) events.push(detachData(event));
       if (events.length === limit) break;
     }
     // If the limit was not reached, all retained events and expired holes were examined.
     if (events.length < limit) examined = this.nextId - 1;
-    return { events, nextCursor: this.cursor(examined), latestCursor: this.getCursor(), gap: expiredTypes.length > 0, expiredTypes };
+    return { ...filter, events, nextCursor: this.cursor(examined), latestCursor: this.getCursor(), gap: expiredTypes.length > 0, expiredTypes };
   }
 
   /** Compatibility only. Public replay uses query and scoped cursors. */

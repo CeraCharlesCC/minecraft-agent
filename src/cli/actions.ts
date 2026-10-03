@@ -1,11 +1,11 @@
 import { fileURLToPath } from "node:url";
 import { once } from "node:events";
 import { CliHandlers, SessionInput } from "./handlers.js";
-import { CliError, type ErrorCode, sessionNotFound } from "../output/errors.js";
-import { daemonRequest, loadSessionForClient } from "../daemon/client.js";
+import { CliError, daemonIncompatible, sessionNotFound } from "../output/errors.js";
+import { daemonErrorCode, daemonRequest, daemonStreamRequest, loadSessionForClient } from "../daemon/client.js";
 import { runDaemon } from "../daemon/server.js";
 import { spawnSessionDaemon } from "../daemon/spawn.js";
-import { listSessions, readSession, removeSession, toPublicSession } from "../session/store.js";
+import { isProcessAlive, listSessions, readSession, removeSession, toPublicSession } from "../session/store.js";
 
 function appendEventTypes(params: URLSearchParams, types: readonly string[]): void {
   for (const type of types) {
@@ -13,8 +13,9 @@ function appendEventTypes(params: URLSearchParams, types: readonly string[]): vo
   }
 }
 
-function context(input: SessionInput): { runtimeId?: string; worldEpoch?: number } {
+function context(input: SessionInput): { context?: string; runtimeId?: string; worldEpoch?: number } {
   return {
+    ...(input.context !== undefined ? { context: input.context } : {}),
     ...(input.runtimeId !== undefined ? { runtimeId: input.runtimeId } : {}),
     ...(input.worldEpoch !== undefined ? { worldEpoch: input.worldEpoch } : {}),
   };
@@ -25,20 +26,32 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
     async startSession(input) {
       const existing = await readSession(input.session);
       if (existing) {
+        if (existing.stopping && isProcessAlive(existing.pid)) {
+          throw new CliError("SESSION_ALREADY_RUNNING", `Session '${input.session}' is still stopping.`,
+            "Wait for the original daemon to exit before starting this session again.", 1);
+        }
         let daemonIsHealthy = false;
+        let apiVersion: unknown;
         try {
-          await daemonRequest(existing, "/status", { signal: AbortSignal.timeout(1500) });
+          const status = await daemonRequest<{ apiVersion?: unknown }>(existing, "/status", { signal: AbortSignal.timeout(1500) });
+          apiVersion = status.apiVersion;
           daemonIsHealthy = true;
         } catch {
-          // A live PID is not sufficient: stale records can point at an unrelated reused PID.
+          // A failed probe does not prove a daemon exited; preserve unresolved live processes.
         }
         if (daemonIsHealthy) {
+          if (apiVersion !== 2) throw daemonIncompatible(input.session, { actualApiVersion: apiVersion ?? null });
           throw new CliError(
             "SESSION_ALREADY_RUNNING",
             `Session '${input.session}' is already running.`,
             "Use 'mc-agent session status' or stop it before starting a new session.",
             1,
           );
+        }
+        if (isProcessAlive(existing.pid)) {
+          throw new CliError("DAEMON_ERROR", `Session '${input.session}' is not responding, but its recorded process is still alive.`,
+            "Retry session status or stop the original session before starting another daemon. The existing record was preserved.", 1,
+            { session: input.session, pid: existing.pid });
         }
         await removeSession(input.session);
       }
@@ -56,8 +69,24 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
 
     async sessionStatus(input) {
       const record = await loadSessionForClient(input.session);
-      const status = await daemonRequest(record, "/status");
-      return { ...toPublicSession(record), status };
+      const status = await daemonRequest<{ apiVersion?: unknown }>(record, "/status");
+      const compatible = status.apiVersion === 2;
+      return { ...toPublicSession(record), status, compatibility: {
+        compatible, expectedApiVersion: 2, actualApiVersion: status.apiVersion ?? null,
+        ...(!compatible ? { remediation: daemonIncompatible(input.session).remediation } : {}),
+      } };
+    },
+
+    async sessionDiagnose(input) {
+      const record = await loadSessionForClient(input.session);
+      return daemonRequest(record, "/diagnose");
+    },
+
+    async sessionEnsureReady(input) {
+      const record = await loadSessionForClient(input.session);
+      return daemonRequest(record, "/ensure-ready", { method: "POST",
+        body: JSON.stringify({ timeout: input.timeout, maxAttempts: input.maxAttempts, backoff: input.backoff }),
+        signal: AbortSignal.timeout(input.timeout + 1500) });
     },
 
     async listSessions() {
@@ -67,13 +96,21 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
 
     async stopSession(input) {
       const record = await loadSessionForClient(input.session);
-      await daemonRequest(record, "/stop", { method: "POST", body: JSON.stringify(context(input)) });
-      return { session: input.session, stopped: true };
+      const accepted = await daemonRequest<{ runtimeId?: string }>(record, "/stop", { method: "POST", body: JSON.stringify(context(input)), signal: AbortSignal.timeout(1500) });
+      const runtimeId = accepted?.runtimeId;
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline) {
+        // Keep the original process identity even if the session record disappears or is replaced.
+        if (!isProcessAlive(record.pid)) return { session: input.session, runtimeId, stopped: true, timedOut: false };
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      return { session: input.session, runtimeId, stopping: true, stopped: false, timedOut: true };
     },
 
     async observeFrame(input) {
       const record = await loadSessionForClient(input.session);
       const params = new URLSearchParams({ maxEntities: String(input.maxEntities), radius: String(input.radius) });
+      if (input.detail) params.set("detail", input.detail);
       if (input.since) params.set("since", input.since);
       for (const track of input.tracks) params.append("track", track);
       return daemonRequest(record, `/frame?${params}`);
@@ -91,6 +128,12 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       return daemonRequest(record, `/actions/${encodeURIComponent(input.action)}`);
     },
 
+    async actionWait(input) {
+      const record = await loadSessionForClient(input.session);
+      return daemonRequest(record, `/actions/${encodeURIComponent(input.action)}/wait?timeout=${input.timeout}`,
+        { signal: AbortSignal.timeout(input.timeout + 1500) });
+    },
+
     async actionCancel(input) {
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, `/actions/${encodeURIComponent(input.action)}/cancel`, { method: "POST", body: JSON.stringify(context(input)) });
@@ -104,6 +147,7 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
     async observeEvents(input) {
       const record = await loadSessionForClient(input.session);
       const params = new URLSearchParams({ since: String(input.since), limit: String(input.limit) });
+      if (input.profile) params.set("profile", input.profile);
       appendEventTypes(params, input.types);
       return daemonRequest(record, `/events?${params.toString()}`);
     },
@@ -111,22 +155,24 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
     async observeWatch(input) {
       const record = await loadSessionForClient(input.session);
       const params = new URLSearchParams({ since: String(input.since) });
+      if (input.profile) params.set("profile", input.profile);
       appendEventTypes(params, input.types);
       const endpoint = input.track ? "/sample" : "/watch";
       if (input.track) {
         params.delete("since");
+        params.delete("profile");
         params.set("track", input.track);
         params.set("fields", (input.fields ?? ["position"]).join(","));
         params.set("rate", String(input.rate ?? 2));
       }
-      const response = await fetch(`http://127.0.0.1:${record.controlPort}${endpoint}?${params.toString()}`, {
-        headers: { Authorization: `Bearer ${record.token}` },
-      });
+      const response = await daemonStreamRequest(record, `${endpoint}?${params.toString()}`);
       if (!response.ok) {
         let payload: { code?: unknown; error?: unknown; message?: unknown; remediation?: unknown; details?: Record<string, unknown> } = {};
         try { payload = await response.json(); } catch { /* Preserve a useful fallback for non-JSON transport failures. */ }
-        const knownCodes: ErrorCode[] = ["BAD_INPUT", "DAEMON_ERROR", "TRACK_UNKNOWN", "TRACK_LOST", "WORLD_CHANGED", "RUNTIME_MISMATCH", "NOT_READY", "STREAM_OVERFLOW"];
-        const code = knownCodes.includes(payload.code as ErrorCode) ? payload.code as ErrorCode : "DAEMON_ERROR";
+        if (response.status === 404 && payload.code === undefined) {
+          throw daemonIncompatible(input.session, { path: endpoint, httpStatus: response.status });
+        }
+        const code = daemonErrorCode(payload.code);
         const message = typeof payload.error === "string" ? payload.error : typeof payload.message === "string" ? payload.message : "Unable to watch daemon events.";
         throw new CliError(code, message, typeof payload.remediation === "string" ? payload.remediation : "Observe a fresh frame and retry with current handles.", code === "BAD_INPUT" ? 3 : 1, payload.details);
       }
@@ -134,12 +180,15 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
         throw new CliError("DAEMON_ERROR", "Daemon stream has no response body.", "Inspect session status and retry.", 1);
       }
       const reader = response.body.getReader();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-          return;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) return;
+          if (!process.stdout.write(Buffer.from(value))) await once(process.stdout, "drain");
         }
-        if (!process.stdout.write(Buffer.from(value))) await once(process.stdout, "drain");
+      } finally {
+        await reader.cancel().catch(() => undefined);
+        reader.releaseLock();
       }
     },
 
@@ -303,6 +352,7 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
         method: "POST",
         body: JSON.stringify({ ...context(input),
           allowDig: input.allowDig,
+          allowPlace: input.allowPlace,
           allowSprinting: input.allowSprinting,
           allowParkour: input.allowParkour,
           canOpenDoors: input.canOpenDoors,
@@ -526,6 +576,7 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       });
       if (input.name) params.set("name", input.name);
       if (input.type) params.set("type", input.type);
+      for (const species of input.types ?? []) params.append("types", species);
       return daemonRequest(record, `/entity/find?${params.toString()}`);
     },
 

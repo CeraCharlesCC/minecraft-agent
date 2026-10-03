@@ -5,7 +5,7 @@ async function loadSpawnWithMocks() {
   vi.resetModules();
   const child = { unref: vi.fn() };
   const mocks = {
-    spawn: vi.fn(() => child),
+    spawn: vi.fn((_command: string, _args: string[], _options: unknown) => child),
     openSync: vi.fn(() => 123),
     mkdir: vi.fn(),
     getStateDir: vi.fn(() => "C:\\state"),
@@ -37,7 +37,7 @@ async function loadSpawnWithNetMock(address: unknown) {
   };
   const mocks = {
     createServer: vi.fn(() => server),
-    spawn: vi.fn(() => child),
+    spawn: vi.fn((_command: string, _args: string[], _options: unknown) => child),
     openSync: vi.fn(() => 123),
     mkdir: vi.fn(),
     getStateDir: vi.fn(() => "C:\\state"),
@@ -87,13 +87,16 @@ describe("daemon spawn", () => {
     expect(mocks.openSync).toHaveBeenCalledWith(join("C:\\state", "default.log"), "a");
     expect(mocks.spawn).toHaveBeenCalledWith(
       process.execPath,
-      expect.arrayContaining(["entry.js", "daemon", "run", "--session", "default", "--version", "1.20.4"]),
+      expect.arrayContaining(["entry.js", "daemon", "run", "--session", "default", "--minecraft-version", "1.20.4"]),
       expect.objectContaining({
         detached: true,
         stdio: ["ignore", 123, 123],
         env: expect.objectContaining({ MC_AGENT_CONTROL_TOKEN: expect.any(String) }),
       }),
     );
+    const args = mocks.spawn.mock.calls[0][1];
+    expect(args.slice(args.indexOf("--minecraft-version"), args.indexOf("--minecraft-version") + 2)).toEqual(["--minecraft-version", "1.20.4"]);
+    expect(args).not.toContain("--version");
     expect(child.unref).toHaveBeenCalled();
     expect(mocks.daemonRequest).toHaveBeenCalledWith(expect.objectContaining({ controlPort: 12345 }), "/status");
   });

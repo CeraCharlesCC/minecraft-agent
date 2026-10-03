@@ -25,6 +25,49 @@ function adapter() {
 }
 
 describe("installed Mineflayer chat adapter", () => {
+  it.each([
+    ["[GSit] Update: Please download a new version", "player", "Update", "Please download a new version"],
+    ["<Alex> hello", "player", "Alex", "hello"],
+    ["Alex whispers: secret", "whisper", "Alex", "secret"],
+  ])("retains pattern-only SYSTEM message %s as an unverified claim", (originalText, claimedChannel, candidateSender, content) => {
+    const { bot, chat, events } = adapter();
+    for (let i = 0; i < 2; i++) bot._client.emit("systemChat", {
+      positionId: 1, formattedMessage: JSON.stringify({ text: originalText }),
+    });
+    chat.flush();
+    const replay = events.query();
+    expect(replay.events).toHaveLength(2);
+    expect(new Set(replay.events.map(event => event.messageId)).size).toBe(2);
+    for (const event of replay.events) {
+      expect(event).toMatchObject({ type: "chat.unverified", channel: "unverified", text: content,
+        claimedChannel, candidateSender, originalText, attribution: "pattern",
+        candidateSenderIdentity: { username: candidateSender }, provenance: { attribution: "pattern", position: "system" } });
+      expect(event).not.toHaveProperty("senderIdentity");
+      expect(events.getDebug(event.messageId as string)[0]!.raw).toHaveProperty(claimedChannel === "player" ? "chat" : "whisper");
+    }
+    // Registry enrichment is useful candidate information, never authorship proof.
+    if (candidateSender === "Alex") expect(replay.events[0]!.candidateSenderIdentity).toMatchObject({ uuid: ALEX_UUID });
+  });
+
+  it("recognizes exact Xaero raw control payloads and retains unknown section codes", () => {
+    const { bot, chat, events } = adapter();
+    const rawPayload = "§f§a§i§r§x§a§e§r§o";
+    const ChatMessage = require("prismarine-chat")(bot.registry);
+    const message = new ChatMessage({ text: rawPayload });
+    let renderCalls = 0;
+    message.toString = () => { renderCalls++; return "§i§x"; };
+    bot.emit("message", message, "system");
+    expect(renderCalls).toBe(0);
+    bot._client.emit("systemChat", { positionId: 1, formattedMessage: JSON.stringify({ text: "unknown §i§x keep" }) });
+    chat.flush();
+    expect(events.query().events).toEqual([
+      expect.objectContaining({ type: "server.control", channel: "control", control: "xaero.fairplay", text: rawPayload }),
+      expect.objectContaining({ type: "server.message", text: "unknown §i§x keep" }),
+    ]);
+    expect(events.getDebug()[0]!.raw).toMatchObject({ message: { text: rawPayload } });
+    expect(events.query(0, 50, [], "agent").events).toEqual([expect.objectContaining({ text: "unknown §i§x keep" })]);
+  });
+
   it("attributes outgoing whisper echoes to self and incoming whispers to the sender without merging repeated packets", () => {
     const { bot, chat, events } = adapter();
     for (const direction of ["outgoing", "incoming", "incoming"]) {

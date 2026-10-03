@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { chmod, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 
@@ -14,6 +14,8 @@ export interface SessionRecord {
   auth: string;
   version?: string;
   startedAt: string;
+  runtimeId?: string;
+  stopping?: boolean;
 }
 
 export interface PublicSessionRecord {
@@ -69,8 +71,13 @@ export async function writeSession(record: SessionRecord, stateDir = getStateDir
 
   await mkdir(stateDir, { recursive: true, mode: 0o700 });
   await chmodBestEffort(stateDir, 0o700);
-  await writeFile(sessionFilePath(record.session, stateDir), `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
-  await chmodBestEffort(sessionFilePath(record.session, stateDir), 0o600);
+  const destination = sessionFilePath(record.session, stateDir);
+  const temporary = `${destination}.${randomBytes(8).toString("hex")}.tmp`;
+  try {
+    await writeFile(temporary, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+    await rename(temporary, destination);
+  } finally { await rm(temporary, { force: true }); }
+  await chmodBestEffort(destination, 0o600);
 }
 
 export async function readSession(

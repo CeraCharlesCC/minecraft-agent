@@ -1,11 +1,43 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it } from "vitest";
 import { CanonicalChat } from "../src/core/chat.js";
-import { EventStore } from "../src/core/events.js";
+import { AGENT_EVENT_TYPES, EventStore, eventMatchesFilter, resolveEventFilter } from "../src/core/events.js";
 
 const tick = async (): Promise<void> => { await Promise.resolve(); };
 
 describe("semantic event replay", () => {
+  it("uses a stable agent allowlist with explicit narrowing and independent subscription cursors", () => {
+    const events = new EventStore({ maxEvents: 1 });
+    events.add({ type: "entity.appeared" });
+    events.add({ type: "entity.appeared" });
+    events.add({ type: "server.control" });
+    const unverified = events.add({ type: "chat.unverified", text: "candidate" });
+    events.add({ type: "future.notification" });
+    const failed = events.add({ type: "action.failed" });
+    const first = events.query(0, 1, [], "agent");
+    expect(first).toMatchObject({ profile: "agent", types: AGENT_EVENT_TYPES, unknownTypes: "excluded",
+      gap: false, expiredTypes: [], events: [unverified], nextCursor: unverified.cursor });
+    expect(events.query(first.nextCursor, 1, [], "agent").events).toEqual([failed]);
+    const exhausted = events.query(failed.cursor, 50, [], "agent");
+    expect(exhausted.nextCursor).toBe(events.getCursor());
+    expect(events.query(exhausted.nextCursor).events).toEqual([]);
+    expect(events.query(0)).toMatchObject({ profile: "all", types: [], unknownTypes: "included", gap: true });
+    expect(events.query(0).events).toContainEqual(expect.objectContaining({ type: "future.notification" }));
+    expect(events.query(0, 50, ["chat.unverified", "entity.appeared"], "agent")).toMatchObject({
+      types: ["chat.unverified"], events: [unverified], gap: false,
+    });
+    expect(events.query(0, 50, ["entity.appeared"], "agent")).toMatchObject({ types: [], events: [], gap: false });
+    expect(eventMatchesFilter({ type: "entity.appeared" }, resolveEventFilter("agent", ["entity.appeared"]))).toBe(false);
+    expect(() => events.query(0, 50, [], "typo")).toThrow(expect.objectContaining({ code: "BAD_INPUT" }));
+  });
+
+  it("reports agent gaps only for retained profile types", () => {
+    const events = new EventStore({ retention: { "chat.unverified": 1 } });
+    events.add({ type: "chat.unverified" });
+    events.add({ type: "chat.unverified" });
+    expect(events.query(0, 50, [], "agent")).toMatchObject({ gap: true, expiredTypes: ["chat.unverified"] });
+    expect(events.query(0, 50, ["action.failed"], "agent")).toMatchObject({ gap: false, expiredTypes: [] });
+  });
   it("allocates new runtime identities and rejects handles from a prior runtime", () => {
     const first = new EventStore();
     const restarted = new EventStore();
@@ -129,8 +161,8 @@ describe("canonical chat receipt", () => {
     bot.emit("whisper", "Alex", "secret", undefined, json);
     await tick();
     expect(events.query().events).toEqual([
-      expect.objectContaining({ type: "chat.player", text: "hello" }),
-      expect.objectContaining({ type: "chat.whisper", text: "secret" }),
+      expect.objectContaining({ type: "chat.unverified", claimedChannel: "player", text: "hello" }),
+      expect.objectContaining({ type: "chat.unverified", claimedChannel: "whisper", text: "secret" }),
     ]);
   });
 
@@ -173,7 +205,7 @@ describe("canonical chat receipt", () => {
     bot.emit("chat", "Alex", "whispers: secret", undefined, json);
     bot.emit("whisper", "Alex", "secret", undefined, json);
     chat.flush();
-    expect(events.query().events).toEqual([expect.objectContaining({ type: "chat.whisper", text: "secret", channel: "whisper", attribution: "pattern" })]);
+    expect(events.query().events).toEqual([expect.objectContaining({ type: "chat.unverified", text: "secret", channel: "unverified", claimedChannel: "whisper", attribution: "pattern" })]);
     chat.dispose();
     bot.emit("chat", "Alex", "ignored");
     expect(events.query().events).toHaveLength(1);

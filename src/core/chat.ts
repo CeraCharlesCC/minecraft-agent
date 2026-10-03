@@ -9,7 +9,7 @@ export interface ChatSender {
 
 export type ResolveChatSender = (username?: string, uuid?: string) => ChatSender | undefined;
 type Callback = "message" | "chat" | "whisper";
-type Channel = "player" | "whisper" | "server" | "game_info";
+type Channel = "player" | "whisper" | "server" | "game_info" | "control";
 type Attribution = "verified" | "structured" | "pattern" | "unknown";
 const translationLayouts: Record<string, { sender?: number; content: number; recipient?: number; team?: number; direction?: "incoming" | "outgoing" }> = {
   "commands.message.display.incoming": { sender: 0, content: 1, direction: "incoming" },
@@ -27,6 +27,8 @@ interface Receipt {
   messageId: string;
   receivedAt: string;
   text: string;
+  originalText?: string;
+  control?: string;
   channel: Channel;
   sender: ChatSender;
   attribution: Attribution;
@@ -58,6 +60,21 @@ function uuid(value: unknown): string | undefined {
   return typeof value === "string" && /^(?:[\da-f]{32}|[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12})$/i.test(value) ? value.toLowerCase() : undefined;
 }
 
+/** Read literal component data before a ChatMessage renderer removes formatting. */
+function literalText(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    const parts = value.map(literalText);
+    return parts.every(part => part !== undefined) ? parts.join("") : undefined;
+  }
+  const component = record(value);
+  if (!component || component.translate !== undefined || typeof component.text !== "string") return undefined;
+  const extra = component.extra === undefined ? "" : literalText(component.extra);
+  return extra === undefined ? undefined : component.text + extra;
+}
+
+const xaeroFairplayPayload = "§f§a§i§r§x§a§e§r§o";
+
 /**
  * Mineflayer emits message -> messagestr -> its legacy chat/whisper patterns.
  * One receipt joins these callbacks by their exact ChatMessage object, with an
@@ -74,6 +91,14 @@ export class CanonicalChat {
     receipt.raw.position = position;
     receipt.raw.sender = sender;
     receipt.raw.verified = verified;
+    if (literalText(message) === xaeroFairplayPayload) {
+      receipt.channel = "control";
+      receipt.control = "xaero.fairplay";
+      receipt.text = xaeroFairplayPayload;
+      receipt.attribution = "unknown";
+      return;
+    }
+    receipt.originalText = text(message);
     const metadata = record(message);
     const translation = typeof metadata?.translate === "string" ? metadata.translate : undefined;
     const parts = Array.isArray(metadata?.with) ? metadata.with : [];
@@ -144,7 +169,8 @@ export class CanonicalChat {
   private classify(callback: "chat" | "whisper", sender: string, message: string, translate: unknown, json: unknown): void {
     const receipt = this.receive(callback, json);
     receipt.raw[callback] = detachData({ sender, message, translate, json });
-    if (receipt.structuredLayout) return;
+    if (receipt.structuredLayout || receipt.control) return;
+    receipt.originalText ??= literalText(json) ?? String(message);
     // A whisper pattern wins over a broad player-chat pattern for the same receipt.
     if (callback === "chat" && receipt.callbacks.has("whisper")) return;
     receipt.channel = callback === "whisper" ? "whisper" : "player";
@@ -201,20 +227,30 @@ export class CanonicalChat {
     const sender = { ...resolved, ...receipt.sender,
       ...(receipt.sender.uuid && resolved?.username ? { username: resolved.username } : {}) };
     const recipient = receipt.recipient ? { ...this.resolveSender?.(receipt.recipient.username, receipt.recipient.uuid), ...receipt.recipient } : undefined;
-    const eventType = receipt.channel === "player" ? "chat.player" : receipt.channel === "whisper" ? "chat.whisper" : "server.message";
+    const unverified = (receipt.channel === "player" || receipt.channel === "whisper") &&
+      receipt.attribution !== "verified" && receipt.attribution !== "structured";
+    const eventType = receipt.control ? "server.control" : unverified ? "chat.unverified" :
+      receipt.channel === "player" ? "chat.player" : receipt.channel === "whisper" ? "chat.whisper" : "server.message";
     this.events.add({
       type: eventType,
       timestamp: receipt.receivedAt,
       messageId: receipt.messageId,
       receivedAt: receipt.receivedAt,
       text: receipt.text,
-      channel: receipt.channel,
+      channel: unverified ? "unverified" : receipt.channel,
+      ...(unverified ? { claimedChannel: receipt.channel, candidateSenderIdentity: sender,
+        ...(sender.username ? { candidateSender: sender.username } : {}) } : {
+        ...(sender.username ? { sender: sender.username } : {}), senderIdentity: sender,
+      }),
+      ...(receipt.control ? { control: receipt.control } : {}),
+      ...(receipt.originalText === undefined ? {} : { originalText: receipt.originalText }),
       ...(receipt.direction ? { direction: receipt.direction } : {}),
       ...(recipient ? { recipientIdentity: recipient } : {}),
       ...(receipt.team === undefined ? {} : { team: receipt.team }),
-      ...(sender.username ? { sender: sender.username } : {}),
-      senderIdentity: sender,
       attribution: receipt.attribution,
+      provenance: { attribution: receipt.attribution, callbacks: [...receipt.callbacks],
+        ...(receipt.raw.position === undefined ? {} : { position: receipt.raw.position }),
+        ...(typeof record(receipt.raw.message)?.translate === "string" ? { translation: record(receipt.raw.message)!.translate } : {}) },
       ...(receipt.verified === undefined ? {} : { verified: receipt.verified }),
       raw: receipt.raw,
     });

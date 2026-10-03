@@ -2,8 +2,8 @@ import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { BotOptions, BotController, CreateBotFn } from "./bot.js";
 import { CliError, badInput } from "../output/errors.js";
 import { ActionResource } from "../core/actions.js";
-import { EventStore } from "../core/events.js";
-import { removeSession, SessionRecord, writeSession } from "../session/store.js";
+import { EventStore, eventMatchesFilter, resolveEventFilter } from "../core/events.js";
+import { readSession, removeSession, SessionRecord, writeSession } from "../session/store.js";
 
 export interface DaemonOptions extends BotOptions {
   session: string;
@@ -89,10 +89,6 @@ function eventTypesFromSearch(url: URL): string[] {
     .filter(Boolean);
 }
 
-function eventMatchesTypes(event: { type: string }, types: readonly string[]): boolean {
-  return types.length === 0 || types.includes(event.type);
-}
-
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -130,9 +126,19 @@ function daemonErrorResponse(error: unknown) {
 export async function runDaemon(options: DaemonOptions): Promise<void> {
   const events = new EventStore();
   const controller = new BotController(options, events, options.createBotFn);
+  const stopLogging = events.subscribe((event) => {
+    if (!event.type.startsWith("connection.")) return;
+    console.log(JSON.stringify({ timestamp: event.timestamp, session: options.session, type: event.type,
+      text: event.text, reason: event.reason, connection: controller.connectionStatus() }));
+  });
   controller.start();
 
   const activeStreams = new Set<ServerResponse>();
+  let shuttingDown = false;
+  let shutdown: Promise<void> | undefined;
+  let stopAcceptance: Promise<void> | undefined;
+  let stopPersistenceError: { code: string; message: string } | undefined;
+  let record: SessionRecord;
   const server = createServer(async (request, response) => {
     try {
       if (!isAuthorized(request, options.token)) {
@@ -148,18 +154,55 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
         return;
       }
 
-      if (request.method === "POST" && url.pathname === "/stop") {
-        sendJson(response, 200, { stopped: true });
-        controller.stop();
-        void removeSession(options.session).finally(() => {
-          for (const stream of activeStreams) stream.end();
-          server.close();
-          if (options.exitOnStop ?? true) {
-            process.exit(0);
-          }
-        });
+      if (request.method === "GET" && url.pathname === "/diagnose") {
+        sendJson(response, 200, controller.diagnose());
         return;
       }
+      if (request.method === "POST" && url.pathname === "/ensure-ready") {
+        controller.assertNotStopping();
+        const input = await readJson(request);
+        sendJson(response, 200, await controller.ensureReady(input as never));
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/stop") {
+        stopAcceptance ??= (async () => {
+          shuttingDown = true;
+          controller.stop();
+          // Acceptance includes an atomically persisted stopping marker.
+          try { await writeSession({ ...record, stopping: true }); }
+          catch (error) {
+            stopPersistenceError = { code: (error as NodeJS.ErrnoException).code ?? "UNKNOWN", message: errorMessage(error) };
+            console.error("Unable to persist daemon stopping state:", stopPersistenceError);
+          }
+        })();
+        await stopAcceptance;
+        sendJson(response, 200, { stopping: true, stopped: false, runtimeId: controller.world.runtimeId, pid: process.pid, ...(stopPersistenceError ? { persistenceError: stopPersistenceError } : {}) });
+        shutdown ??= (async () => {
+          if (!response.writableFinished && !response.destroyed) await new Promise<void>((resolve) => {
+            const done = () => { response.off("finish", done); response.off("close", done); resolve(); };
+            response.once("finish", done);
+            response.once("close", done);
+          });
+          for (const stream of activeStreams) stream.end();
+          await new Promise<void>((resolve) => {
+            const forceClose = setTimeout(() => server.closeAllConnections(), 1000);
+            forceClose.unref();
+            server.close(() => { clearTimeout(forceClose); resolve(); });
+            server.closeIdleConnections();
+          });
+          stopLogging();
+          try {
+            const current = await readSession(options.session);
+            if (current?.token === options.token && current.runtimeId === controller.world.runtimeId) await removeSession(options.session);
+          } finally {
+            // Disk failures must not strand a stopped controller in a live process.
+            if (options.exitOnStop ?? true) process.exit(0);
+          }
+        })();
+        void shutdown.catch((error) => { console.error("Daemon shutdown failed:", errorMessage(error)); });
+        return;
+      }
+      if (shuttingDown && request.method === "POST") controller.assertNotStopping();
 
       if (request.method === "GET" && ["/watch", "/sample"].includes(url.pathname)) {
         if (activeStreams.size >= 32) throw new CliError("STREAM_OVERFLOW", "Subscriber limit reached.", "Close an existing stream before reconnecting.");
@@ -169,8 +212,9 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
       if (request.method === "GET" && url.pathname === "/frame") {
         sendJson(response, 200, controller.frame({
           since: url.searchParams.get("since") ?? undefined,
-          maxEntities: Number(url.searchParams.get("maxEntities") ?? "50"),
+          maxEntities: Number(url.searchParams.get("maxEntities") ?? "12"),
           radius: Number(url.searchParams.get("radius") ?? "64"),
+          detail: (url.searchParams.get("detail") ?? "compact") as "compact" | "full",
           tracks: url.searchParams.getAll("track").flatMap((value) => value.split(",")),
         }));
         return;
@@ -182,23 +226,24 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
       controller.flushChat();
       if (request.method === "GET" && url.pathname === "/events") {
         sendJson(response, 200, events.query(url.searchParams.get("since") ?? "0",
-          Number(url.searchParams.get("limit") ?? "50"), eventTypesFromSearch(url)));
+          Number(url.searchParams.get("limit") ?? "50"), eventTypesFromSearch(url), url.searchParams.get("profile") ?? "all"));
         return;
       }
       if (request.method === "GET" && url.pathname === "/watch") {
         const types = eventTypesFromSearch(url);
-        let replay = events.query(url.searchParams.get("since") ?? "0", 1000, types);
+        const filter = resolveEventFilter(url.searchParams.get("profile") ?? "all", types);
+        let replay = events.query(url.searchParams.get("since") ?? "0", 1000, types, filter.profile);
         const initialReplay = replay;
         const backlog = [...replay.events];
         while (replay.nextCursor !== replay.latestCursor) {
-          replay = events.query(replay.nextCursor, 1000, types);
+          replay = events.query(replay.nextCursor, 1000, types, filter.profile);
           backlog.push(...replay.events);
         }
         const stream = boundedStream(response);
         let starting = true;
         const live: typeof backlog = [];
         const unsubscribe = events.subscribe((event) => {
-          if (!eventMatchesTypes(event, types)) return;
+          if (!eventMatchesFilter(event, filter)) return;
           if (stream.closed) { unsubscribe(); return; }
           if (!starting) stream.write(event);
           else if (live.length < 128) live.push(event);
@@ -243,6 +288,17 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
         }, 1000 / rate);
         timer.unref();
         response.on("close", () => clearInterval(timer));
+        return;
+      }
+      const actionWaitRoute = /^\/actions\/([^/]+)\/wait$/.exec(url.pathname);
+      if (request.method === "GET" && actionWaitRoute) {
+        const abort = new AbortController();
+        const close = () => { if (!response.writableEnded) abort.abort(); };
+        response.on("close", close);
+        try {
+          const result = await controller.actions.wait(decodeURIComponent(actionWaitRoute[1]), Number(url.searchParams.get("timeout") ?? "5000"), abort.signal);
+          if (!response.destroyed) sendJson(response, 200, result);
+        } finally { response.off("close", close); }
         return;
       }
       const actionRoute = /^\/actions\/([^/]+)(\/cancel)?$/.exec(url.pathname);
@@ -461,6 +517,7 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
       if (request.method === "POST" && url.pathname === "/navigate/configure") {
         const body = (await readJson(request)) as {
           allowDig?: boolean;
+          allowPlace?: boolean;
           allowSprinting?: boolean;
           allowParkour?: boolean;
           canOpenDoors?: boolean;
@@ -470,6 +527,12 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
           tickTimeout?: number;
         };
         controller.validateContext(body as never);
+        for (const key of ["allowDig", "allowPlace", "allowSprinting", "allowParkour", "canOpenDoors"] as const) {
+          if (body[key] !== undefined && typeof body[key] !== "boolean") throw badInput(`Invalid ${key}.`);
+        }
+        for (const key of ["maxDropDown", "searchRadius", "thinkTimeout", "tickTimeout"] as const) {
+          if (body[key] !== undefined && (!Number.isSafeInteger(body[key]) || body[key]! < (key === "searchRadius" ? -1 : key === "maxDropDown" ? 0 : 1))) throw badInput(`Invalid ${key}.`);
+        }
         sendJson(response, 200, controller.configureNavigation(body));
         return;
       }
@@ -500,6 +563,7 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
           controller.findEntities({
             name: url.searchParams.get("name") ?? undefined,
             type: url.searchParams.get("type") ?? undefined,
+            types: url.searchParams.has("types") ? url.searchParams.getAll("types").flatMap(value => value.split(",")).map(value => value.trim()).filter(Boolean) : undefined,
             radius: Number(url.searchParams.get("radius") ?? "32"),
             limit: Number(url.searchParams.get("limit") ?? "50"),
             includePlayers: url.searchParams.get("includePlayers") === "true",
@@ -511,6 +575,7 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
 
       sendJson(response, 404, { error: "not found" });
     } catch (error) {
+      if (response.destroyed || response.writableEnded) return;
       const { statusCode, body } = daemonErrorResponse(error);
       sendJson(response, statusCode, body);
     }
@@ -520,7 +585,7 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
     server.listen(options.controlPort, "127.0.0.1", resolve);
   });
 
-  const record: SessionRecord = {
+  record = {
     session: options.session,
     pid: process.pid,
     controlPort: options.controlPort,
@@ -531,6 +596,8 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
     auth: options.auth,
     version: options.version,
     startedAt: new Date().toISOString(),
+    runtimeId: controller.world.runtimeId,
+    stopping: false,
   };
   await writeSession(record);
 }

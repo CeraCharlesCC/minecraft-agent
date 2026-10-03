@@ -65,7 +65,8 @@ class FakeBot extends EventEmitter {
   canDigBlock = vi.fn(() => true);
   digTime = vi.fn(() => 250);
   findBlocks = vi.fn((options?: any) => (options?.matching === 59 ? [new Vec3(20, 64, 20)] : [new Vec3(1, 2, 3)]));
-  equip = vi.fn();
+  equipCalls = vi.fn();
+  equip = this.equipCalls;
   unequip = vi.fn();
   setQuickBarSlot = vi.fn();
   toss = vi.fn();
@@ -75,9 +76,11 @@ class FakeBot extends EventEmitter {
   deactivateItem = vi.fn();
   recipesFor = vi.fn(() => [{ id: "recipe", result: { count: 4 } }]);
   craft = vi.fn();
-  dig = vi.fn();
+  digCalls = vi.fn();
+  dig = this.digCalls;
   stopDigging = vi.fn();
-  placeBlock = vi.fn();
+  placeBlockCalls = vi.fn();
+  placeBlock = this.placeBlockCalls;
   placeEntity = vi.fn(async () => ({ id: 12, name: "boat", type: "object", position: { x: 1, y: 2, z: 3 } }));
   activateBlockCalls = vi.fn();
   activateBlock = this.activateBlockCalls;
@@ -85,7 +88,8 @@ class FakeBot extends EventEmitter {
   sleep = vi.fn();
   wake = vi.fn();
   elytraFly = vi.fn();
-  activateEntity = vi.fn();
+  activateEntityCalls = vi.fn();
+  activateEntity = this.activateEntityCalls;
   useOn = vi.fn();
   attack = vi.fn();
   swingArm = vi.fn();
@@ -122,6 +126,85 @@ function controller() {
 }
 
 describe("BotController", () => {
+  it("returns actionable player and passive tracks from ready search and honors current bindings", async () => {
+    const { subject, bot } = controller();
+    Object.assign(bot.entities, { "11": bot.players.Steve.entity });
+    Object.assign(bot.players, { Unloaded: { username: "Unloaded" } });
+    expect(subject.findEntities({}).entities).toEqual([]);
+    bot.emit("spawn");
+    const found = subject.findEntities({ radius: 16 });
+    expect(found.entities.map((item: any) => item.type)).toEqual(["minecraft:cow", "minecraft:player", "minecraft:sniffer"]);
+    expect(found).toMatchObject({ runtimeId: subject.world.runtimeId, worldEpoch: subject.world.worldEpoch, context: expect.stringMatching(/^mcctx1\./), observedAt: expect.any(String) });
+    const player = found.entities[1];
+    subject.validateContext({ context: found.context });
+    await subject.activateEntity(player.trackId);
+    expect(bot.activateEntityCalls).toHaveBeenCalledWith(bot.players.Steve.entity);
+    expect(() => subject.attackEntity(player.trackId)).toThrow("Refusing to attack a player");
+    expect(subject.findEntities({ types: ["minecraft:sniffer"] }).entities).toEqual([expect.objectContaining({ type: "minecraft:sniffer" })]);
+    bot.emit("entityGone", bot.players.Steve.entity);
+    expect(subject.findEntities({ name: "Steve" }).entities).toEqual([]);
+    expect(() => subject.world.resolveTrack(player.trackId)).toThrow("lost");
+    bot.emit("end", "socketClosed");
+    expect(subject.findEntities({}).entities).toEqual([]);
+    expect(() => subject.validateContext({ context: found.context })).toThrow("World context has changed");
+    subject.stop();
+  });
+
+  it("waits for Mineflayer plugin injection before installing method guards", () => {
+    const bot = new FakeBot();
+    const lookAt = bot.lookAt;
+    const pathfinder = bot.pathfinder;
+    (bot as any).lookAt = undefined;
+    (bot as any).pathfinder = undefined;
+    const subject = new BotController(
+      { host: "localhost", port: 25565, username: "AgentBot", auth: "offline" },
+      new EventStore(), () => bot,
+    );
+    expect(() => subject.start()).not.toThrow();
+    expect(subject.status().connection.state).toBe("connecting");
+    expect(pathfinder.setMovements).not.toHaveBeenCalled();
+    bot.lookAt = lookAt;
+    bot.pathfinder = pathfinder;
+    bot.emit("inject_allowed");
+    expect(bot.lookAt).not.toBe(lookAt);
+    expect(pathfinder.setMovements).toHaveBeenCalledOnce();
+    bot.emit("spawn");
+    expect(subject.frame().connection.ready).toBe(true);
+    subject.stop();
+  });
+
+  it("distinguishes connection startup from terminal disconnect and retains the kick reason in frames", () => {
+    const { subject, bot } = controller();
+    expect(subject.status().connection).toMatchObject({ state: "connecting", remediation: expect.stringContaining("device login") });
+    bot.emit("spawn");
+    expect(subject.frame().connection).toMatchObject({ state: "ready", ready: true });
+    bot.emit("kicked", { text: "Server maintenance" });
+    bot.emit("end", "socketClosed");
+    const frame = subject.frame();
+    expect(frame.connection).toMatchObject({
+      state: "disconnected", connected: false, spawned: false, ready: false,
+      reason: 'KICKED: {"text":"Server maintenance"}',
+      remediation: expect.stringContaining("restart the session explicitly"),
+    });
+    expect(subject.status().connection).toMatchObject({ state: "disconnected", reason: frame.connection.reason });
+    expect(() => subject.validateContext({ runtimeId: frame.runtimeId, worldEpoch: frame.worldEpoch })).toThrow(expect.objectContaining({
+      code: "NOT_READY", details: expect.objectContaining({ state: "disconnected" }), remediation: expect.stringContaining("session stop"),
+    }));
+    bot.emit("login");
+    expect(subject.status().connection).toMatchObject({ state: "disconnected", reason: frame.connection.reason });
+    bot.emit("spawn");
+    expect(subject.frame().connection).toMatchObject({ state: "disconnected", ready: false, reason: frame.connection.reason });
+  });
+
+  it("preserves nested protocol kick reasons instead of reducing them to object strings", () => {
+    const { subject, bot } = controller();
+    const reason = { type: "compound", value: { translate: { type: "string", value: "multiplayer.disconnect.kicked" } } };
+    bot.emit("kicked", reason);
+    bot.emit("end", "socketClosed");
+    expect(subject.status().connection.reason).toBe(`KICKED: ${JSON.stringify(reason)}`);
+    expect(subject.frame().connection.reason).toBe(`KICKED: ${JSON.stringify(reason)}`);
+  });
+
   it("records lifecycle and message events", () => {
     const { subject, bot, events } = controller();
     bot.emit("spawn");
@@ -141,7 +224,7 @@ describe("BotController", () => {
     expect(subject.status()).toMatchObject({ connected: false, spawned: false, lastError: "bad" });
     expect(events.list(0, 50)).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: "connection.ready" }),
-      expect.objectContaining({ type: "chat.whisper", sender: "Alex", text: "secret" }),
+      expect.objectContaining({ type: "chat.unverified", candidateSender: "Alex", claimedChannel: "whisper", text: "secret" }),
       expect.objectContaining({ type: "server.message", sender: "Server", text: "server says hi" }),
       expect.objectContaining({ type: "self.died" }),
       expect.objectContaining({ type: "entity.appeared" }),
@@ -174,8 +257,9 @@ describe("BotController", () => {
       () => bot,
     );
     subject.start();
-    bot.emit("error", "plain-error");
     bot.emit("message", undefined, "system", undefined);
+    subject.flushChat();
+    bot.emit("error", "plain-error");
 
     expect(subject.status()).toMatchObject({ username: "FallbackBot", lastError: "plain-error" });
     bot.entity = undefined as unknown as FakeBot["entity"];
@@ -212,6 +296,11 @@ describe("BotController", () => {
     expect(subject.blockAtCursor(5)).toMatchObject({ block: { name: "dirt", position: { x: 3, y: 3, z: 3 } } });
     expect(subject.findBlocks("dirt", 16, 3)).toMatchObject({ blocks: [{ name: "dirt", position: { x: 1, y: 2, z: 3 } }] });
 
+    bot.emit("spawn");
+    bot.pathfinder.goto.mockImplementation(async (...args: unknown[]) => {
+      const goal = args[0] as { x: number; y: number; z: number };
+      bot.entity.position = { x: goal.x, y: goal.y, z: goal.z };
+    });
     await subject.goto(10, 64, -2, 1);
     expect(bot.pathfinder.goto).toHaveBeenCalledWith(expect.objectContaining({ x: 10, y: 64, z: -2 }));
 
@@ -250,7 +339,7 @@ describe("BotController", () => {
     expect(bot.look).toHaveBeenCalledWith(1, 0.5, true);
 
     await expect(subject.equip("dirt", "hand")).resolves.toMatchObject({ equipped: "dirt", destination: "hand" });
-    expect(bot.equip).toHaveBeenCalledWith(expect.objectContaining({ name: "dirt" }), "hand");
+    expect(bot.equipCalls).toHaveBeenCalledWith(expect.objectContaining({ name: "dirt" }), "hand");
     await expect(subject.unequip("hand")).resolves.toEqual({ unequipped: true, destination: "hand" });
     expect(subject.setQuickBarSlot(2)).toEqual({ quickBarSlot: 2 });
     expect(bot.setQuickBarSlot).toHaveBeenCalledWith(2);
@@ -279,12 +368,15 @@ describe("BotController", () => {
     await expect(subject.craft("stick", 1, undefined, 0)).resolves.toMatchObject({ recipeIndex: 0 });
     await expect(subject.craft("stick", 1, undefined, undefined, "recipe")).resolves.toMatchObject({ recipeId: "recipe" });
 
-    await expect(subject.dig(1, 2, 3)).resolves.toMatchObject({ dug: true, block: { name: "dirt" } });
-    expect(bot.dig).toHaveBeenCalledWith(expect.objectContaining({ name: "dirt" }), true);
+    bot.emit("spawn");
+    const dug = subject.runAction("world.dig", ["movement", "look", "item"], () => subject.dig(1, 2, 3));
+    expect(await subject.actions.wait(dug.action, 1000)).toMatchObject({ state: "completed", result: { dug: true, block: { name: "dirt" } } });
+    expect(bot.digCalls).toHaveBeenCalledWith(expect.objectContaining({ name: "dirt" }), true);
     expect(subject.stopDigging()).toEqual({ stopped: true });
 
-    await expect(subject.place(1, 2, 3, "east", "dirt")).resolves.toMatchObject({ placed: true, face: "east" });
-    expect(bot.placeBlock).toHaveBeenCalledWith(expect.objectContaining({ name: "dirt" }), expect.objectContaining({ x: 1, y: 0, z: 0 }));
+    const placed = subject.runAction("world.place", ["look", "item"], () => subject.place(1, 2, 3, "east", "dirt"));
+    expect(await subject.actions.wait(placed.action, 1000)).toMatchObject({ state: "completed", result: { placed: true, face: "east" } });
+    expect(bot.placeBlockCalls).toHaveBeenCalledWith(expect.objectContaining({ name: "dirt" }), expect.objectContaining({ x: 1, y: 0, z: 0 }));
     await expect(subject.placeEntity(1, 2, 3, "up", "dirt")).resolves.toMatchObject({ placed: true, entity: { id: 12 } });
     await expect(subject.activate(1, 2, 3)).resolves.toMatchObject({ activated: true, block: { name: "dirt" } });
     expect(bot.activateBlockCalls).toHaveBeenCalledWith(expect.objectContaining({ name: "dirt" }));
@@ -304,10 +396,10 @@ describe("BotController", () => {
 
     await expect(subject.activateEntity(10)).resolves.toMatchObject({ activated: true, entity: { id: 10 } });
     expect(subject.useOnEntity(10)).toMatchObject({ usedOn: true, entity: { id: 10 } });
-    expect(subject.findEntities({ name: "cow", radius: 16, limit: 5, includePassive: true })).toMatchObject({ entities: [expect.objectContaining({ id: 10 })] });
+    expect(subject.findEntities({ name: "cow", radius: 16, limit: 5, includePassive: true })).toMatchObject({ entities: [expect.objectContaining({ trackId: expect.any(String), type: "minecraft:cow", status: "loaded" })] });
     expect(() => subject.attackEntity(10)).toThrow("Refusing to attack a passive mob");
     expect(subject.attackEntity(10, { allowPassive: true })).toMatchObject({ attacked: true, entity: { id: 10 } });
-    expect(subject.findEntities({ name: "sniffer", radius: 16, limit: 5 })).toEqual({ entities: [] });
+    expect(subject.findEntities({ name: "sniffer", radius: 16, limit: 5 })).toMatchObject({ entities: [expect.objectContaining({ type: "minecraft:sniffer", status: "loaded" })] });
     expect(() => subject.attackEntity(12)).toThrow("Refusing to attack a passive mob");
     expect(subject.swingArm("right", true)).toEqual({ swung: true, hand: "right", showHand: true });
     expect(subject.mountEntity(10)).toMatchObject({ mounted: true, entity: { id: 10 } });

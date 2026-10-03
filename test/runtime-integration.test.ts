@@ -24,7 +24,7 @@ class LiveBot extends EventEmitter {
   setQuickBarSlot = vi.fn();
   setControlState = vi.fn((state: string, value: boolean) => { this.controlState[state] = value; });
   clearControlStates = vi.fn(() => { this.controlState = {}; });
-  chat = vi.fn(); quit = vi.fn(); lookAtCalls = vi.fn(); lookAt = this.lookAtCalls; activateEntity = vi.fn(); equip = vi.fn(); placeBlock = vi.fn();
+  chat = vi.fn(); quit = vi.fn(); lookAtCalls = vi.fn(); lookAt = this.lookAtCalls; activateEntity = vi.fn(); equipCalls = vi.fn(); equip = this.equipCalls; placeBlockCalls = vi.fn(); placeBlock = this.placeBlockCalls;
   blockAt = vi.fn((position: any) => ({ name: "dirt", type: 3, position }));
   deactivateItem = vi.fn(); stopDigging = vi.fn(); attack = vi.fn();
   pathfinder = { movements: {} as never, setMovements: vi.fn(), setGoal: vi.fn(), stop: vi.fn(),
@@ -42,12 +42,12 @@ function deferred() { let resolve!: () => void; const promise = new Promise<void
 describe("runtime integration", () => {
   it("frames copy eventless live mutations and flush canonical chat before the cursor", () => {
     const { controller, bot, events } = runtime();
-    const first = controller.frame();
+    const first = controller.frame({ detail: "full" });
     bot.entity.velocity.x = 2; bot.slots[0].count = 9; bot.currentWindow.slots[0].count = 8;
     const json = { text: "same" };
     bot.emit("message", json, "chat", UUID); bot.emit("chat", "Alex", "same", undefined, json);
     bot.emit("message", json, "chat", UUID); bot.emit("chat", "Alex", "same", undefined, json);
-    const second = controller.frame();
+    const second = controller.frame({ detail: "full" });
     expect(first.self.velocity.x).toBe(0); expect(first.inventory[0].count).toBe(3); expect(first.window.slots[0].count).toBe(2);
     expect(second.self.velocity.x).toBe(2); expect(second.inventory[0].count).toBe(9);
     expect(second.eventCursor).toBe(events.getCursor());
@@ -135,10 +135,10 @@ describe("runtime integration", () => {
   });
 
   it("cancelled placement cannot perform its next physical step after equip resolves", async () => {
-    const { controller, bot } = runtime(); const pending = deferred(); bot.equip.mockReturnValue(pending.promise);
+    const { controller, bot } = runtime(); const pending = deferred(); bot.equipCalls.mockReturnValue(pending.promise);
     const action = controller.runAction("world.place", ["item", "look"], () => controller.place(1,64,0,"up","dirt"));
     controller.actions.cancel(action.action); pending.resolve(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
-    expect(bot.placeBlock).not.toHaveBeenCalled(); expect(controller.actions.get(action.action).state).toBe("cancelled");
+    expect(bot.placeBlockCalls).not.toHaveBeenCalled(); expect(controller.actions.get(action.action).state).toBe("cancelled");
   });
 
   it("look tracking fails on loss and attack/chat permissions remain enforced", () => {
@@ -260,6 +260,167 @@ describe("runtime integration", () => {
     expect(delta.delta.changed.actions.at(-1).action).toBe(next.action);
     expect(controller.actions.get(next.action).result).toEqual({ pages: "y".repeat(10000) });
     expect(JSON.stringify(delta).length).toBeLessThan(5000);
+  });
+
+  it("keeps snapshot and inventory/window reads out of movement, ticks, guards, samples and find", async () => {
+    const { controller, bot, track } = runtime();
+    const reconcile = vi.spyOn(controller.world, "reconcile");
+    const inventoryReads = vi.fn(() => bot.slots);
+    const windowReads = vi.fn(() => [{ name: "stone", count: 2 }]);
+    Object.defineProperty(bot.inventory, "slots", { get: inventoryReads });
+    Object.defineProperty(bot.currentWindow, "slots", { get: windowReads });
+    const unrelatedPosition = vi.fn(() => ({ x: 100, y: 64, z: 0 }));
+    bot.entities[8] = { id: 8, type: "mob", name: "cod", get position() { return unrelatedPosition(); } };
+    for (let n = 0; n < 100; n++) {
+      bot.emit("entityMoved", bot.entities[7]);
+      bot.emit("physicsTick");
+      controller.sample(track, ["position", "velocity", "status"]);
+      controller.validateContext({ runtimeId: controller.world.runtimeId, worldEpoch: 1 });
+    }
+    expect(unrelatedPosition).not.toHaveBeenCalled();
+    const action = controller.runAction("entity.activate", ["item", "look"], () => bot._client.write("use_entity", {}), track);
+    await controller.actions.wait(action.action);
+    expect(bot.packetWrites).toHaveBeenCalledWith("use_entity", {});
+    expect(controller.findEntities({ radius: 200 }).entities).toHaveLength(2);
+    expect(reconcile).not.toHaveBeenCalled();
+    expect(inventoryReads).not.toHaveBeenCalled();
+    expect(windowReads).not.toHaveBeenCalled();
+    controller.frame();
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(inventoryReads).toHaveBeenCalled();
+    expect(windowReads).toHaveBeenCalled();
+  });
+
+  it("records damage/recovery and target loss/reappearance before the next frame", () => {
+    const { controller, bot, events, track } = runtime();
+    const cursor = events.getLastEventId();
+    bot.health = 4; bot.emit("health");
+    bot.health = 20; bot.emit("health");
+    bot.emit("entityGone", bot.entities[7]);
+    bot.entities[7] = { ...bot.entities[7], position: { x: 7, y: 64, z: 0 } };
+    bot.emit("entitySpawn", bot.entities[7]);
+    expect(controller.world.trackFor(bot.entities[7])).toBe(track);
+    const transient = events.list(cursor, 20);
+    expect(transient).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "self.damaged", health: 4, amount: 16 }),
+      expect.objectContaining({ type: "self.health_critical", health: 4 }),
+      expect.objectContaining({ type: "entity.lost", trackId: track }),
+      expect.objectContaining({ type: "entity.appeared", trackId: track }),
+    ]));
+    expect(controller.frame().self.health).toBe(20);
+  });
+
+  it("retires replaced object bindings immediately on a spawn event and reacquires verified UUID", () => {
+    const { controller, bot, track } = runtime();
+    const old = bot.entities[7];
+    const action = controller.followTrack(track, 2);
+    bot.entities[7] = { ...old, position: { x: 8, y: 64, z: 0 } };
+    bot.emit("entitySpawn", bot.entities[7]);
+    expect(controller.actions.get(action.action)).toMatchObject({ state: "failed", reason: "TRACK_LOST" });
+    expect(controller.world.trackFor(bot.entities[7])).toBe(track);
+    expect(controller.world.resolveTrack(track)).toBe(bot.entities[7]);
+    bot.emit("entityDead", old);
+    expect(controller.world.resolveTrack(track)).toBe(bot.entities[7]);
+  });
+
+  it.each(["removal", "replacement", "dimension"])("blocks asynchronous continuation after eventless %s", async change => {
+    const { controller, bot, track } = runtime();
+    const pending = deferred();
+    bot.lookAtCalls.mockReturnValue(pending.promise);
+    const action = controller.runAction("entity.activate", ["item", "look"], async () => {
+      await bot.lookAt(bot.entities[7].position);
+      bot._client.write("use_entity", {});
+    }, track);
+    if (change === "removal") delete bot.entities[7];
+    if (change === "replacement") bot.entities[7] = { ...bot.entities[7] };
+    if (change === "dimension") bot.game.dimension = "the_nether";
+    pending.resolve();
+    const settled = await controller.actions.wait(action.action);
+    expect(settled).toMatchObject({ state: "failed", reason: change === "dimension" ? "WORLD_CHANGED" : "TRACK_LOST" });
+    expect(bot.packetWrites).not.toHaveBeenCalled();
+  });
+
+  it("continues look on physics ticks and fails follow on eventless dictionary removal", async () => {
+    const { controller, bot, track } = runtime();
+    const look = controller.trackLook(track);
+    await Promise.resolve(); await Promise.resolve();
+    bot.entities[7].position.x = 9;
+    bot.emit("physicsTick");
+    expect(bot.lookAtCalls).toHaveBeenLastCalledWith(expect.objectContaining({ x: 9 }));
+    expect(controller.actions.get(look.action).state).toBe("running");
+    const follow = controller.followTrack(track, 2);
+    delete bot.entities[7];
+    bot.emit("physicsTick");
+    expect(controller.actions.get(follow.action)).toMatchObject({ state: "failed", reason: "TRACK_LOST" });
+    expect(bot.pathfinder.setGoal).toHaveBeenLastCalledWith(null);
+  });
+
+  it("self motion retires eventless missing tracks before evaluating proximity", () => {
+    const { controller, bot, events, track } = runtime();
+    bot.entities[7].position.x = 40;
+    bot.emit("entityMoved", bot.entities[7]);
+    const cursor = events.getLastEventId();
+    delete bot.entities[7];
+    bot.entity.position.x = 40;
+    bot.emit("move");
+    expect(events.list(cursor, 20)).toEqual([expect.objectContaining({ type: "entity.lost", trackId: track })]);
+    expect(() => controller.sample(track, ["position"])).toThrow(/lost/i);
+  });
+
+  it("retries cooldown-suppressed proximity on ticks without another move or frame", () => {
+    vi.useFakeTimers(); vi.setSystemTime(0);
+    try {
+      const { controller, bot, events, track } = runtime();
+      const reconcile = vi.spyOn(controller.world, "reconcile");
+      const otherPosition = vi.fn(() => ({ x: 100, y: 64, z: 0 }));
+      bot.entities[8] = { id: 8, type: "mob", name: "cod", get position() { return otherPosition(); } };
+      bot.emit("entitySpawn", bot.entities[8]); otherPosition.mockClear();
+      const cursor = events.getLastEventId();
+      vi.advanceTimersByTime(500);
+      bot.entities[7].position.x = 30; bot.emit("entityMoved", bot.entities[7]);
+      bot.emit("physicsTick");
+      expect(events.list(cursor, 20)).toEqual([]);
+      expect((controller.world as any).pendingProximity.size).toBe(1);
+      vi.advanceTimersByTime(1100); bot.emit("physicsTick"); bot.emit("physicsTick");
+      expect(events.list(cursor, 20)).toEqual([expect.objectContaining({ type: "entity.left_nearby", trackId: track, distance: 30 })]);
+      expect((controller.world as any).pendingProximity.size).toBe(0);
+      expect(otherPosition).not.toHaveBeenCalled();
+      expect(reconcile).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(["move", "eventless"])("drops a deferred proximity transition when the target returns via %s", change => {
+    vi.useFakeTimers(); vi.setSystemTime(0);
+    try {
+      const { controller, bot, events } = runtime();
+      const cursor = events.getLastEventId();
+      vi.advanceTimersByTime(500);
+      bot.entities[7].position.x = 30; bot.emit("entityMoved", bot.entities[7]);
+      expect((controller.world as any).pendingProximity.size).toBe(1);
+      bot.entities[7].position.x = 5;
+      if (change === "move") bot.emit("entityMoved", bot.entities[7]);
+      vi.advanceTimersByTime(1100); bot.emit("physicsTick");
+      expect(events.list(cursor, 20)).toEqual([]);
+      expect((controller.world as any).pendingProximity.size).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(["gone", "eventless-removal", "reset"])("clears pending proximity after %s", change => {
+    vi.useFakeTimers(); vi.setSystemTime(0);
+    try {
+      const { controller, bot, events } = runtime();
+      vi.advanceTimersByTime(500);
+      bot.entities[7].position.x = 30; bot.emit("entityMoved", bot.entities[7]);
+      expect((controller.world as any).pendingProximity.size).toBe(1);
+      const cursor = events.getLastEventId();
+      if (change === "gone") bot.emit("entityGone", bot.entities[7]);
+      if (change === "eventless-removal") delete bot.entities[7];
+      if (change === "reset") bot.emit("death");
+      vi.advanceTimersByTime(1100); bot.emit("physicsTick");
+      expect((controller.world as any).pendingProximity.size).toBe(0);
+      expect(events.list(cursor, 20).map(event => event.type)).toContain("entity.lost");
+      expect(events.list(cursor, 20).map(event => event.type)).not.toContain("entity.left_nearby");
+    } finally { vi.useRealTimers(); }
   });
 
 });

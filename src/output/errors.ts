@@ -6,6 +6,8 @@ export type ErrorCode =
   | "SESSION_ALREADY_RUNNING"
   | "COMMAND_BLOCKED"
   | "DAEMON_ERROR"
+  | "DAEMON_TIMEOUT"
+  | "DAEMON_INCOMPATIBLE"
   | "NAVIGATION_FAILED"
   | "TRACK_UNKNOWN"
   | "TRACK_LOST"
@@ -47,6 +49,16 @@ export function sessionNotFound(session: string): CliError {
     `Session '${session}' is not running.`,
     "Start it with 'mc-agent session start --session <name>'.",
     4,
+  );
+}
+
+export function daemonIncompatible(session: string, details: Record<string, unknown> = {}): CliError {
+  return new CliError(
+    "DAEMON_INCOMPATIBLE",
+    `Session '${session}' is running a daemon incompatible with API v2.`,
+    `Stop it with 'mc-agent session stop --session ${session}', then start it again with the current CLI and the same connection options. Existing daemons keep their old code after an upgrade; retrying the observation will not fix this.`,
+    1,
+    { session, expectedApiVersion: 2, ...details },
   );
 }
 

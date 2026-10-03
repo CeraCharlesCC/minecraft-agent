@@ -2,8 +2,9 @@ import { Writable } from "node:stream";
 import { Command } from "commander";
 import { z } from "zod";
 import { getSkillContent } from "../core/skills.js";
-import { commandBlocked, normalizeError } from "../output/errors.js";
+import { badInput, commandBlocked, normalizeError } from "../output/errors.js";
 import { failure, formatDefaultText, resolveOutputMode, success, writeJson, writeText } from "../output/response.js";
+import { decodeActionContext } from "../core/context.js";
 import { CliHandlers } from "./handlers.js";
 
 export interface CliIo {
@@ -14,13 +15,14 @@ export interface CliIo {
 
 const sessionSchema = z.object({
   session: z.string().min(1).default("default"),
+  context: z.string().min(1).optional(),
   runtimeId: z.string().min(1).optional(),
-  worldEpoch: z.coerce.number().int().min(0).optional(),
+  worldEpoch: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
 });
 
 const physicalSchema = sessionSchema.extend({
   runtimeId: z.string().min(1),
-  worldEpoch: z.coerce.number().int().min(0),
+  worldEpoch: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER),
 });
 
 function collectEventType(value: string, previous: string[] = []): string[] {
@@ -43,13 +45,17 @@ const startSchema = sessionSchema.extend({
   username: z.string().min(1).default("AgentBot"),
   auth: z.string().min(1).default("offline"),
   version: z.string().min(1).optional(),
+  autoReconnect: z.boolean().optional(),
+  reconnectMaxAttempts: z.coerce.number().int().min(1).max(10).optional(),
+  reconnectBackoff: z.coerce.number().int().min(0).max(30000).optional(),
 });
 
 const eventCursorSchema = z.union([z.literal("0"), z.literal(0), z.string().regex(/^[^:]+:s\d+$/, "Expected a runtime-scoped event cursor or 0")]).default(0).transform(value => value === "0" ? 0 as const : value);
 const trackSchema = z.string().regex(/^[^:]+:[pe]\d+$/, "Expected a runtime-scoped track");
 const frameSchema = sessionSchema.extend({
   since: z.string().regex(/^[^:]+:f\d+$/, "Expected a runtime-scoped frame").optional(),
-  maxEntities: z.coerce.number().int().min(1).max(200).default(50),
+  detail: z.enum(["compact", "full"]).default("compact"),
+  maxEntities: z.coerce.number().int().min(0).max(200).default(12),
   radius: z.coerce.number().positive().max(256).default(64),
   track: z.preprocess(normalizeEventTypes, z.array(trackSchema)),
 }).transform(({ track, ...input }) => ({ ...input, tracks: track }));
@@ -61,19 +67,21 @@ const debugEventsSchema = sessionSchema.extend({
 });
 
 const eventsSchema = sessionSchema.extend({
+  profile: z.enum(["all", "agent"]).default("all"),
   since: eventCursorSchema,
   limit: z.coerce.number().int().min(1).max(1000).default(50),
   type: eventTypesSchema,
 }).transform(({ type, ...input }) => ({ ...input, types: type }));
 
 const watchSchema = sessionSchema.extend({
+  profile: z.enum(["all", "agent"]).default("all"),
   since: eventCursorSchema,
   type: eventTypesSchema,
   track: trackSchema.optional(),
   fields: z.preprocess(value => value === undefined ? undefined : normalizeEventTypes(value), z.array(z.enum(["position", "velocity", "status"])).min(1).optional()),
   rate: z.coerce.number().min(0.1).max(10).optional(),
 }).superRefine((input, context) => {
-  if (input.track && (input.type.length || input.since !== 0)) {
+  if (input.track && (input.type.length || input.since !== 0 || input.profile !== "all")) {
     context.addIssue({ code: "custom", message: "Target samples cannot use event cursors or type filters" });
   }
   if (!input.track && (input.fields || input.rate !== undefined)) {
@@ -159,6 +167,8 @@ const navigateFollowSchema = physicalSchema.extend({
 
 const navigateConfigureSchema = physicalSchema.extend({
   allowDig: z.boolean().optional(),
+  allowPlace: z.boolean().optional(),
+  place: z.boolean().optional(),
   dig: z.boolean().optional(),
   noDig: z.boolean().optional(),
   allowSprinting: z.boolean().optional(),
@@ -251,8 +261,13 @@ const entityFindSchema = sessionSchema.extend({
   type: z.string().min(1).optional(),
   radius: z.coerce.number().positive().max(256).default(32),
   limit: z.coerce.number().int().min(1).max(200).default(50),
-  includePlayers: z.boolean().default(false),
-  includePassive: z.boolean().default(false),
+  types: z.preprocess(value => value === undefined ? undefined : normalizeEventTypes(value), z.array(z.string().regex(/^minecraft:[a-z][a-z0-9_]*$/)).min(1).optional()),
+  includePlayers: z.boolean().default(true),
+  includePassive: z.boolean().default(true),
+});
+
+const entityFindValidatedSchema = entityFindSchema.superRefine((input, context) => {
+  if (input.type && input.types) context.addIssue({ code: "custom", message: "Use --type for a legacy category or --types for species, separately" });
 });
 
 const entityAttackSchema = entitySchema.extend({
@@ -263,6 +278,9 @@ const entityAttackSchema = entitySchema.extend({
 const daemonRunSchema = startSchema.extend({
   controlPort: z.coerce.number().int().positive().max(65535),
 });
+
+const physicalHandlers = new WeakMap<Command, CliHandlers>();
+const waitTimeoutSchema = z.coerce.number().int().min(0).max(30000);
 
 type TextFormatter = (data: unknown) => string;
 
@@ -280,7 +298,27 @@ function commandRunner<T>(
     let mode: ReturnType<typeof getOutputMode> | undefined;
     try {
       mode = getOutputMode(command, io);
-      const data = await action();
+      const handlers = physicalHandlers.get(command);
+      const opts = command.opts();
+      let waitTimeout: number | undefined;
+      if (handlers) {
+        if (opts.context !== undefined) {
+          const decoded = decodeActionContext(opts.context);
+          if ((opts.runtimeId !== undefined && opts.runtimeId !== decoded.runtimeId) ||
+              (opts.worldEpoch !== undefined && Number(opts.worldEpoch) !== decoded.worldEpoch)) {
+            throw badInput("Action context contradicts --runtime or --world-epoch.");
+          }
+          opts.runtimeId = decoded.runtimeId;
+          opts.worldEpoch = decoded.worldEpoch;
+        }
+        if (opts.wait !== undefined) waitTimeout = waitTimeoutSchema.parse(opts.wait === true ? 5000 : opts.wait);
+      }
+      let data: unknown = await action();
+      if (handlers && waitTimeout !== undefined) {
+        const actionId = (data as { action?: unknown } | null)?.action;
+        if (typeof actionId !== "string") throw badInput("This command did not return an action to wait for.");
+        data = await handlers.actionWait!({ session: opts.session ?? "default", action: actionId, timeout: waitTimeout });
+      }
       if (mode === "json") {
         writeJson(io.stdout, success(data));
       } else {
@@ -338,12 +376,15 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .option("--port <port>", "Minecraft server port", "25565")
     .option("--username <name>", "bot username", "AgentBot")
     .option("--auth <mode>", "mineflayer auth mode", "offline")
-    .option("--version <version>", "Minecraft protocol version")
+    .option("--minecraft-version <version>", "Minecraft protocol version")
+    .option("--auto-reconnect", "automatically reconnect after an unexpected disconnect")
+    .option("--reconnect-max-attempts <count>", "maximum automatic reconnect attempts (default 3)")
+    .option("--reconnect-backoff <ms>", "automatic reconnect backoff in milliseconds (default 250)")
     .action((opts, cmd) =>
       commandRunner(
         cmd,
         io,
-        () => handlers.startSession(startSchema.parse(opts)),
+        () => handlers.startSession(startSchema.parse({ ...opts, version: opts.minecraftVersion })),
         (data) => `Started session ${(data as { session?: string }).session ?? "default"}`,
       )(),
     );
@@ -365,6 +406,18 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .option("--session <name>", "session name", "default")
     .action((opts, cmd) => commandRunner(cmd, io, () => handlers.stopSession(sessionSchema.parse(opts)))());
 
+  session.command("diagnose").description("Explain session readiness and recovery options")
+    .option("--session <name>", "session name", "default")
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.sessionDiagnose!(sessionSchema.parse(opts)))());
+  session.command("ensure-ready").description("Wait for spawn and recover a disconnected session with bounded retries")
+    .option("--session <name>", "session name", "default")
+    .option("--timeout <ms>", "total readiness timeout (1-120000 ms)", "10000")
+    .option("--max-attempts <count>", "maximum connection attempts (1-10)", "3")
+    .option("--backoff <ms>", "retry backoff in milliseconds (0-30000)", "250")
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.sessionEnsureReady!(sessionSchema.extend({
+      timeout: z.coerce.number().int().min(1).max(120000), maxAttempts: z.coerce.number().int().min(1).max(10), backoff: z.coerce.number().int().min(0).max(30000),
+    }).parse(opts)))());
+
   const observe = program.command("observe").description("Observe coherent frames and semantic events");
 
   observe
@@ -372,7 +425,8 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .description("Read a coherent local frame or delta from a retained baseline")
     .option("--session <name>", "session name", "default")
     .option("--since <frame>", "runtime-scoped baseline frame; reset when unavailable")
-    .option("--max-entities <count>", "individual entity projection limit (1-200)", "50")
+    .option("--detail <mode>", "frame detail: compact or full", "compact")
+    .option("--max-entities <count>", "individual entity projection limit (0-200)", "12")
     .option("--radius <blocks>", "entity projection radius", "64")
     .option("--track <track>", "preserve requested tracks; repeat or comma-separate", collectEventType, [])
     .action((opts, cmd) => commandRunner(cmd, io, () => handlers.observeFrame!(frameSchema.parse(opts)))());
@@ -382,6 +436,7 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .description("Replay retained semantic events with scoped cursors and gap detection")
     .option("--session <name>", "session name", "default")
     .option("--since <cursor>", "runtime-scoped semantic cursor, or 0 from beginning", "0")
+    .option("--profile <profile>", "event profile: all or agent", "all")
     .option("--limit <count>", "maximum events to return", "50")
     .option("--type <eventType>", "include only this event type; repeat or comma-separate for multiple types", collectEventType, [])
     .action((opts, cmd) => commandRunner(cmd, io, () => handlers.observeEvents(eventsSchema.parse(opts)))());
@@ -391,6 +446,7 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .description("Watch semantic events or sample a target as newline-delimited JSON")
     .option("--session <name>", "session name", "default")
     .option("--since <cursor>", "runtime-scoped semantic cursor, or 0 from beginning", "0")
+    .option("--profile <profile>", "event profile: all or agent", "all")
     .option("--type <eventType>", "include only this event type; repeat or comma-separate for multiple types", collectEventType, [])
     .option("--track <track>", "sample a runtime-scoped entity track")
     .option("--fields <fields>", "comma-separated sample fields: position,velocity,status; default position")
@@ -576,6 +632,8 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .command("configure")
     .description("Configure pathfinder movement settings")
     .option("--allow-dig", "allow pathfinder to dig")
+    .option("--allow-place", "allow pathfinder to place blocks")
+    .option("--no-place", "disable pathfinder block placement")
     .option("--no-dig", "disable pathfinder digging")
     .option("--allow-sprinting", "allow pathfinder sprinting")
     .option("--no-sprinting", "disable pathfinder sprinting")
@@ -591,8 +649,10 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
       const parsed = navigateConfigureSchema.parse(opts);
       return handlers.navigateConfigure({
           session: parsed.session,
+          ...(parsed.context ? { context: parsed.context } : {}),
           ...(parsed.runtimeId ? { runtimeId: parsed.runtimeId } : {}),
           ...(parsed.worldEpoch !== undefined ? { worldEpoch: parsed.worldEpoch } : {}),
+          allowPlace: parsed.place === false ? false : parsed.allowPlace,
           allowDig: parsed.noDig || parsed.dig === false ? false : parsed.allowDig,
           allowSprinting: parsed.noSprinting || parsed.sprinting === false ? false : parsed.allowSprinting,
           allowParkour: parsed.noParkour || parsed.parkour === false ? false : parsed.allowParkour,
@@ -878,13 +938,14 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .command("find")
     .description("Find visible entities with filters")
     .option("--name <name>", "entity name or username")
-    .option("--type <type>", "entity type")
+    .option("--type <type>", "deprecated legacy Mineflayer entity category")
+    .option("--types <species>", "canonical species names; repeat or comma-separate", collectEventType)
     .option("--radius <blocks>", "search radius", "32")
     .option("--limit <count>", "maximum entities to return", "50")
-    .option("--include-players", "include player entities", false)
-    .option("--include-passive", "include passive mobs", false)
+    .option("--include-players", "deprecated: players are already included", true)
+    .option("--include-passive", "deprecated: passive mobs are already included", true)
     .option("--session <name>", "session name", "default")
-    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.entityFind(entityFindSchema.parse(opts)))());
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.entityFind(entityFindValidatedSchema.parse(opts)))());
 
   entity
     .command("activate")
@@ -943,6 +1004,11 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .requiredOption("--action <action>", "runtime-scoped action id")
     .option("--session <name>", "session name", "default")
     .action((opts, cmd) => commandRunner(cmd, io, () => handlers.actionStatus!(actionSchema.parse(opts)))());
+  action.command("wait").description("Wait for a managed action to settle; timeout leaves it running")
+    .requiredOption("--action <action>", "runtime-scoped action id")
+    .option("--session <name>", "session name", "default")
+    .option("--timeout <ms>", "wait timeout (0-30000 ms)", "5000")
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.actionWait!(actionSchema.extend({ timeout: waitTimeoutSchema }).parse(opts)))());
   action.command("cancel")
     .requiredOption("--action <action>", "runtime-scoped action id")
     .option("--session <name>", "session name", "default")
@@ -977,8 +1043,11 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .option("--port <port>", "Minecraft server port", "25565")
     .option("--username <name>", "bot username", "AgentBot")
     .option("--auth <mode>", "mineflayer auth mode", "offline")
-    .option("--version <version>", "Minecraft protocol version")
-    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.daemonRun(daemonRunSchema.parse(opts)))());
+    .option("--minecraft-version <version>", "Minecraft protocol version")
+    .option("--auto-reconnect", "automatically reconnect after an unexpected disconnect")
+    .option("--reconnect-max-attempts <count>", "maximum automatic reconnect attempts (default 3)")
+    .option("--reconnect-backoff <ms>", "automatic reconnect backoff in milliseconds (default 250)")
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.daemonRun(daemonRunSchema.parse({ ...opts, version: opts.minecraftVersion })))());
   program.addCommand(daemon, { hidden: true });
 
   // Every physical mutation carries the context of the observation used to choose it.
@@ -996,8 +1065,15 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
   for (const group of program.commands) {
     for (const command of group.commands) {
       if (!physicalCommands[group.name()]?.includes(command.name())) continue;
-      command.requiredOption("--runtime <runtimeId>", "expected daemon runtime identity from frame");
-      command.requiredOption("--world-epoch <epoch>", "expected world context epoch from frame");
+      physicalHandlers.set(command, handlers);
+      command.option("--context <context>", "action context token from a frame or entity search");
+      const immediate = (group.name() === "navigate" && ["stop", "configure"].includes(command.name())) ||
+        (group.name() === "control" && command.name() === "clear") ||
+        (group.name() === "world" && command.name() === "stop-digging") ||
+        (group.name() === "inventory" && command.name() === "deactivate-item");
+      if (!immediate) command.option("--wait [ms]", "wait for this action, default 5000 ms; timeout leaves it running");
+      command.option("--runtime <runtimeId>", "expected daemon runtime identity from frame");
+      command.option("--world-epoch <epoch>", "expected world context epoch from frame");
       command.hook("preAction", (_command, actionCommand) => {
         const opts = actionCommand.opts();
         opts.runtimeId = opts.runtime;

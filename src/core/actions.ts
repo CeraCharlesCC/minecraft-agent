@@ -16,6 +16,8 @@ export interface RuntimeAction {
   error?: { code: string; message: string; details?: Record<string, unknown> };
 }
 
+export type ActionWaitResult = RuntimeAction & { timedOut: boolean };
+
 /** Owns physical resources until settlement; terminal records are never resurrected. */
 export class ActionManager {
   private nextId = 1;
@@ -23,6 +25,7 @@ export class ActionManager {
   private readonly owners = new Map<ActionResource, string>();
   private readonly cleanup = new Map<string, () => void>();
   private readonly terminalOrder: string[] = [];
+  private readonly waiters = new Map<string, Set<(record: RuntimeAction) => void>>();
 
   constructor(private readonly events: EventStore, private readonly historyLimit = 256) {
     if (!Number.isSafeInteger(historyLimit) || historyLimit < 0) throw badInput("Action history limit must be a nonnegative integer.");
@@ -65,6 +68,42 @@ export class ActionManager {
     const record = this.records.get(id);
     if (!record) throw new CliError("ACTION_UNKNOWN", "Action is unknown or expired.", "Observe current actions.", 1, { action: id });
     return detachData(record);
+  }
+
+  /** Waiting observes settlement; its deadline never cancels the underlying work. */
+  wait(id: string, timeout = 5000, signal?: AbortSignal): Promise<ActionWaitResult> {
+    if (!Number.isSafeInteger(timeout) || timeout < 0 || timeout > 30000) {
+      throw badInput("Action wait timeout must be an integer between 0 and 30000 milliseconds.");
+    }
+    const current = this.get(id);
+    if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("Action wait aborted."));
+    if (current.state !== "running" || timeout === 0) {
+      return Promise.resolve({ ...current, timedOut: current.state === "running" });
+    }
+    return new Promise((resolve, reject) => {
+      const subscribers = this.waiters.get(id) ?? new Set<(record: RuntimeAction) => void>();
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
+        subscribers.delete(settled);
+        if (subscribers.size === 0) this.waiters.delete(id);
+      };
+      const settled = (record: RuntimeAction) => {
+        cleanup();
+        resolve({ ...detachData(record), timedOut: false });
+      };
+      const abort = () => {
+        cleanup();
+        reject(signal?.reason ?? new Error("Action wait aborted."));
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        resolve({ ...this.get(id), timedOut: true });
+      }, timeout);
+      subscribers.add(settled);
+      this.waiters.set(id, subscribers);
+      signal?.addEventListener("abort", abort, { once: true });
+    });
   }
 
   list(): RuntimeAction[] {
@@ -137,6 +176,7 @@ export class ActionManager {
       try { stop?.(); } catch { /* Preserve authoritative termination even if transport has gone. */ }
     }
     this.events.add({ type: `action.${state}`, action: id, kind: record.kind, target: record.target, reason, error: record.error });
+    for (const waiter of [...(this.waiters.get(id) ?? [])]) waiter(record);
     this.terminalOrder.push(id);
     this.prune();
   }

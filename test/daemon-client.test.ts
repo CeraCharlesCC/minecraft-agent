@@ -1,12 +1,30 @@
+import { createServer, type Server } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { daemonRequest, loadSessionForClient } from "../src/daemon/client.js";
+import { daemonRequest, daemonStreamRequest, loadSessionForClient } from "../src/daemon/client.js";
 import { CliError } from "../src/output/errors.js";
 import { createSessionToken, SessionRecord, writeSession } from "../src/session/store.js";
 
 const tempDirs: string[] = [];
+const servers: Server[] = [];
+
+async function listen(server: Server): Promise<number> {
+  servers.push(server);
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  return (server.address() as { port: number }).port;
+}
+
+function stalledFetch() {
+  const mock = vi.fn((_url: string, init: RequestInit) => new Promise<Response>((_resolve, reject) => {
+    const signal = init.signal!;
+    if (signal.aborted) reject(signal.reason);
+    else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+  }));
+  vi.stubGlobal("fetch", mock);
+  return mock;
+}
 
 async function makeTempDir() {
   const dir = await mkdtemp(join(tmpdir(), "mc-agent-client-"));
@@ -30,7 +48,12 @@ function record(overrides: Partial<SessionRecord> = {}): SessionRecord {
 }
 
 afterEach(async () => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
+  await Promise.all(servers.splice(0).map(server => {
+    server.closeAllConnections();
+    return new Promise<void>(resolve => server.close(() => resolve()));
+  }));
   delete process.env.MC_AGENT_STATE_DIR;
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
@@ -57,6 +80,7 @@ describe("daemon client", () => {
 
     expect(fetchMock).toHaveBeenCalledWith("http://127.0.0.1:39234/status", {
       method: "GET",
+      signal: expect.any(AbortSignal),
       headers: {
         Authorization: "Bearer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "Content-Type": "application/json",
@@ -84,6 +108,20 @@ describe("daemon client", () => {
     });
   });
 
+  it("identifies unsupported legacy routes without suggesting an observation retry", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: "not found" }), { status: 404 })));
+    await expect(daemonRequest(record(), "/frame?maxEntities=50")).rejects.toMatchObject({
+      code: "DAEMON_INCOMPATIBLE",
+      remediation: expect.stringContaining("session stop --session default"),
+      details: { session: "default", expectedApiVersion: 2, path: "/frame", httpStatus: 404 },
+    });
+  });
+
+  it("preserves typed resource errors even when their HTTP status is 404", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: "ACTION_UNKNOWN", error: "Unknown action", remediation: "Inspect actions." }), { status: 404 })));
+    await expect(daemonRequest(record(), "/actions/missing")).rejects.toMatchObject({ code: "ACTION_UNKNOWN" });
+  });
+
   it("handles empty success bodies and fallback daemon error messages", async () => {
     const saved = record({ token: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
     vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(new Response("", { status: 200 })));
@@ -98,11 +136,125 @@ describe("daemon client", () => {
   });
   it("preserves runtime errors and structured details through the client", async () => {
     const saved = record();
-    for (const code of ["TRACK_UNKNOWN", "TRACK_LOST", "WORLD_CHANGED", "RUNTIME_MISMATCH", "FRAME_RESET_REQUIRED", "NOT_READY", "ACTION_UNKNOWN", "STREAM_OVERFLOW"]) {
+    for (const code of ["DAEMON_TIMEOUT", "DAEMON_INCOMPATIBLE", "TRACK_UNKNOWN", "TRACK_LOST", "WORLD_CHANGED", "RUNTIME_MISMATCH", "FRAME_RESET_REQUIRED", "NOT_READY", "ACTION_UNKNOWN", "STREAM_OVERFLOW"]) {
       const details = { runtimeId: "runtime", trackId: "runtime:p1", resetRequired: true };
       vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ code, error: "stale context", remediation: "observe", details }), {status:409})));
       await expect(daemonRequest(saved, "/action")).rejects.toMatchObject({code, details, remediation:"observe"});
     }
+  });
+
+  it("bounds stalled headers and clears the default deadline after timeout", async () => {
+    vi.useFakeTimers();
+    const fetchMock = stalledFetch();
+    const request = daemonRequest(record(), "/frame?detail=compact");
+    const failure = expect(request).rejects.toMatchObject({ code: "DAEMON_TIMEOUT", details: {
+      path: "/frame?detail=compact", method: "GET", timeoutMs: 5000, responseConfirmed: false,
+    } });
+    await vi.advanceTimersByTimeAsync(5000);
+    await failure;
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("bounds an HTTP body and reports an unknown POST outcome without resending", async () => {
+    let requests = 0;
+    let resolveDisconnected!: () => void;
+    const disconnected = new Promise<void>(resolve => { resolveDisconnected = resolve; });
+    const controlPort = await listen(createServer((request, response) => {
+      requests++;
+      expect(request.method).toBe("POST");
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.write('{"accepted":');
+      response.once("close", resolveDisconnected);
+    }));
+    await expect(daemonRequest(record({ controlPort }), "/chat", { method: "POST", body: '{"message":"hello"}' })).rejects.toMatchObject({
+      code: "DAEMON_TIMEOUT", details: { path: "/chat", method: "POST", timeoutMs: 5000,
+        responseConfirmed: false, outcome: "unknown", mayHaveExecuted: true },
+    });
+    await disconnected;
+    expect(requests).toBe(1);
+  }, 10000);
+
+  it("bounds partial HTTP error bodies during stream startup and disconnects", async () => {
+    let resolveDisconnected!: () => void;
+    const disconnected = new Promise<void>(resolve => { resolveDisconnected = resolve; });
+    const controlPort = await listen(createServer((_request, response) => {
+      response.writeHead(503, { "Content-Type": "application/json" });
+      response.write('{"code":"DAEMON_ERROR",');
+      response.once("close", resolveDisconnected);
+    }));
+    await expect(daemonStreamRequest(record({ controlPort }), "/watch?since=0")).rejects.toMatchObject({
+      code: "DAEMON_TIMEOUT", details: { path: "/watch?since=0", timeoutMs: 5000, responseConfirmed: false },
+    });
+    await disconnected;
+  }, 10000);
+
+  it("preserves a caller abort while reading an HTTP body", async () => {
+    const controller = new AbortController();
+    const reason = new DOMException("Cancelled by caller", "AbortError");
+    const controlPort = await listen(createServer((_request, response) => {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.write('{"value":');
+      setTimeout(() => controller.abort(reason), 20);
+    }));
+    await expect(daemonRequest(record({ controlPort }), "/frame", { signal: controller.signal })).rejects.toMatchObject({ name: "AbortError" });
+    expect(controller.signal.reason).toBe(reason);
+  });
+
+  it("keeps explicit waits longer than five seconds and their caller signal", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const fetchMock = vi.fn((_url: string, init: RequestInit) => new Promise<Response>((resolve, reject) => {
+      init.signal!.addEventListener("abort", () => reject(init.signal!.reason), { once: true });
+      setTimeout(() => resolve(new Response('{"timedOut":true}')), 5500);
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const request = daemonRequest(record(), "/actions/a1/wait?timeout=6000", { signal: controller.signal });
+    await vi.advanceTimersByTimeAsync(5500);
+    await expect(request).resolves.toEqual({ timedOut: true });
+    expect(fetchMock.mock.calls[0]![1].signal).toBe(controller.signal);
+    expect(controller.signal.aborted).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("distinguishes caller cancellation from a caller deadline", async () => {
+    const fetchMock = stalledFetch();
+    const controller = new AbortController();
+    const reason = new Error("Caller cancelled");
+    const cancelled = daemonRequest(record(), "/frame", { signal: controller.signal });
+    controller.abort(reason);
+    await expect(cancelled).rejects.toBe(reason);
+    await expect(daemonRequest(record(), "/ensure-ready", { method: "POST", signal: AbortSignal.timeout(20) })).rejects.toMatchObject({
+      code: "DAEMON_TIMEOUT", details: { timeoutMs: null, outcome: "unknown", mayHaveExecuted: true },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("clears successful request timers and limits stream startup without limiting its lifetime", async () => {
+    vi.useFakeTimers();
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const response = new Response(new ReadableStream<Uint8Array>({ start(controller) { streamController = controller; } }));
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response('{"ready":true}')).mockResolvedValueOnce(response);
+    vi.stubGlobal("fetch", fetchMock);
+    await daemonRequest(record(), "/status");
+    expect(vi.getTimerCount()).toBe(0);
+    const stream = await daemonStreamRequest(record(), "/watch?since=0");
+    const streamSignal = fetchMock.mock.calls[1]![1].signal as AbortSignal;
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(streamSignal.aborted).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+    const reader = stream.body!.getReader();
+    streamController.enqueue(new TextEncoder().encode("still subscribed"));
+    await expect(reader.read()).resolves.toMatchObject({ done: false });
+    await reader.cancel();
+    reader.releaseLock();
+
+    stalledFetch();
+    const startup = daemonStreamRequest(record(), "/sample?track=p1");
+    const failure = expect(startup).rejects.toMatchObject({ code: "DAEMON_TIMEOUT", details: { timeoutMs: 5000 } });
+    await vi.advanceTimersByTimeAsync(5000);
+    await failure;
+    expect(vi.getTimerCount()).toBe(0);
   });
 
 });

@@ -2,6 +2,8 @@ import { Writable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { buildProgram } from "../src/cli/program.js";
 import type { CliHandlers } from "../src/cli/handlers.js";
+import { encodeActionContext } from "../src/core/context.js";
+import { getSkillContent } from "../src/core/skills.js";
 import { sessionNotFound } from "../src/output/errors.js";
 
 class MemoryStream extends Writable {
@@ -53,12 +55,82 @@ function makeProgram(version = "0.0.0") {
 
 describe("CLI protocol", () => {
 
+  it("decodes observation context and waits only for the returned action identity", async () => {
+    const { program, handlers, stdout } = makeProgram();
+    const context = encodeActionContext("r7", 2);
+    vi.mocked(handlers.navigateFollow).mockResolvedValue({ action: "r7:a9", state: "running" });
+    vi.mocked(handlers.actionWait!).mockResolvedValue({ action: "r7:a9", state: "running", timedOut: true });
+    await program.parseAsync(["node", "mc-agent", "navigate", "follow", "--track", "r7:p1", "--context", context, "--wait", "75"]);
+    expect(handlers.navigateFollow).toHaveBeenCalledWith({ session: "default", context, runtimeId: "r7", worldEpoch: 2, track: "r7:p1", range: 2 });
+    expect(handlers.actionWait).toHaveBeenCalledWith({ session: "default", action: "r7:a9", timeout: 75 });
+    expect(JSON.parse(stdout.value)).toEqual({ ok: true, data: { action: "r7:a9", state: "running", timedOut: true } });
+    expect(handlers.actionCancel).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { state: "completed", result: { block: "minecraft:stone", drops: 1 } },
+    { state: "failed", reason: "FAILED", error: { code: "NAVIGATION_FAILED", message: "Goal is unreachable", details: { target: [1, 2, 3] } } },
+  ])("preserves terminal action %s details from bounded waits", async terminal => {
+    const { program, handlers, stdout } = makeProgram();
+    const completed = { action: "r7:a9", runtimeId: "r7", worldEpoch: 2, kind: "world.dig", startedAt: "start", finishedAt: "finish", timedOut: false, ...terminal };
+    vi.mocked(handlers.worldDig).mockResolvedValue({ action: "r7:a9", state: "running" });
+    vi.mocked(handlers.actionWait!).mockResolvedValue(completed);
+    await program.parseAsync(["node", "mc-agent", "world", "dig", "--x", "1", "--y", "2", "--z", "3", "--context", encodeActionContext("r7", 2), "--wait", "150"]);
+    expect(handlers.actionWait).toHaveBeenCalledWith({ session: "default", action: "r7:a9", timeout: 150 });
+    expect(JSON.parse(stdout.value)).toEqual({ ok: true, data: completed });
+    expect(handlers.actionCancel).not.toHaveBeenCalled();
+  });
+
+  it("uses the default bounded wait and supports context on cancellation", async () => {
+    const { program, handlers } = makeProgram();
+    const context = encodeActionContext("r7", 2);
+    vi.mocked(handlers.actionCancel!).mockResolvedValue({ action: "r7:a1", state: "cancelled" });
+    await program.parseAsync(["node", "mc-agent", "action", "cancel", "--action", "r7:a1", "--context", context, "--runtime", "r7", "--world-epoch", "2", "--wait"]);
+    expect(handlers.actionCancel).toHaveBeenCalledWith({ session: "default", context, runtimeId: "r7", worldEpoch: 2, action: "r7:a1" });
+    expect(handlers.actionWait).toHaveBeenCalledWith({ session: "default", action: "r7:a1", timeout: 5000 });
+  });
+
+  it.each([
+    ["world", "wake"],
+    ["world", "wake", "--runtime", "r7"],
+    ["world", "wake", "--context", "latest"],
+    ["world", "wake", "--context", encodeActionContext("r7", 2), "--runtime", "r8"],
+    ["world", "wake", "--context", encodeActionContext("r7", 2), "--world-epoch", "3"],
+    ["world", "wake", "--context", encodeActionContext("r7", 2), "--wait", "30001"],
+    ["action", "wait", "--action", "r7:a1", "--timeout", "-1"],
+    ["entity", "find", "--type", "mob", "--types", "minecraft:cow"],
+    ["entity", "find", "--types", "cow"],
+    ["observe", "events", "--profile", "future"],
+    ["observe", "watch", "--track", "r7:p1", "--profile", "agent"],
+    ["observe", "frame", "--detail", "raw"],
+    ["session", "ensure-ready", "--max-attempts", "0"],
+  ])("rejects invalid context and new protocol inputs %j", async (...args) => {
+    const { program } = makeProgram();
+    await expect(program.parseAsync(["node", "mc-agent", ...args])).rejects.toMatchObject({ code: "BAD_INPUT" });
+  });
+
+  it("parses full frames, inclusive species search, agent profiles, recovery and action waiting", async () => {
+    const { program, handlers } = makeProgram();
+    await program.parseAsync(["node", "mc-agent", "observe", "frame", "--detail", "full", "--max-entities", "0"]);
+    expect(handlers.observeFrame).toHaveBeenCalledWith({ session: "default", detail: "full", maxEntities: 0, radius: 64, tracks: [] });
+    await program.parseAsync(["node", "mc-agent", "entity", "find", "--types", "minecraft:player,minecraft:cow", "--types", "minecraft:sheep"]);
+    expect(handlers.entityFind).toHaveBeenCalledWith({ session: "default", types: ["minecraft:player", "minecraft:cow", "minecraft:sheep"], radius: 32, limit: 50, includePlayers: true, includePassive: true });
+    await program.parseAsync(["node", "mc-agent", "observe", "events", "--profile", "agent"]);
+    expect(handlers.observeEvents).toHaveBeenCalledWith({ session: "default", profile: "agent", since: 0, limit: 50, types: [] });
+    await program.parseAsync(["node", "mc-agent", "session", "diagnose"]);
+    expect(handlers.sessionDiagnose).toHaveBeenCalledWith({ session: "default" });
+    await program.parseAsync(["node", "mc-agent", "session", "ensure-ready"]);
+    expect(handlers.sessionEnsureReady).toHaveBeenCalledWith({ session: "default", timeout: 10000, maxAttempts: 3, backoff: 250 });
+    await program.parseAsync(["node", "mc-agent", "action", "wait", "--action", "r7:a1"]);
+    expect(handlers.actionWait).toHaveBeenCalledWith({ session: "default", action: "r7:a1", timeout: 5000 });
+  });
+
   it("parses frame projection, scoped deltas, tracked actions, and sample rates", async () => {
     const { program, handlers } = makeProgram();
     await program.parseAsync(["node", "mc-agent", "observe", "frame", "--since", "r7:f2", "--track", "r7:p1,r7:e2", "--track", "r7:e3", "--max-entities", "100", "--radius", "40"]);
-    expect(handlers.observeFrame).toHaveBeenCalledWith({ session: "default", since: "r7:f2", maxEntities: 100, radius: 40, tracks: ["r7:p1", "r7:e2", "r7:e3"] });
+    expect(handlers.observeFrame).toHaveBeenCalledWith({ session: "default", since: "r7:f2", detail: "compact", maxEntities: 100, radius: 40, tracks: ["r7:p1", "r7:e2", "r7:e3"] });
     await program.parseAsync(["node", "mc-agent", "observe", "watch", "--track", "r7:p1", "--fields", "position,velocity", "--rate", "3"]);
-    expect(handlers.observeWatch).toHaveBeenCalledWith({ session: "default", since: 0, types: [], track: "r7:p1", fields: ["position", "velocity"], rate: 3 });
+    expect(handlers.observeWatch).toHaveBeenCalledWith({ session: "default", since: 0, profile: "all", types: [], track: "r7:p1", fields: ["position", "velocity"], rate: 3 });
     await program.parseAsync(["node", "mc-agent", "look", "track", "--track", "r7:p1", "--runtime", "r7", "--world-epoch", "2"]);
     expect(handlers.lookTrack).toHaveBeenCalledWith({ session: "default", track: "r7:p1", runtimeId: "r7", worldEpoch: 2 });
     await program.parseAsync(["node", "mc-agent", "action", "status", "--action", "r7:a1"]);
@@ -101,6 +173,57 @@ describe("CLI protocol", () => {
       auth: "offline",
     });
     expect(JSON.parse(stdout.value)).toEqual({ ok: true, data: { session: "default" } });
+  });
+
+  it.each([
+    ["--minecraft-version", "1.21.1"],
+    ["--minecraft-version=1.21.1"],
+  ])("forwards Minecraft protocol version from session start %j", async (...args) => {
+    const { program, handlers, stdout } = makeProgram("9.8.7");
+    vi.mocked(handlers.startSession).mockResolvedValue({ session: "default" });
+
+    await program.parseAsync(["node", "mc-agent", "session", "start", ...args]);
+
+    expect(handlers.startSession).toHaveBeenCalledExactlyOnceWith({
+      session: "default", host: "localhost", port: 25565, username: "AgentBot", auth: "offline", version: "1.21.1",
+    });
+    expect(handlers.daemonRun).not.toHaveBeenCalled();
+    expect(JSON.parse(stdout.value)).toEqual({ ok: true, data: { session: "default" } });
+  });
+
+  it.each([
+    ["--minecraft-version", "1.21.1"],
+    ["--minecraft-version=1.21.1"],
+  ])("forwards Minecraft protocol version from internal daemon run %j", async (...args) => {
+    const { program, handlers, stdout } = makeProgram("9.8.7");
+
+    await program.parseAsync(["node", "mc-agent", "daemon", "run", "--control-port", "4567", ...args]);
+
+    expect(handlers.daemonRun).toHaveBeenCalledExactlyOnceWith({
+      session: "default", host: "localhost", port: 25565, username: "AgentBot", auth: "offline", controlPort: 4567, version: "1.21.1",
+    });
+    expect(JSON.parse(stdout.value)).toEqual({ ok: true, data: {} });
+  });
+
+  it.each(["--version", "-V"])("prints the package version for root %s", async flag => {
+    const { program, handlers, stdout } = makeProgram("9.8.7");
+    program.configureOutput({ writeOut: output => stdout.write(output) });
+
+    await expect(program.parseAsync(["node", "mc-agent", flag])).rejects.toMatchObject({ code: "commander.version", exitCode: 0 });
+
+    expect(stdout.value).toBe("9.8.7\n");
+    expect(handlers.startSession).not.toHaveBeenCalled();
+    expect(handlers.daemonRun).not.toHaveBeenCalled();
+  });
+
+  it("defaults compact frames to 12 projected entities", async () => {
+    const { program, handlers } = makeProgram();
+
+    await program.parseAsync(["node", "mc-agent", "observe", "frame"]);
+
+    expect(handlers.observeFrame).toHaveBeenCalledExactlyOnceWith({
+      session: "default", detail: "compact", maxEntities: 12, radius: 64, tracks: [],
+    });
   });
 
   it("uses default text formatter fallback for start sessions without names", async () => {
@@ -151,9 +274,7 @@ describe("CLI protocol", () => {
 
     await program.parseAsync(["node", "mc-agent", "skills", "get", "core"]);
 
-    expect(stdout.value).toContain("# mc-agent core");
-    expect(stdout.value).toContain("## Operating loop");
-    expect(stdout.value).toContain("keep the returned `nextCursor`");
+    expect(stdout.value).toBe(`${getSkillContent("core", false)}\n`);
   });
 
   it("writes structured errors for streaming and raw-output commands", async () => {
@@ -208,6 +329,7 @@ describe("CLI protocol", () => {
 
     expect(handlers.navigateConfigure).toHaveBeenCalledWith({
       session: "s", runtimeId: "r7", worldEpoch: 1,
+      allowPlace: undefined,
       allowDig: false,
       allowSprinting: false,
       allowParkour: false,
@@ -290,8 +412,8 @@ describe("CLI protocol", () => {
     expect(handlers.sessionStatus).toHaveBeenCalledWith({ session: "s" });
     expect(handlers.listSessions).toHaveBeenCalledWith();
     expect(handlers.stopSession).toHaveBeenCalledWith({ session: "s" });
-    expect(handlers.observeEvents).toHaveBeenCalledWith({ session: "s", since: "r7:s2", limit: 3, types: [] });
-    expect(handlers.observeWatch).toHaveBeenCalledWith({ session: "s", since: "r7:s4", types: [] });
+    expect(handlers.observeEvents).toHaveBeenCalledWith({ session: "s", since: "r7:s2", profile: "all", limit: 3, types: [] });
+    expect(handlers.observeWatch).toHaveBeenCalledWith({ session: "s", since: "r7:s4", profile: "all", types: [] });
     expect(handlers.sendChat).toHaveBeenCalledWith({ session: "s", message: "/say hi", allowCommand: true });
     expect(handlers.botPosition).toHaveBeenCalledWith({ session: "s" });
     expect(handlers.botInventory).toHaveBeenCalledWith({ session: "s" });
@@ -341,11 +463,13 @@ describe("CLI protocol", () => {
       session: "default",
       since: 0,
       limit: 50,
+      profile: "all",
       types: ["chat.player", "chat.whisper", "server.message"],
     });
     expect(handlers.observeWatch).toHaveBeenCalledWith({
       session: "default",
       since: 0,
+      profile: "all",
       types: ["chat.player"],
     });
   });

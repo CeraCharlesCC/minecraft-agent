@@ -17,6 +17,60 @@ function setup(history = 256) {
 }
 
 describe("runtime action ownership", () => {
+  it("waits for settlement and returns detached results", async () => {
+    const { actions } = setup();
+    const work = deferred<{ value: number }>();
+    const action = actions.start("look.at", 1, ["look"], { run: () => work.promise });
+    const waiting = actions.wait(action.action, 1000);
+    work.resolve({ value: 7 });
+    const finished = await waiting;
+    expect(finished).toMatchObject({ state: "completed", timedOut: false, result: { value: 7 } });
+    (finished.result as { value: number }).value = 9;
+    expect(actions.get(action.action).result).toEqual({ value: 7 });
+    expect(await actions.wait(action.action, 0)).toMatchObject({ state: "completed", timedOut: false });
+  });
+
+  it("reports failed and cancelled settlement to every waiter", async () => {
+    const { actions } = setup();
+    const action = actions.start("follow", 1, ["movement"], { continuous: true });
+    const waits = [actions.wait(action.action, 1000), actions.wait(action.action, 1000)];
+    actions.fail(action.action, new CliError("TRACK_LOST", "lost", "Observe.", 1, { trackId: "target" }));
+    for (const result of await Promise.all(waits)) expect(result).toMatchObject({ state: "failed", timedOut: false, error: { code: "TRACK_LOST", details: { trackId: "target" } } });
+    const next = actions.start("follow", 1, ["movement"], { continuous: true });
+    const cancelled = actions.wait(next.action, 1000);
+    actions.cancel(next.action);
+    expect(await cancelled).toMatchObject({ state: "cancelled", timedOut: false });
+  });
+
+  it("times out continuous work without cancelling it", async () => {
+    vi.useFakeTimers();
+    try {
+      const { actions } = setup();
+      const stop = vi.fn();
+      const action = actions.start("follow", 1, ["movement"], { continuous: true, stop });
+      const waiting = actions.wait(action.action, 50);
+      await vi.advanceTimersByTimeAsync(50);
+      expect(await waiting).toMatchObject({ state: "running", timedOut: true });
+      expect(actions.owner("movement")).toBe(action.action);
+      expect(stop).not.toHaveBeenCalled();
+      expect(await actions.wait(action.action, 0)).toMatchObject({ state: "running", timedOut: true });
+      actions.cancel(action.action);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("aborts only the waiter and rejects malformed deadlines or foreign actions", async () => {
+    const { actions } = setup();
+    const action = actions.start("follow", 1, ["movement"], { continuous: true });
+    const abort = new AbortController();
+    const waiting = actions.wait(action.action, 1000, abort.signal);
+    const rejection = expect(waiting).rejects.toThrow("stop waiting");
+    abort.abort(new Error("stop waiting"));
+    await rejection;
+    expect(actions.get(action.action).state).toBe("running");
+    for (const timeout of [-1, NaN, 30001, 0.5]) expect(() => actions.wait(action.action, timeout)).toThrow(expect.objectContaining({ code: "BAD_INPUT" }));
+    expect(() => actions.wait("another:a1")).toThrow(expect.objectContaining({ code: "RUNTIME_MISMATCH" }));
+    actions.cancel(action.action);
+  });
   it("returns promptly then reports detached completion results", async () => {
     const { events, actions } = setup();
     const work = deferred<{ done: boolean }>();
