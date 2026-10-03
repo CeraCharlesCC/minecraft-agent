@@ -14,6 +14,13 @@ export interface CliIo {
 
 const sessionSchema = z.object({
   session: z.string().min(1).default("default"),
+  runtimeId: z.string().min(1).optional(),
+  worldEpoch: z.coerce.number().int().min(0).optional(),
+});
+
+const physicalSchema = sessionSchema.extend({
+  runtimeId: z.string().min(1),
+  worldEpoch: z.coerce.number().int().min(0),
 });
 
 function collectEventType(value: string, previous: string[] = []): string[] {
@@ -38,16 +45,43 @@ const startSchema = sessionSchema.extend({
   version: z.string().min(1).optional(),
 });
 
+const eventCursorSchema = z.union([z.literal("0"), z.literal(0), z.string().regex(/^[^:]+:s\d+$/, "Expected a runtime-scoped event cursor or 0")]).default(0).transform(value => value === "0" ? 0 as const : value);
+const trackSchema = z.string().regex(/^[^:]+:[pe]\d+$/, "Expected a runtime-scoped track");
+const frameSchema = sessionSchema.extend({
+  since: z.string().regex(/^[^:]+:f\d+$/, "Expected a runtime-scoped frame").optional(),
+  maxEntities: z.coerce.number().int().min(1).max(200).default(50),
+  radius: z.coerce.number().positive().max(256).default(64),
+  track: z.preprocess(normalizeEventTypes, z.array(trackSchema)),
+}).transform(({ track, ...input }) => ({ ...input, tracks: track }));
+const actionSchema = sessionSchema.extend({
+  action: z.string().regex(/^[^:]+:a\d+$/, "Expected a runtime-scoped action"),
+});
+const debugEventsSchema = sessionSchema.extend({
+  id: z.string().regex(/^[^:]+:[ms]\d+$/, "Expected a scoped message ID or semantic cursor").optional(),
+});
+
 const eventsSchema = sessionSchema.extend({
-  since: z.coerce.number().int().min(0).default(0),
+  since: eventCursorSchema,
   limit: z.coerce.number().int().min(1).max(1000).default(50),
   type: eventTypesSchema,
 }).transform(({ type, ...input }) => ({ ...input, types: type }));
 
 const watchSchema = sessionSchema.extend({
-  since: z.coerce.number().int().min(0).default(0),
+  since: eventCursorSchema,
   type: eventTypesSchema,
-}).transform(({ type, ...input }) => ({ ...input, types: type }));
+  track: trackSchema.optional(),
+  fields: z.preprocess(value => value === undefined ? undefined : normalizeEventTypes(value), z.array(z.enum(["position", "velocity", "status"])).min(1).optional()),
+  rate: z.coerce.number().min(0.1).max(10).optional(),
+}).superRefine((input, context) => {
+  if (input.track && (input.type.length || input.since !== 0)) {
+    context.addIssue({ code: "custom", message: "Target samples cannot use event cursors or type filters" });
+  }
+  if (!input.track && (input.fields || input.rate !== undefined)) {
+    context.addIssue({ code: "custom", message: "--fields and --rate require --track" });
+  }
+}).transform(({ type, ...input }) => input.track
+  ? ({ ...input, types: type, fields: input.fields ?? ["position"], rate: input.rate ?? 2 })
+  : ({ ...input, types: type }));
 
 const chatSchema = sessionSchema.extend({
   message: z.string().min(1),
@@ -66,23 +100,23 @@ const tabCompleteSchema = sessionSchema.extend({
   timeout: z.coerce.number().int().positive().max(30000).default(5000),
 });
 
-const controlTapSchema = sessionSchema.extend({
+const controlTapSchema = physicalSchema.extend({
   state: z.enum(["forward", "back", "left", "right", "jump", "sprint", "sneak"]),
   durationMs: z.coerce.number().int().min(1).max(30000).default(500),
 });
 
-const controlSetSchema = sessionSchema.extend({
+const controlSetSchema = physicalSchema.extend({
   state: z.enum(["forward", "back", "left", "right", "jump", "sprint", "sneak"]),
   value: z.boolean().default(true),
 });
 
-const lookAtSchema = sessionSchema.extend({
+const lookAtSchema = physicalSchema.extend({
   x: z.coerce.number(),
   y: z.coerce.number(),
   z: z.coerce.number(),
 });
 
-const lookSchema = sessionSchema.extend({
+const lookSchema = physicalSchema.extend({
   yaw: z.coerce.number(),
   pitch: z.coerce.number(),
   force: z.boolean().default(false),
@@ -114,16 +148,16 @@ const sightBlockSchema = sessionSchema.extend({
   vectorLength: z.coerce.number().positive().max(32).default(5),
 });
 
-const navigateGotoSchema = blockPositionSchema.extend({
+const navigateGotoSchema = blockPositionSchema.extend(physicalSchema.shape).extend({
   range: z.coerce.number().positive().max(32).default(1),
 });
 
-const navigateFollowSchema = sessionSchema.extend({
-  player: z.string().min(1),
+const navigateFollowSchema = physicalSchema.extend({
+  track: trackSchema,
   range: z.coerce.number().positive().max(32).default(2),
 });
 
-const navigateConfigureSchema = sessionSchema.extend({
+const navigateConfigureSchema = physicalSchema.extend({
   allowDig: z.boolean().optional(),
   dig: z.boolean().optional(),
   noDig: z.boolean().optional(),
@@ -140,30 +174,30 @@ const navigateConfigureSchema = sessionSchema.extend({
   tickTimeout: z.coerce.number().int().positive().max(1000).optional(),
 });
 
-const collectItemSchema = sessionSchema.extend({
-  id: z.coerce.number().int(),
+const collectItemSchema = physicalSchema.extend({
+  track: trackSchema,
   range: z.coerce.number().positive().max(8).default(1),
 });
 
-const equipSchema = sessionSchema.extend({
+const equipSchema = physicalSchema.extend({
   item: z.string().min(1),
   destination: z.string().min(1).default("hand"),
 });
 
-const unequipSchema = sessionSchema.extend({
+const unequipSchema = physicalSchema.extend({
   destination: z.string().min(1).default("hand"),
 });
 
-const quickBarSchema = sessionSchema.extend({
+const quickBarSchema = physicalSchema.extend({
   slot: z.coerce.number().int().min(0).max(8),
 });
 
-const tossSchema = sessionSchema.extend({
+const tossSchema = physicalSchema.extend({
   item: z.string().min(1),
   count: z.coerce.number().int().positive().max(64).default(1),
 });
 
-const itemActionSchema = sessionSchema.extend({
+const itemActionSchema = physicalSchema.extend({
   offhand: z.boolean().default(false),
 });
 
@@ -177,36 +211,36 @@ const recipeSchema = sessionSchema.extend({
   recipeId: z.string().min(1).optional(),
 });
 
-const placeBlockSchema = blockPositionSchema.extend({
+const placeBlockSchema = blockPositionSchema.extend(physicalSchema.shape).extend({
   face: z.enum(["up", "down", "north", "south", "west", "east"]).default("up"),
   item: z.string().min(1).optional(),
 });
 
-const updateSignSchema = blockPositionSchema.extend({
+const updateSignSchema = blockPositionSchema.extend(physicalSchema.shape).extend({
   text: z.string(),
   back: z.boolean().default(false),
 });
 
-const entitySchema = sessionSchema.extend({
-  id: z.coerce.number().int(),
+const entitySchema = physicalSchema.extend({
+  track: trackSchema,
 });
 
-const swingArmSchema = sessionSchema.extend({
+const swingArmSchema = physicalSchema.extend({
   hand: z.enum(["left", "right"]).default("right"),
   showHand: z.boolean().default(true),
 });
 
-const moveVehicleSchema = sessionSchema.extend({
+const moveVehicleSchema = physicalSchema.extend({
   left: z.coerce.number().min(-1).max(1).default(0),
   forward: z.coerce.number().min(-1).max(1).default(0),
 });
 
-const windowItemSchema = sessionSchema.extend({
+const windowItemSchema = physicalSchema.extend({
   item: z.string().min(1),
   count: z.coerce.number().int().positive().max(2304).default(1),
 });
 
-const windowClickSchema = sessionSchema.extend({
+const windowClickSchema = physicalSchema.extend({
   slot: z.coerce.number().int().min(0),
   mouseButton: z.coerce.number().int().min(0).max(1).default(0),
   mode: z.coerce.number().int().min(0).max(6).default(0),
@@ -331,23 +365,36 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .option("--session <name>", "session name", "default")
     .action((opts, cmd) => commandRunner(cmd, io, () => handlers.stopSession(sessionSchema.parse(opts)))());
 
-  const observe = program.command("observe").description("Observe Minecraft bot events");
+  const observe = program.command("observe").description("Observe coherent frames and semantic events");
+
+  observe
+    .command("frame")
+    .description("Read a coherent local frame or delta from a retained baseline")
+    .option("--session <name>", "session name", "default")
+    .option("--since <frame>", "runtime-scoped baseline frame; reset when unavailable")
+    .option("--max-entities <count>", "individual entity projection limit (1-200)", "50")
+    .option("--radius <blocks>", "entity projection radius", "64")
+    .option("--track <track>", "preserve requested tracks; repeat or comma-separate", collectEventType, [])
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.observeFrame!(frameSchema.parse(opts)))());
 
   observe
     .command("events")
-    .description("Fetch stored bot events")
+    .description("Replay retained semantic events with scoped cursors and gap detection")
     .option("--session <name>", "session name", "default")
-    .option("--since <eventId>", "return events after this id", "0")
+    .option("--since <cursor>", "runtime-scoped semantic cursor, or 0 from beginning", "0")
     .option("--limit <count>", "maximum events to return", "50")
     .option("--type <eventType>", "include only this event type; repeat or comma-separate for multiple types", collectEventType, [])
     .action((opts, cmd) => commandRunner(cmd, io, () => handlers.observeEvents(eventsSchema.parse(opts)))());
 
   observe
     .command("watch")
-    .description("Watch new bot events as newline-delimited JSON")
+    .description("Watch semantic events or sample a target as newline-delimited JSON")
     .option("--session <name>", "session name", "default")
-    .option("--since <eventId>", "return events after this id", "0")
+    .option("--since <cursor>", "runtime-scoped semantic cursor, or 0 from beginning", "0")
     .option("--type <eventType>", "include only this event type; repeat or comma-separate for multiple types", collectEventType, [])
+    .option("--track <track>", "sample a runtime-scoped entity track")
+    .option("--fields <fields>", "comma-separated sample fields: position,velocity,status; default position")
+    .option("--rate <hz>", "sample rate 0.1-10 Hz; default 2")
     .action((opts, cmd) => streamingCommandRunner(cmd, io, () => handlers.observeWatch(watchSchema.parse(opts)))());
 
   const chat = program.command("chat").description("Send Minecraft chat");
@@ -455,16 +502,16 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .option("--value", "turn the control state on", true)
     .option("--off", "turn the control state off")
     .option("--session <name>", "session name", "default")
-    .action((opts, cmd) => {
+    .action((opts, cmd) => commandRunner(cmd, io, () => {
       const input = controlSetSchema.parse({ ...opts, value: opts.off ? false : opts.value });
-      return commandRunner(cmd, io, () => handlers.controlSet(input))();
-    });
+      return handlers.controlSet(input);
+    })());
 
   control
     .command("clear")
     .description("Clear all active control states")
     .option("--session <name>", "session name", "default")
-    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.controlClear(sessionSchema.parse(opts)))());
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.controlClear(physicalSchema.parse(opts)))());
 
   const look = program.command("look").description("Control bot camera direction");
 
@@ -486,6 +533,13 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .option("--session <name>", "session name", "default")
     .action((opts, cmd) => commandRunner(cmd, io, () => handlers.look(lookSchema.parse(opts)))());
 
+  look
+    .command("track")
+    .description("Continuously look at a verified loaded track")
+    .requiredOption("--track <track>", "loaded track from observe frame")
+    .option("--session <name>", "session name", "default")
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.lookTrack!(entitySchema.parse(opts)))());
+
   const navigate = program.command("navigate").description("Pathfind through the Minecraft world");
 
   navigate
@@ -500,8 +554,8 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
 
   navigate
     .command("follow")
-    .description("Continuously follow a visible player")
-    .requiredOption("--player <name>", "player username")
+    .description("Continuously follow a loaded entity track")
+    .requiredOption("--track <track>", "loaded track from observe frame")
     .option("--range <blocks>", "preferred follow distance", "2")
     .option("--session <name>", "session name", "default")
     .action((opts, cmd) => commandRunner(cmd, io, () => handlers.navigateFollow(navigateFollowSchema.parse(opts)))());
@@ -510,7 +564,7 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .command("stop")
     .description("Stop active pathfinding")
     .option("--session <name>", "session name", "default")
-    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.navigateStop(sessionSchema.parse(opts)))());
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.navigateStop(physicalSchema.parse(opts)))());
 
   navigate
     .command("status")
@@ -533,11 +587,12 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .option("--think-timeout <ms>", "pathfinder think timeout")
     .option("--tick-timeout <ms>", "pathfinder per-tick timeout")
     .option("--session <name>", "session name", "default")
-    .action((opts, cmd) => {
+    .action((opts, cmd) => commandRunner(cmd, io, () => {
       const parsed = navigateConfigureSchema.parse(opts);
-      return commandRunner(cmd, io, () =>
-        handlers.navigateConfigure({
+      return handlers.navigateConfigure({
           session: parsed.session,
+          ...(parsed.runtimeId ? { runtimeId: parsed.runtimeId } : {}),
+          ...(parsed.worldEpoch !== undefined ? { worldEpoch: parsed.worldEpoch } : {}),
           allowDig: parsed.noDig || parsed.dig === false ? false : parsed.allowDig,
           allowSprinting: parsed.noSprinting || parsed.sprinting === false ? false : parsed.allowSprinting,
           allowParkour: parsed.noParkour || parsed.parkour === false ? false : parsed.allowParkour,
@@ -546,16 +601,15 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
           searchRadius: parsed.searchRadius,
           thinkTimeout: parsed.thinkTimeout,
           tickTimeout: parsed.tickTimeout,
-        }),
-      )();
-    });
+        });
+    })());
 
   const collect = program.command("collect").description("Collect visible resources");
 
   collect
     .command("item")
     .description("Pathfind near a visible dropped item entity")
-    .requiredOption("--id <id>", "item entity id from bot entities")
+    .requiredOption("--track <track>", "loaded item track from observe frame")
     .option("--range <blocks>", "pickup range", "1")
     .option("--session <name>", "session name", "default")
     .action((opts, cmd) => commandRunner(cmd, io, () => handlers.collectItem(collectItemSchema.parse(opts)))());
@@ -596,13 +650,13 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .command("consume")
     .description("Consume the currently held item")
     .option("--session <name>", "session name", "default")
-    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.inventoryConsume(sessionSchema.parse(opts)))());
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.inventoryConsume(physicalSchema.parse(opts)))());
 
   inventory
     .command("fish")
     .description("Use the currently held fishing rod")
     .option("--session <name>", "session name", "default")
-    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.inventoryFish(sessionSchema.parse(opts)))());
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.inventoryFish(physicalSchema.parse(opts)))());
 
   inventory
     .command("activate-item")
@@ -615,7 +669,7 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .command("deactivate-item")
     .description("Stop using the held item")
     .option("--session <name>", "session name", "default")
-    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.inventoryDeactivateItem(sessionSchema.parse(opts)))());
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.inventoryDeactivateItem(physicalSchema.parse(opts)))());
 
   inventory
     .command("recipes")
@@ -639,7 +693,7 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .option("--recipe-index <index>", "recipe index from inventory recipes")
     .option("--recipe-id <id>", "recipe id when exposed by mineflayer")
     .option("--session <name>", "session name", "default")
-    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.inventoryCraft(recipeSchema.parse(opts)))());
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.inventoryCraft(recipeSchema.extend(physicalSchema.shape).parse(opts)))());
 
   const world = program.command("world").description("Inspect and interact with blocks");
 
@@ -692,13 +746,13 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .requiredOption("--y <number>", "y coordinate")
     .requiredOption("--z <number>", "z coordinate")
     .option("--session <name>", "session name", "default")
-    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.worldDig(blockPositionSchema.parse(opts)))());
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.worldDig(blockPositionSchema.extend(physicalSchema.shape).parse(opts)))());
 
   world
     .command("stop-digging")
     .description("Stop the current dig action")
     .option("--session <name>", "session name", "default")
-    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.worldStopDigging(sessionSchema.parse(opts)))());
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.worldStopDigging(physicalSchema.parse(opts)))());
 
   world
     .command("place")
@@ -729,7 +783,7 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .requiredOption("--y <number>", "y coordinate")
     .requiredOption("--z <number>", "z coordinate")
     .option("--session <name>", "session name", "default")
-    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.worldActivate(blockPositionSchema.parse(opts)))());
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.worldActivate(blockPositionSchema.extend(physicalSchema.shape).parse(opts)))());
 
   world
     .command("update-sign")
@@ -749,19 +803,19 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .requiredOption("--y <number>", "bed y coordinate")
     .requiredOption("--z <number>", "bed z coordinate")
     .option("--session <name>", "session name", "default")
-    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.worldSleep(blockPositionSchema.parse(opts)))());
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.worldSleep(blockPositionSchema.extend(physicalSchema.shape).parse(opts)))());
 
   world
     .command("wake")
     .description("Wake from sleep")
     .option("--session <name>", "session name", "default")
-    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.worldWake(sessionSchema.parse(opts)))());
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.worldWake(physicalSchema.parse(opts)))());
 
   world
     .command("elytra-fly")
     .description("Start elytra flight")
     .option("--session <name>", "session name", "default")
-    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.worldElytraFly(sessionSchema.parse(opts)))());
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.worldElytraFly(physicalSchema.parse(opts)))());
 
   const window = program.command("window").description("Inspect and transfer through the current container window");
 
@@ -772,12 +826,12 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .requiredOption("--y <number>", "block y coordinate")
     .requiredOption("--z <number>", "block z coordinate")
     .option("--session <name>", "session name", "default")
-    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.windowOpenBlock(blockPositionSchema.parse(opts)))());
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.windowOpenBlock(blockPositionSchema.extend(physicalSchema.shape).parse(opts)))());
 
   window
     .command("open-entity")
     .description("Open a visible container-like entity")
-    .requiredOption("--id <id>", "entity id")
+    .requiredOption("--track <track>", "loaded track from observe frame")
     .option("--session <name>", "session name", "default")
     .action((opts, cmd) => commandRunner(cmd, io, () => handlers.windowOpenEntity(entitySchema.parse(opts)))());
 
@@ -816,7 +870,7 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .command("close")
     .description("Close the current window")
     .option("--session <name>", "session name", "default")
-    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.windowClose(sessionSchema.parse(opts)))());
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.windowClose(physicalSchema.parse(opts)))());
 
   const entity = program.command("entity").description("Interact with visible entities");
 
@@ -834,22 +888,22 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
 
   entity
     .command("activate")
-    .description("Right-click a visible entity by id")
-    .requiredOption("--id <id>", "entity id")
+    .description("Right-click a visible entity by track")
+    .requiredOption("--track <track>", "loaded track from observe frame")
     .option("--session <name>", "session name", "default")
     .action((opts, cmd) => commandRunner(cmd, io, () => handlers.entityActivate(entitySchema.parse(opts)))());
 
   entity
     .command("use-on")
-    .description("Use the held item on a visible entity by id")
-    .requiredOption("--id <id>", "entity id")
+    .description("Use the held item on a visible entity by track")
+    .requiredOption("--track <track>", "loaded track from observe frame")
     .option("--session <name>", "session name", "default")
     .action((opts, cmd) => commandRunner(cmd, io, () => handlers.entityUseOn(entitySchema.parse(opts)))());
 
   entity
     .command("attack")
-    .description("Attack a visible entity by id")
-    .requiredOption("--id <id>", "entity id")
+    .description("Attack a visible entity by track")
+    .requiredOption("--track <track>", "loaded track from observe frame")
     .option("--allow-players", "allow attacking player entities", false)
     .option("--allow-passive", "allow attacking passive mobs", false)
     .option("--session <name>", "session name", "default")
@@ -865,8 +919,8 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
 
   entity
     .command("mount")
-    .description("Mount a visible entity by id")
-    .requiredOption("--id <id>", "entity id")
+    .description("Mount a visible entity by track")
+    .requiredOption("--track <track>", "loaded track from observe frame")
     .option("--session <name>", "session name", "default")
     .action((opts, cmd) => commandRunner(cmd, io, () => handlers.entityMount(entitySchema.parse(opts)))());
 
@@ -874,7 +928,7 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .command("dismount")
     .description("Dismount the current vehicle")
     .option("--session <name>", "session name", "default")
-    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.entityDismount(sessionSchema.parse(opts)))());
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.entityDismount(physicalSchema.parse(opts)))());
 
   entity
     .command("move-vehicle")
@@ -883,6 +937,23 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .option("--forward <number>", "forward/back input from -1 to 1", "0")
     .option("--session <name>", "session name", "default")
     .action((opts, cmd) => commandRunner(cmd, io, () => handlers.entityMoveVehicle(moveVehicleSchema.parse(opts)))());
+
+  const action = program.command("action").description("Inspect and cancel managed runtime actions");
+  action.command("status")
+    .requiredOption("--action <action>", "runtime-scoped action id")
+    .option("--session <name>", "session name", "default")
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.actionStatus!(actionSchema.parse(opts)))());
+  action.command("cancel")
+    .requiredOption("--action <action>", "runtime-scoped action id")
+    .option("--session <name>", "session name", "default")
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.actionCancel!(actionSchema.extend(physicalSchema.shape).parse(opts)))());
+
+  const debug = program.command("debug").description("Raw diagnostics outside the primary agent interface");
+  debug.command("events")
+    .description("Read retained raw payloads by scoped message ID or semantic cursor")
+    .option("--session <name>", "session name", "default")
+    .option("--id <id>", "runtime-scoped message ID or semantic cursor")
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.debugEvents!(debugEventsSchema.parse(opts)))());
 
   const skills = program.command("skills").description("Print mc-agent skill content for AI agents");
 
@@ -909,6 +980,30 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .option("--version <version>", "Minecraft protocol version")
     .action((opts, cmd) => commandRunner(cmd, io, () => handlers.daemonRun(daemonRunSchema.parse(opts)))());
   program.addCommand(daemon, { hidden: true });
+
+  // Every physical mutation carries the context of the observation used to choose it.
+  const physicalCommands: Record<string, readonly string[]> = {
+    control: ["tap", "set", "clear"],
+    look: ["at", "yaw-pitch", "track"],
+    navigate: ["goto", "follow", "stop", "configure"],
+    collect: ["item"],
+    inventory: ["equip", "unequip", "quickbar", "toss", "consume", "fish", "activate-item", "deactivate-item", "craft"],
+    world: ["dig", "stop-digging", "place", "place-entity", "activate", "update-sign", "sleep", "wake", "elytra-fly"],
+    window: ["open-block", "open-entity", "deposit", "withdraw", "click", "close"],
+    entity: ["activate", "use-on", "attack", "swing-arm", "mount", "dismount", "move-vehicle"],
+    action: ["cancel"],
+  };
+  for (const group of program.commands) {
+    for (const command of group.commands) {
+      if (!physicalCommands[group.name()]?.includes(command.name())) continue;
+      command.requiredOption("--runtime <runtimeId>", "expected daemon runtime identity from frame");
+      command.requiredOption("--world-epoch <epoch>", "expected world context epoch from frame");
+      command.hook("preAction", (_command, actionCommand) => {
+        const opts = actionCommand.opts();
+        opts.runtimeId = opts.runtime;
+      });
+    }
+  }
 
   return program;
 }

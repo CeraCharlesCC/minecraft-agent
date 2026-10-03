@@ -96,4 +96,13 @@ describe("daemon client", () => {
       remediation: expect.stringContaining("daemon log"),
     });
   });
+  it("preserves runtime errors and structured details through the client", async () => {
+    const saved = record();
+    for (const code of ["TRACK_UNKNOWN", "TRACK_LOST", "WORLD_CHANGED", "RUNTIME_MISMATCH", "FRAME_RESET_REQUIRED", "NOT_READY", "ACTION_UNKNOWN", "STREAM_OVERFLOW"]) {
+      const details = { runtimeId: "runtime", trackId: "runtime:p1", resetRequired: true };
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ code, error: "stale context", remediation: "observe", details }), {status:409})));
+      await expect(daemonRequest(saved, "/action")).rejects.toMatchObject({code, details, remediation:"observe"});
+    }
+  });
+
 });

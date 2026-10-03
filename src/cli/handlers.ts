@@ -9,17 +9,37 @@ export interface StartSessionInput {
 
 export interface SessionInput {
   session: string;
+  runtimeId?: string;
+  worldEpoch?: number;
 }
 
 export interface EventsInput extends SessionInput {
-  since: number;
+  since: 0 | string;
   limit: number;
   types: string[];
 }
 
 export interface WatchInput extends SessionInput {
-  since: number;
+  since: 0 | string;
   types: string[];
+  track?: string;
+  fields?: string[];
+  rate?: number;
+}
+
+export interface FrameInput extends SessionInput {
+  since?: string;
+  maxEntities: number;
+  radius: number;
+  tracks: string[];
+}
+
+export interface DebugEventsInput extends SessionInput {
+  id?: string;
+}
+
+export interface ActionInput extends SessionInput {
+  action: string;
 }
 
 export interface ChatInput extends SessionInput {
@@ -92,7 +112,7 @@ export interface NavigateGotoInput extends BlockPositionInput {
 }
 
 export interface NavigateFollowInput extends SessionInput {
-  player: string;
+  track: string;
   range: number;
 }
 
@@ -108,7 +128,7 @@ export interface NavigateConfigureInput extends SessionInput {
 }
 
 export interface CollectItemInput extends SessionInput {
-  id: number;
+  track: string;
   range: number;
 }
 
@@ -159,7 +179,7 @@ export interface UpdateSignInput extends BlockPositionInput {
 }
 
 export interface EntityInput extends SessionInput {
-  id: number;
+  track: string;
 }
 
 export interface EntityAttackInput extends EntityInput {
@@ -202,6 +222,11 @@ export interface DaemonRunInput extends StartSessionInput {
 }
 
 export interface CliHandlers {
+  observeFrame?(input: FrameInput): Promise<unknown>;
+  debugEvents?(input: DebugEventsInput): Promise<unknown>;
+  actionStatus?(input: ActionInput): Promise<unknown>;
+  actionCancel?(input: ActionInput): Promise<unknown>;
+  lookTrack?(input: EntityInput): Promise<unknown>;
   startSession(input: StartSessionInput): Promise<unknown>;
   sessionStatus(input: SessionInput): Promise<unknown>;
   listSessions(): Promise<unknown>;

@@ -7,19 +7,29 @@ export type ErrorCode =
   | "COMMAND_BLOCKED"
   | "DAEMON_ERROR"
   | "NAVIGATION_FAILED"
+  | "TRACK_UNKNOWN"
+  | "TRACK_LOST"
+  | "WORLD_CHANGED"
+  | "RUNTIME_MISMATCH"
+  | "FRAME_RESET_REQUIRED"
+  | "NOT_READY"
+  | "ACTION_UNKNOWN"
+  | "STREAM_OVERFLOW"
   | "UNKNOWN_ERROR";
 
 export class CliError extends Error {
   readonly code: ErrorCode;
   readonly exitCode: number;
   readonly remediation: string;
+  readonly details?: Record<string, unknown>;
 
-  constructor(code: ErrorCode, message: string, remediation: string, exitCode = 1) {
+  constructor(code: ErrorCode, message: string, remediation: string, exitCode = 1, details?: Record<string, unknown>) {
     super(message);
     this.name = "CliError";
     this.code = code;
     this.exitCode = exitCode;
     this.remediation = remediation;
+    this.details = details;
   }
 }
 

@@ -1,6 +1,7 @@
 import { fileURLToPath } from "node:url";
-import { CliHandlers } from "./handlers.js";
-import { CliError, sessionNotFound } from "../output/errors.js";
+import { once } from "node:events";
+import { CliHandlers, SessionInput } from "./handlers.js";
+import { CliError, type ErrorCode, sessionNotFound } from "../output/errors.js";
 import { daemonRequest, loadSessionForClient } from "../daemon/client.js";
 import { runDaemon } from "../daemon/server.js";
 import { spawnSessionDaemon } from "../daemon/spawn.js";
@@ -10,6 +11,13 @@ function appendEventTypes(params: URLSearchParams, types: readonly string[]): vo
   for (const type of types) {
     params.append("type", type);
   }
+}
+
+function context(input: SessionInput): { runtimeId?: string; worldEpoch?: number } {
+  return {
+    ...(input.runtimeId !== undefined ? { runtimeId: input.runtimeId } : {}),
+    ...(input.worldEpoch !== undefined ? { worldEpoch: input.worldEpoch } : {}),
+  };
 }
 
 export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): CliHandlers {
@@ -59,8 +67,38 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
 
     async stopSession(input) {
       const record = await loadSessionForClient(input.session);
-      await daemonRequest(record, "/stop", { method: "POST", body: "{}" });
+      await daemonRequest(record, "/stop", { method: "POST", body: JSON.stringify(context(input)) });
       return { session: input.session, stopped: true };
+    },
+
+    async observeFrame(input) {
+      const record = await loadSessionForClient(input.session);
+      const params = new URLSearchParams({ maxEntities: String(input.maxEntities), radius: String(input.radius) });
+      if (input.since) params.set("since", input.since);
+      for (const track of input.tracks) params.append("track", track);
+      return daemonRequest(record, `/frame?${params}`);
+    },
+
+    async debugEvents(input) {
+      const record = await loadSessionForClient(input.session);
+      const params = new URLSearchParams();
+      if (input.id) params.set("id", input.id);
+      return daemonRequest(record, `/debug/events${params.size ? `?${params}` : ""}`);
+    },
+
+    async actionStatus(input) {
+      const record = await loadSessionForClient(input.session);
+      return daemonRequest(record, `/actions/${encodeURIComponent(input.action)}`);
+    },
+
+    async actionCancel(input) {
+      const record = await loadSessionForClient(input.session);
+      return daemonRequest(record, `/actions/${encodeURIComponent(input.action)}/cancel`, { method: "POST", body: JSON.stringify(context(input)) });
+    },
+
+    async lookTrack(input) {
+      const record = await loadSessionForClient(input.session);
+      return daemonRequest(record, "/look/track", { method: "POST", body: JSON.stringify({ ...context(input), track: input.track }) });
     },
 
     async observeEvents(input) {
@@ -74,11 +112,26 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const record = await loadSessionForClient(input.session);
       const params = new URLSearchParams({ since: String(input.since) });
       appendEventTypes(params, input.types);
-      const response = await fetch(`http://127.0.0.1:${record.controlPort}/watch?${params.toString()}`, {
+      const endpoint = input.track ? "/sample" : "/watch";
+      if (input.track) {
+        params.delete("since");
+        params.set("track", input.track);
+        params.set("fields", (input.fields ?? ["position"]).join(","));
+        params.set("rate", String(input.rate ?? 2));
+      }
+      const response = await fetch(`http://127.0.0.1:${record.controlPort}${endpoint}?${params.toString()}`, {
         headers: { Authorization: `Bearer ${record.token}` },
       });
-      if (!response.ok || !response.body) {
-        throw new CliError("DAEMON_ERROR", "Unable to watch daemon events.", "Restart the session and retry.", 1);
+      if (!response.ok) {
+        let payload: { code?: unknown; error?: unknown; message?: unknown; remediation?: unknown; details?: Record<string, unknown> } = {};
+        try { payload = await response.json(); } catch { /* Preserve a useful fallback for non-JSON transport failures. */ }
+        const knownCodes: ErrorCode[] = ["BAD_INPUT", "DAEMON_ERROR", "TRACK_UNKNOWN", "TRACK_LOST", "WORLD_CHANGED", "RUNTIME_MISMATCH", "NOT_READY", "STREAM_OVERFLOW"];
+        const code = knownCodes.includes(payload.code as ErrorCode) ? payload.code as ErrorCode : "DAEMON_ERROR";
+        const message = typeof payload.error === "string" ? payload.error : typeof payload.message === "string" ? payload.message : "Unable to watch daemon events.";
+        throw new CliError(code, message, typeof payload.remediation === "string" ? payload.remediation : "Observe a fresh frame and retry with current handles.", code === "BAD_INPUT" ? 3 : 1, payload.details);
+      }
+      if (!response.body) {
+        throw new CliError("DAEMON_ERROR", "Daemon stream has no response body.", "Inspect session status and retry.", 1);
       }
       const reader = response.body.getReader();
       while (true) {
@@ -86,25 +139,25 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
         if (done) {
           return;
         }
-        process.stdout.write(Buffer.from(value));
+        if (!process.stdout.write(Buffer.from(value))) await once(process.stdout, "drain");
       }
     },
 
     async sendChat(input) {
       const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/chat", { method: "POST", body: JSON.stringify({ message: input.message }) });
+      return daemonRequest(record, "/chat", { method: "POST", body: JSON.stringify({ ...context(input), message: input.message, allowCommand: input.allowCommand }) });
     },
 
     async sendWhisper(input) {
       const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/chat/whisper", { method: "POST", body: JSON.stringify({ username: input.username, message: input.message }) });
+      return daemonRequest(record, "/chat/whisper", { method: "POST", body: JSON.stringify({ ...context(input), username: input.username, message: input.message }) });
     },
 
     async tabComplete(input) {
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/chat/tab-complete", {
         method: "POST",
-        body: JSON.stringify({
+        body: JSON.stringify({ ...context(input),
           text: input.text,
           assumeCommand: input.assumeCommand,
           sendBlockInSight: input.sendBlockInSight,
@@ -157,7 +210,7 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/control/tap", {
         method: "POST",
-        body: JSON.stringify({ state: input.state, durationMs: input.durationMs }),
+        body: JSON.stringify({ ...context(input), state: input.state, durationMs: input.durationMs }),
       });
     },
 
@@ -165,20 +218,20 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/control/set", {
         method: "POST",
-        body: JSON.stringify({ state: input.state, value: input.value }),
+        body: JSON.stringify({ ...context(input), state: input.state, value: input.value }),
       });
     },
 
     async controlClear(input) {
       const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/control/clear", { method: "POST", body: "{}" });
+      return daemonRequest(record, "/control/clear", { method: "POST", body: JSON.stringify(context(input)) });
     },
 
     async lookAt(input) {
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/look/at", {
         method: "POST",
-        body: JSON.stringify({ x: input.x, y: input.y, z: input.z }),
+        body: JSON.stringify({ ...context(input), x: input.x, y: input.y, z: input.z }),
       });
     },
 
@@ -186,7 +239,7 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/look/yaw-pitch", {
         method: "POST",
-        body: JSON.stringify({ yaw: input.yaw, pitch: input.pitch, force: input.force }),
+        body: JSON.stringify({ ...context(input), yaw: input.yaw, pitch: input.pitch, force: input.force }),
       });
     },
 
@@ -222,7 +275,7 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/navigate/goto", {
         method: "POST",
-        body: JSON.stringify({ x: input.x, y: input.y, z: input.z, range: input.range }),
+        body: JSON.stringify({ ...context(input), x: input.x, y: input.y, z: input.z, range: input.range }),
       });
     },
 
@@ -230,13 +283,13 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/navigate/follow", {
         method: "POST",
-        body: JSON.stringify({ player: input.player, range: input.range }),
+        body: JSON.stringify({ ...context(input), track: input.track, range: input.range }),
       });
     },
 
     async navigateStop(input) {
       const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/navigate/stop", { method: "POST", body: "{}" });
+      return daemonRequest(record, "/navigate/stop", { method: "POST", body: JSON.stringify(context(input)) });
     },
 
     async navigateStatus(input) {
@@ -248,7 +301,7 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/navigate/configure", {
         method: "POST",
-        body: JSON.stringify({
+        body: JSON.stringify({ ...context(input),
           allowDig: input.allowDig,
           allowSprinting: input.allowSprinting,
           allowParkour: input.allowParkour,
@@ -265,7 +318,7 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/collect/item", {
         method: "POST",
-        body: JSON.stringify({ id: input.id, range: input.range }),
+        body: JSON.stringify({ ...context(input), track: input.track, range: input.range }),
       });
     },
 
@@ -273,7 +326,7 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/inventory/equip", {
         method: "POST",
-        body: JSON.stringify({ item: input.item, destination: input.destination }),
+        body: JSON.stringify({ ...context(input), item: input.item, destination: input.destination }),
       });
     },
 
@@ -281,7 +334,7 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/inventory/unequip", {
         method: "POST",
-        body: JSON.stringify({ destination: input.destination }),
+        body: JSON.stringify({ ...context(input), destination: input.destination }),
       });
     },
 
@@ -289,7 +342,7 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/inventory/quickbar", {
         method: "POST",
-        body: JSON.stringify({ slot: input.slot }),
+        body: JSON.stringify({ ...context(input), slot: input.slot }),
       });
     },
 
@@ -297,31 +350,31 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/inventory/toss", {
         method: "POST",
-        body: JSON.stringify({ item: input.item, count: input.count }),
+        body: JSON.stringify({ ...context(input), item: input.item, count: input.count }),
       });
     },
 
     async inventoryConsume(input) {
       const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/inventory/consume", { method: "POST", body: "{}" });
+      return daemonRequest(record, "/inventory/consume", { method: "POST", body: JSON.stringify(context(input)) });
     },
 
     async inventoryFish(input) {
       const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/inventory/fish", { method: "POST", body: "{}" });
+      return daemonRequest(record, "/inventory/fish", { method: "POST", body: JSON.stringify(context(input)) });
     },
 
     async inventoryActivateItem(input) {
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/inventory/activate-item", {
         method: "POST",
-        body: JSON.stringify({ offhand: input.offhand }),
+        body: JSON.stringify({ ...context(input), offhand: input.offhand }),
       });
     },
 
     async inventoryDeactivateItem(input) {
       const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/inventory/deactivate-item", { method: "POST", body: "{}" });
+      return daemonRequest(record, "/inventory/deactivate-item", { method: "POST", body: JSON.stringify(context(input)) });
     },
 
     async inventoryRecipes(input) {
@@ -341,7 +394,7 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
           : { x: input.tableX, y: input.tableY ?? 0, z: input.tableZ ?? 0 };
       return daemonRequest(record, "/inventory/craft", {
         method: "POST",
-        body: JSON.stringify({ item: input.item, count: input.count, table, recipeIndex: input.recipeIndex, recipeId: input.recipeId }),
+        body: JSON.stringify({ ...context(input), item: input.item, count: input.count, table, recipeIndex: input.recipeIndex, recipeId: input.recipeId }),
       });
     },
 
@@ -349,20 +402,20 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/world/dig", {
         method: "POST",
-        body: JSON.stringify({ x: input.x, y: input.y, z: input.z }),
+        body: JSON.stringify({ ...context(input), x: input.x, y: input.y, z: input.z }),
       });
     },
 
     async worldStopDigging(input) {
       const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/world/stop-digging", { method: "POST", body: "{}" });
+      return daemonRequest(record, "/world/stop-digging", { method: "POST", body: JSON.stringify(context(input)) });
     },
 
     async worldPlace(input) {
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/world/place", {
         method: "POST",
-        body: JSON.stringify({ x: input.x, y: input.y, z: input.z, face: input.face, item: input.item }),
+        body: JSON.stringify({ ...context(input), x: input.x, y: input.y, z: input.z, face: input.face, item: input.item }),
       });
     },
 
@@ -370,7 +423,7 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/world/place-entity", {
         method: "POST",
-        body: JSON.stringify({ x: input.x, y: input.y, z: input.z, face: input.face, item: input.item }),
+        body: JSON.stringify({ ...context(input), x: input.x, y: input.y, z: input.z, face: input.face, item: input.item }),
       });
     },
 
@@ -378,7 +431,7 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/world/activate", {
         method: "POST",
-        body: JSON.stringify({ x: input.x, y: input.y, z: input.z }),
+        body: JSON.stringify({ ...context(input), x: input.x, y: input.y, z: input.z }),
       });
     },
 
@@ -386,7 +439,7 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/world/update-sign", {
         method: "POST",
-        body: JSON.stringify({ x: input.x, y: input.y, z: input.z, text: input.text, back: input.back }),
+        body: JSON.stringify({ ...context(input), x: input.x, y: input.y, z: input.z, text: input.text, back: input.back }),
       });
     },
 
@@ -394,25 +447,25 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/world/sleep", {
         method: "POST",
-        body: JSON.stringify({ x: input.x, y: input.y, z: input.z }),
+        body: JSON.stringify({ ...context(input), x: input.x, y: input.y, z: input.z }),
       });
     },
 
     async worldWake(input) {
       const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/world/wake", { method: "POST", body: "{}" });
+      return daemonRequest(record, "/world/wake", { method: "POST", body: JSON.stringify(context(input)) });
     },
 
     async worldElytraFly(input) {
       const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/world/elytra-fly", { method: "POST", body: "{}" });
+      return daemonRequest(record, "/world/elytra-fly", { method: "POST", body: JSON.stringify(context(input)) });
     },
 
     async windowOpenBlock(input) {
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/window/open-block", {
         method: "POST",
-        body: JSON.stringify({ x: input.x, y: input.y, z: input.z }),
+        body: JSON.stringify({ ...context(input), x: input.x, y: input.y, z: input.z }),
       });
     },
 
@@ -420,7 +473,7 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/window/open-entity", {
         method: "POST",
-        body: JSON.stringify({ id: input.id }),
+        body: JSON.stringify({ ...context(input), track: input.track }),
       });
     },
 
@@ -433,7 +486,7 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/window/deposit", {
         method: "POST",
-        body: JSON.stringify({ item: input.item, count: input.count }),
+        body: JSON.stringify({ ...context(input), item: input.item, count: input.count }),
       });
     },
 
@@ -441,7 +494,7 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/window/withdraw", {
         method: "POST",
-        body: JSON.stringify({ item: input.item, count: input.count }),
+        body: JSON.stringify({ ...context(input), item: input.item, count: input.count }),
       });
     },
 
@@ -449,18 +502,18 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/window/click", {
         method: "POST",
-        body: JSON.stringify({ slot: input.slot, mouseButton: input.mouseButton, mode: input.mode }),
+        body: JSON.stringify({ ...context(input), slot: input.slot, mouseButton: input.mouseButton, mode: input.mode }),
       });
     },
 
     async windowClose(input) {
       const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/window/close", { method: "POST", body: "{}" });
+      return daemonRequest(record, "/window/close", { method: "POST", body: JSON.stringify(context(input)) });
     },
 
     async entityActivate(input) {
       const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/entity/activate", { method: "POST", body: JSON.stringify({ id: input.id }) });
+      return daemonRequest(record, "/entity/activate", { method: "POST", body: JSON.stringify({ ...context(input), track: input.track }) });
     },
 
     async entityFind(input) {
@@ -478,14 +531,14 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
 
     async entityUseOn(input) {
       const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/entity/use-on", { method: "POST", body: JSON.stringify({ id: input.id }) });
+      return daemonRequest(record, "/entity/use-on", { method: "POST", body: JSON.stringify({ ...context(input), track: input.track }) });
     },
 
     async entityAttack(input) {
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/entity/attack", {
         method: "POST",
-        body: JSON.stringify({ id: input.id, allowPlayers: input.allowPlayers, allowPassive: input.allowPassive }),
+        body: JSON.stringify({ ...context(input), track: input.track, allowPlayers: input.allowPlayers, allowPassive: input.allowPassive }),
       });
     },
 
@@ -493,25 +546,25 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/entity/swing-arm", {
         method: "POST",
-        body: JSON.stringify({ hand: input.hand, showHand: input.showHand }),
+        body: JSON.stringify({ ...context(input), hand: input.hand, showHand: input.showHand }),
       });
     },
 
     async entityMount(input) {
       const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/entity/mount", { method: "POST", body: JSON.stringify({ id: input.id }) });
+      return daemonRequest(record, "/entity/mount", { method: "POST", body: JSON.stringify({ ...context(input), track: input.track }) });
     },
 
     async entityDismount(input) {
       const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/entity/dismount", { method: "POST", body: "{}" });
+      return daemonRequest(record, "/entity/dismount", { method: "POST", body: JSON.stringify(context(input)) });
     },
 
     async entityMoveVehicle(input) {
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/entity/move-vehicle", {
         method: "POST",
-        body: JSON.stringify({ left: input.left, forward: input.forward }),
+        body: JSON.stringify({ ...context(input), left: input.left, forward: input.forward }),
       });
     },
 

@@ -79,7 +79,8 @@ class FakeBot extends EventEmitter {
   stopDigging = vi.fn();
   placeBlock = vi.fn();
   placeEntity = vi.fn(async () => ({ id: 12, name: "boat", type: "object", position: { x: 1, y: 2, z: 3 } }));
-  activateBlock = vi.fn();
+  activateBlockCalls = vi.fn();
+  activateBlock = this.activateBlockCalls;
   updateSign = vi.fn();
   sleep = vi.fn();
   wake = vi.fn();
@@ -136,22 +137,20 @@ describe("BotController", () => {
     bot.emit("error", new Error("bad"));
     bot.emit("end");
 
-    expect(subject.status()).toMatchObject({ connected: false, spawned: false, lastError: "bad", lastEventId: 11 });
-    expect(events.list(0, 20)).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ type: "spawn" }),
-        expect.objectContaining({ type: "whisper", sender: "Alex", text: "secret" }),
-        expect.objectContaining({ type: "message", sender: "Server", text: "server says hi" }),
-        expect.objectContaining({ type: "death" }),
-        expect.objectContaining({ type: "health" }),
-        expect.objectContaining({ type: "entitySpawn" }),
-        expect.objectContaining({ type: "itemDrop" }),
-        expect.objectContaining({ type: "blockUpdate" }),
-        expect.objectContaining({ type: "kicked", text: "bye" }),
-        expect.objectContaining({ type: "error", text: "bad" }),
-        expect.objectContaining({ type: "end", text: "Connection ended." }),
-      ]),
-    );
+    subject.flushChat();
+    expect(subject.status()).toMatchObject({ connected: false, spawned: false, lastError: "bad" });
+    expect(events.list(0, 50)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "connection.ready" }),
+      expect.objectContaining({ type: "chat.whisper", sender: "Alex", text: "secret" }),
+      expect.objectContaining({ type: "server.message", sender: "Server", text: "server says hi" }),
+      expect.objectContaining({ type: "self.died" }),
+      expect.objectContaining({ type: "entity.appeared" }),
+      expect.objectContaining({ type: "world.reset", reason: "DEATH" }),
+      expect.objectContaining({ type: "connection.error", text: "bad" }),
+      expect.objectContaining({ type: "connection.disconnected" }),
+    ]));
+    expect(events.list(0, 50).some(event => event.type === "entityMoved" || event.type === "health")).toBe(false);
+
   });
 
   it("throws when actions are used before start and quits when stopped", () => {
@@ -185,10 +184,11 @@ describe("BotController", () => {
     bot.heldItem = null as unknown as FakeBot["heldItem"];
     expect(subject.position()).toEqual({ position: undefined, dimension: undefined });
     expect(subject.inventory()).toMatchObject({ items: [] });
+    subject.flushChat();
     expect(events.list(0, 10)).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ type: "message", sender: undefined, text: "undefined" }),
-        expect.objectContaining({ type: "error", text: "plain-error" }),
+        expect.objectContaining({ type: "server.message", text: "undefined" }),
+        expect.objectContaining({ type: "connection.error", text: "plain-error" }),
       ]),
     );
   });
@@ -287,7 +287,7 @@ describe("BotController", () => {
     expect(bot.placeBlock).toHaveBeenCalledWith(expect.objectContaining({ name: "dirt" }), expect.objectContaining({ x: 1, y: 0, z: 0 }));
     await expect(subject.placeEntity(1, 2, 3, "up", "dirt")).resolves.toMatchObject({ placed: true, entity: { id: 12 } });
     await expect(subject.activate(1, 2, 3)).resolves.toMatchObject({ activated: true, block: { name: "dirt" } });
-    expect(bot.activateBlock).toHaveBeenCalledWith(expect.objectContaining({ name: "dirt" }));
+    expect(bot.activateBlockCalls).toHaveBeenCalledWith(expect.objectContaining({ name: "dirt" }));
     expect(subject.updateSign(1, 2, 3, "hello", false)).toMatchObject({ updated: true });
     await expect(subject.sleep(1, 2, 3)).resolves.toMatchObject({ sleeping: true });
     await expect(subject.wake()).resolves.toEqual({ awake: true });
