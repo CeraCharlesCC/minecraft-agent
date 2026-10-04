@@ -34,7 +34,7 @@ async function server() {
   const headers = { Authorization: "Bearer wait-protocol-test-token-123456789", "Content-Type": "application/json" };
   const request = async (path: string, init: RequestInit = {}) => {
     const response = await fetch(`http://127.0.0.1:${port}${path}`, { ...init, headers });
-    expect(response.headers.get("X-MC-Agent-API")).toBe("3.1");
+    expect(response.headers.get("X-MC-Agent-API")).toBe("3.2");
     return response;
   };
   const get = async (path: string) => (await request(path)).json() as Promise<any>;

@@ -19,7 +19,9 @@ mc-agent --output json observe frame
 
 Before dependent work, check action state: `completed` is success; `ok: true` means processed. `timedOut: true` leaves work running. Navigation starts with digging/placement disabled.
 
-Arguments: `mc-agent <group> <command> --help`. Agent loop: [skill](skills/minecraft/SKILL.md) or `skills get core`. Observation, action, replay, delta, and upgrade contracts: [reference](skills/minecraft/references/playbooks.md) or `skills get core --full`.
+Dropped items include their stack, and named entities include `customName` when known. Use `mc-agent entity inspect --track <track>` for one entity's item and equipment. `collect item` completes only after confirming this bot picked up the target; it does not guarantee the entire stack. Unavailable facts remain unknown.
+
+Arguments: `mc-agent <group> <command> --help`. Agent loop: [skill](skills/minecraft/SKILL.md) or `skills get core`. Observation, action, replay, and delta contracts: [reference](skills/minecraft/references/playbooks.md) or `skills get core --full`.
 
 ```sh
 npm ci

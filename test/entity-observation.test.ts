@@ -42,7 +42,7 @@ describe("entity observation provenance and late identity", () => {
     metadata(bot);
     const first = world.frame(bot, ready);
     expect(first.entities).toHaveLength(1);
-    expect(first.entities[0]).toMatchObject({ type: null, unknownFields: ["type", "position"] });
+    expect(first.entities[0]).toMatchObject({ type: null, unknownFields: ["type", "position", "customName"] });
     expect(first.entities[0]).not.toHaveProperty("position");
     expect(first.entities[0]).not.toHaveProperty("distance");
     bot._client.emit("rel_entity_move", { entityId: 7, dX: 4096, dY: 0, dZ: 0 });
@@ -53,7 +53,7 @@ describe("entity observation provenance and late identity", () => {
     spawn(bot);
     const restored = world.frame(bot, ready, { since: first.frame }).delta.changed.entities[0];
     expect(restored).toMatchObject({ trackId: first.entities[0].trackId, type: "minecraft:cow", name: "cow", position: { x: 3, y: 64, z: 0 }, distance: 3 });
-    expect(restored).not.toHaveProperty("unknownFields");
+    expect(restored.unknownFields).toEqual(["customName"]);
     expect(world.frame(bot, ready, { maxEntities: 0 }).projection.aggregates).toEqual({ "minecraft:cow": 1 });
     expect(world.searchLoaded(bot, ready, { name: "cow", type: "animal", types: undefined }).entities).toHaveLength(1);
     expect(world.searchLoaded(bot, ready, { types: ["cow"] }).entities).toEqual(world.searchLoaded(bot, ready, { types: ["minecraft:cow"] }).entities);
@@ -68,7 +68,7 @@ describe("entity observation provenance and late identity", () => {
     const { bot, world } = livePlugin(packet === "sync_entity_position" ? "1.21.4" : "1.20.4");
     // No spawn: this packet itself creates the Prismarine entity.
     bot._client.emit(packet, { entityId: 7, x: 4, y: 64, z: 0, dx: 0, dy: 0, dz: 0, yaw: 0, pitch: 0 });
-    expect(world.searchLoaded(bot, ready).entities[0]).toMatchObject({ type: null, position: { x: 4, y: 64, z: 0 }, distance: 4, unknownFields: ["type"] });
+    expect(world.searchLoaded(bot, ready).entities[0]).toMatchObject({ type: null, position: { x: 4, y: 64, z: 0 }, distance: 4, unknownFields: ["type", "customName"] });
     bot._client.emit("rel_entity_move", { entityId: 7, dX: 4096, dY: 0, dZ: 0 });
     expect(observedEntityPosition(bot.entities[7])).toEqual({ x: 5, y: 64, z: 0 });
   });
@@ -79,7 +79,7 @@ describe("entity observation provenance and late identity", () => {
     expect(observedEntityPosition(bot.entities[7])).toEqual({ x: 0, y: 0, z: 0 });
     bot._client.emit("spawn_entity", { entityId: 8, objectUUID: OTHER_UUID, type: 999999, x: 1, y: 64, z: 0, yaw: 0, pitch: 0 });
     const entity = world.searchLoaded(bot, ready).entities.find((value: any) => value.name === "unknown");
-    expect(entity).toMatchObject({ type: null, unknownFields: ["type"] });
+    expect(entity).toMatchObject({ type: null, unknownFields: ["type", "customName"] });
     expect(world.frame(bot, ready, { maxEntities: 0 }).projection.aggregates).toMatchObject({ unknown: 1 });
   });
 

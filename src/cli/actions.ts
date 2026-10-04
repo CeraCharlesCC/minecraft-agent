@@ -577,6 +577,12 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       return daemonRequest(record, `/entity/find?${params.toString()}`);
     },
 
+    async entityInspect(input) {
+      const record = await loadSessionForClient(input.session);
+      const params = new URLSearchParams({ track: input.track });
+      return daemonRequest(record, `/entity/inspect?${params}`);
+    },
+
     async entityUseOn(input) {
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/entity/use-on", { method: "POST", body: JSON.stringify({ ...context(input), track: input.track }) });

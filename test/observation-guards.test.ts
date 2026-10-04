@@ -68,7 +68,7 @@ describe("observation provenance at the controller boundary", () => {
       position();
       bot._client.emit("entity_metadata", { entityId: 7, metadata: [] });
       const first = controller.frame({ detail: "full" }).entities[0];
-      expect(first).toMatchObject({ type: null, unknownFields: ["type", "position"] });
+      expect(first).toMatchObject({ type: null, unknownFields: ["type", "position", "customName"] });
       expect(first).not.toHaveProperty("velocity"); expect(first).not.toHaveProperty("onGround");
       const track = first.trackId as string;
       bot._client.emit("rel_entity_move", { entityId: 7, dX: 4096, dY: 0, dZ: 0 });

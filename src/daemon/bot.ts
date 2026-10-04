@@ -4,7 +4,7 @@ import { createBot } from "mineflayer";
 import pathfinderPackage from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import { EventStore, detachData } from "../core/events.js";
-import { WorldModel, FrameOptions, projectItem, projectEntity, entitySpecies } from "../core/world.js";
+import { WorldModel, FrameOptions, projectItem, projectEntity, entitySpecies, observedDroppedItem } from "../core/world.js";
 import { installEntityObservation, observedEntityPosition, resetEntityObservation } from "../core/entity-observation.js";
 import { installSelfOxygen } from "./self-oxygen.js";
 import { CanonicalChat } from "../core/chat.js";
@@ -353,6 +353,7 @@ export class BotController {
   private lifecycleReset = false;
   private readonly execution = new AsyncLocalStorage<{ action: string; worldEpoch: number; target?: string; binding?: unknown }>();
   private readonly pendingWindowListeners = new Set<() => void>();
+  private readonly collections = new Map<string | symbol, { action?: string; track: string; binding: MineflayerEntity; lost: boolean; pickedUp: boolean; targetLost: () => void }>();
   private readonly navigationMovementConfig: NavigationMovementConfig = { canDig: false, canPlace: false };
   private readonly placementDefaults = new WeakMap<PathfinderMovements, { blocks: number[]; towers: boolean }>();
 
@@ -363,7 +364,12 @@ export class BotController {
   ) {
     this.world = new WorldModel(events);
     this.actions = new ActionManager(events);
-    this.world.onTrackLost = (track) => this.actions.failTarget(track);
+    this.world.onTrackLost = (track) => {
+      const collection = [...this.collections.values()].find(value => value.track === track &&
+        (!value.action || this.actions.get(value.action).state === "running"));
+      collection?.targetLost();
+      this.actions.failTarget(track, collection?.action);
+    };
     this.world.onWorldReset = (reason) => this.invalidateWorld(reason);
   }
 
@@ -560,12 +566,25 @@ export class BotController {
       const context = this.execution.getStore();
       const owner = context?.action ?? this.actions.owner("movement");
       const action = owner ? this.actions.get(owner) : undefined;
-      const result = originalEquip.call(bot, item, destination);
-      if (!action || !(action.kind.startsWith("navigate.") || action.kind === "collect.item")) return result;
-      const execution = context ?? { action: action.action, worldEpoch: action.worldEpoch, target: action.target,
-        binding: action.target ? this.world.resolveTrack(action.target) : undefined };
+      if (!action || !(action.kind.startsWith("navigate.") || action.kind === "collect.item")) return originalEquip.call(bot, item, destination);
       const verify = this.continuationGuard(["movement", "look"]);
-      const bound = Promise.resolve(result).then(value => value);
+      let execution: NonNullable<ReturnType<typeof this.execution.getStore>>;
+      let result: Promise<void>;
+      try {
+        if (bot !== this.bot || generation !== this.generation) throw commandBlocked("Connection changed before navigation equipment preparation.", "Observe a fresh frame.");
+        verify();
+        execution = context ?? { action: action.action, worldEpoch: action.worldEpoch, target: action.target,
+          binding: action.target ? this.world.resolveTrack(action.target) : undefined };
+        // Physics callbacks may lack ALS. Bind preparation itself before it can
+        // send either synchronous packets or delayed inventory mutations.
+        result = this.execution.run(execution, () => originalEquip.call(bot, item, destination));
+      } catch (error) {
+        const rejected = Promise.reject(error);
+        void rejected.catch(() => {});
+        return rejected;
+      }
+      const bound = Promise.resolve(result).then(value => { verify(); return value; });
+      void bound.catch(() => {});
       const then = bound.then.bind(bound);
       bound.then = ((fulfilled: ((value: void) => unknown) | undefined | null, rejected: ((error: unknown) => unknown) | undefined | null) =>
         this.execution.run(execution, () => then(value => {
@@ -633,6 +652,10 @@ export class BotController {
   }
 
   flushChat() { this.chatReceiver?.flush(); }
+
+  entityInspect(track: string) {
+    return this.world.inspect(this.bot, this.observationContext(), track);
+  }
 
   isOwnChat(event: { type: string; [field: string]: unknown }): boolean {
     if (!event.type.startsWith("chat.")) return false;
@@ -758,9 +781,12 @@ export class BotController {
     const recoveryState = this.terminalFailure || this.authentication === "intervention_required" ? "intervention_required"
       : this.retryState.active ? "recovering" : exhausted ? "exhausted"
       : this.options.autoReconnect ? "intervention_required" : "disabled";
+    const pendingStartup = !this.connectionEnded && !this.lastError && !this.terminalFailure &&
+      this.authentication !== "intervention_required" && !this.retryState.active &&
+      (state === "connecting" || state === "waiting_for_spawn");
     return { state, ready,
       ...(!ready && code ? { cause: { code, message: message! } } : {}),
-      ...(!ready && !this.stopping ? { recovery: { state: recoveryState,
+      ...(!ready && !this.stopping && !pendingStartup ? { recovery: { state: recoveryState,
         ...(this.incident ? { attempts: this.retryState.attempts, maxAttempts: this.incident.maxAttempts } : {}) } } : {}),
     };
   }
@@ -945,8 +971,10 @@ export class BotController {
     for (const owner of owners) {
       const action = this.actions.get(owner);
       if (!action.target) continue;
+      const collection = this.collections.get(owner);
+      if (collection?.lost || collection?.pickedUp) continue;
       try { this.getRequiredEntity(action.target); }
-      catch (error) { this.actions.fail(owner, error); }
+      catch (error) { if (!collection?.lost && !collection?.pickedUp) this.actions.fail(owner, error); }
     }
   }
 
@@ -1013,11 +1041,18 @@ export class BotController {
             this.actions.fail(context.action, new CliError("WORLD_CHANGED", "World changed before packet submission.", "Observe a fresh frame."));
             return;
           }
+          const collection = this.collections.get(context.action);
+          // Observation can continue briefly after removal; physical packets cannot.
+          if (collection?.lost || collection?.pickedUp) return;
           if (context.target && this.getRequiredEntity(context.target) !== context.binding) {
             this.actions.fail(context.action, new CliError("TRACK_LOST", "Target binding changed before packet submission.", "Observe a fresh frame."));
             return;
           }
-        } catch (error) { this.actions.fail(context.action, error); return; }
+        } catch (error) {
+          const collection = this.collections.get(context.action);
+          if (!collection?.lost && !collection?.pickedUp) this.actions.fail(context.action, error);
+          return;
+        }
       }
       return write(name, params);
     };
@@ -1359,12 +1394,93 @@ export class BotController {
 
   async collectItem(id: number | string, range: number) {
     const entity = this.getRequiredEntity(id);
+    const bot = this.requireBot();
+    if (entitySpecies(entity, bot.registry) !== "minecraft:item") {
+      throw new CliError("COMMAND_BLOCKED", "Collection requires a dropped item target.", "Observe dropped items and choose an item track.");
+    }
     const position = observedEntityPosition(entity);
     if (!position) {
       throw new CliError("COMMAND_BLOCKED", `Entity '${id}' has no position.`, "Observe the current game state and choose a valid operation.");
     }
-    await this.navigateNear(position.x, position.y, position.z, range);
-    return { collectedTarget: this.publicEntity(entity), inventory: this.inventory() };
+    const track = this.world.trackFor(entity)!;
+    const action = this.execution.getStore()?.action;
+    const key = action ?? Symbol("collection");
+    const epoch = this.world.worldEpoch, generation = this.generation;
+    const entityId = entity.id, entityUuid = entity.uuid;
+    const confirmationTimeout = 3_000;
+    type PickupReceipt = { pickupConfirmed: true; item?: Record<string, unknown>; unknownFields: string[] };
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let resolvePickup!: (result: PickupReceipt) => void;
+    let rejectPickup!: (error: unknown) => void;
+    const confirmation = new Promise<PickupReceipt>((resolve, reject) => {
+      resolvePickup = resolve; rejectPickup = reject;
+    });
+    const startTimer = () => {
+      if (!active) return;
+      timer ??= setTimeout(() => rejectPickup(new CliError("COMMAND_BLOCKED", "Item pickup was not confirmed.",
+        "Observe the target and inventory before choosing another action.", 1,
+        { reason: "PICKUP_UNCONFIRMED", trackId: track, timeoutMs: confirmationTimeout })), confirmationTimeout);
+    };
+    const stopApproach = () => {
+      try { this.execution.exit(() => this.clearResources(["movement"])); }
+      catch { /* Confirmation remains authoritative if a transport has closed. */ }
+    };
+    const collection = { action, track, binding: entity, lost: false, pickedUp: false,
+      targetLost: () => { collection.lost = true; startTimer(); stopApproach(); } };
+    this.collections.set(key, collection);
+    const onCollect = (collector: MineflayerEntity, collected: MineflayerEntity) => {
+      if (collector !== bot.entity || collected !== entity || this.bot !== bot || this.generation !== generation) return;
+      this.checkWorld();
+      if (this.world.worldEpoch !== epoch || entity.id !== entityId ||
+          (entityUuid !== undefined && entity.uuid !== entityUuid) ||
+          (action && this.actions.get(action).state !== "running")) return;
+      const currentTrack = this.world.trackFor(entity);
+      if (collection.lost) {
+        // A removed binding may still receive its pickup event, but a reloaded
+        // object or recycled numeric ID cannot confirm the original action.
+        if (currentTrack !== undefined || Object.values(bot.entities ?? {}).some(value => value.id === entityId)) return;
+      } else {
+        if (currentTrack !== track) return;
+        try { if (this.world.resolveTrack(track) !== entity) return; }
+        catch { return; }
+      }
+      const item = observedDroppedItem(entity);
+      if (item) { delete item.count; delete item.slot; }
+      const receipt: PickupReceipt = { pickupConfirmed: true, ...(item ? { item } : {}),
+        unknownFields: ["collectedCount", ...(!item ? ["item"] : [])] };
+      collection.pickedUp = true;
+      resolvePickup(detachData(receipt));
+      stopApproach();
+    };
+    const unsubscribe = this.events.subscribe(event => {
+      if (action && event.action === action && ["action.completed", "action.failed", "action.cancelled"].includes(event.type)) {
+        this.collections.delete(key);
+        unsubscribe();
+      }
+      if ((event.type === "world.reset") || (event.action === action && action &&
+          ["action.failed", "action.cancelled"].includes(event.type))) {
+        rejectPickup(new CliError(event.type === "world.reset" ? "WORLD_CHANGED" : "COMMAND_BLOCKED",
+          "Collection stopped before pickup confirmation.", "Observe a fresh frame and current actions."));
+      }
+    });
+    bot.on("playerCollect", onCollect);
+    try {
+      const movement = this.navigateNear(position.x, position.y, position.z, range)
+        .then(() => { startTimer(); return confirmation; })
+        .catch(error => { if (collection.lost || collection.pickedUp) return confirmation; throw error; });
+      return await Promise.race([movement, confirmation]);
+    } finally {
+      active = false;
+      if (timer) clearTimeout(timer);
+      bot.off("playerCollect", onCollect);
+      // Keep confirmed pickup protection through ActionManager's settlement
+      // microtask; entityGone can arrive after this method has returned.
+      if (!collection.pickedUp || !action || this.actions.get(action).state !== "running") {
+        unsubscribe();
+        this.collections.delete(key);
+      }
+    }
   }
 
   async equip(itemName: string, destination: string): Promise<{ equipped: string; destination: string; heldItem?: { name: string; displayName?: string } }> {
@@ -1684,6 +1800,9 @@ export class BotController {
       if (epoch !== this.world.worldEpoch) throw new CliError("WORLD_CHANGED", "World changed during action.", "Observe a fresh frame.");
       if (resources.some((resource, index) => owners[index] !== this.actions.owner(resource))) {
         throw new CliError("COMMAND_BLOCKED", "Action was replaced or cancelled.", "Inspect current actions.");
+      }
+      if (owners.some(owner => owner && (this.collections.get(owner)?.lost || this.collections.get(owner)?.pickedUp))) {
+        throw new CliError("TRACK_LOST", "Collection target is no longer available for movement.", "Wait for pickup confirmation.");
       }
     };
   }

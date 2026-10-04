@@ -699,9 +699,9 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
 
   collect
     .command("item")
-    .description("Pathfind near a visible dropped item entity")
+    .description("Approach a loaded dropped item and confirm this bot's pickup; completion does not guarantee the whole stack")
     .requiredOption("--track <track>", "loaded item track from observe frame")
-    .option("--range <blocks>", "pickup range", "1")
+    .option("--range <blocks>", "approach goal range; pickup still requires confirmation", "1")
     .option("--session <name>", "session name", "default")
     .action((opts, cmd) => commandRunner(cmd, io, () => handlers.collectItem(collectItemSchema.parse(opts)))());
 
@@ -977,6 +977,13 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .option("--include-passive", "deprecated: passive mobs are already included", true)
     .option("--session <name>", "session name", "default")
     .action((opts, cmd) => commandRunner(cmd, io, () => handlers.entityFind(entityFindValidatedSchema.parse(opts)))());
+
+  entity
+    .command("inspect")
+    .description("Inspect one loaded entity's name, dropped item and equipment")
+    .requiredOption("--track <track>", "loaded entity track from frame or find")
+    .option("--session <name>", "session name", "default")
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.entityInspect(sessionSchema.extend({ track: trackSchema }).parse(opts)))());
 
   entity
     .command("activate")

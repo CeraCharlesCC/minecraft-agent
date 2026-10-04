@@ -37,6 +37,9 @@ type Entity = {
   displayName?: string; kind?: string; class?: string; position?: Point; velocity?: Point;
   yaw?: number; pitch?: number; height?: number; width?: number; onGround?: boolean;
   equipment?: unknown[];
+  metadata?: unknown[] | Record<number, unknown>;
+  getCustomName?: () => unknown;
+  getDroppedItem?: () => unknown;
 };
 type LiveBot = {
   username?: string; entity?: Entity; entities?: Record<string, Entity>;
@@ -53,6 +56,8 @@ interface Track {
   worldEpoch: number; kind: string; type?: string; class?: string; name?: string; username?: string;
   firstSeen: string; lastObservedAt: string; status: "loaded" | "lost" | "dead";
   position?: Point; velocity?: Point; yaw?: number; pitch?: number; onGround?: boolean;
+  height?: number; width?: number; customName?: string; item?: Record<string, unknown>;
+  semanticUnknownFields?: string[];
   entity?: Entity; nearby?: boolean; proximityAt?: number;
 }
 export interface WorldFrame {
@@ -143,16 +148,52 @@ export function projectItem(value: unknown, detail: "compact" | "full" = "compac
   return result;
 }
 
-export function projectEntity(value: unknown, detail: "compact" | "full" = "compact"): Record<string, unknown> | undefined {
+/** Extract a dropped stack without exposing protocol metadata or retaining live items. */
+export function observedDroppedItem(value: unknown): Record<string, unknown> | undefined {
+  const entity = value as Entity | undefined;
+  if (!entity || typeof entity.getDroppedItem !== "function") return undefined;
+  try {
+    const item = projectItem(entity.getDroppedItem());
+    return item && typeof item.name === "string" && item.name.length > 0 && Number.isSafeInteger(item.count) && Number(item.count) > 0 ? item : undefined;
+  } catch { return undefined; }
+}
+
+function observedEntitySemantics(entity: Entity, type?: string) {
+  const unknownFields: string[] = [];
+  let customName: string | undefined;
+  // Prismarine returns null for missing metadata, but throws on a known null name.
+  // Check reception before using its version-aware ChatMessage adapter.
+  if (entity.metadata?.[2] === null) { /* Known unnamed entity. */ }
+  else if (typeof entity.getCustomName === "function") {
+    try {
+      const name = entity.getCustomName();
+      if (name && typeof name === "object" && typeof (name as { toString?: unknown }).toString === "function" && name.toString !== Object.prototype.toString) {
+        customName = String(name);
+      } else if (typeof name === "string") customName = name;
+      else unknownFields.push("customName");
+    } catch { unknownFields.push("customName"); }
+  } else unknownFields.push("customName");
+  const item = type === "minecraft:item" ? observedDroppedItem(entity) : undefined;
+  if (type === "minecraft:item" && !item) unknownFields.push("item");
+  return { customName, item, unknownFields };
+}
+
+export function projectEntity(value: unknown, detail: "compact" | "full" = "compact", inspect = false): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object") return undefined;
   const entity = value as Record<string, unknown>, result: Record<string, unknown> = {};
-  for (const key of ["trackId", "status", "type", "name", "username", ...(detail === "full" ? ["kind", "class", "uuid"] : [])]) if (typeof entity[key] === "string") result[key] = entity[key];
+  for (const key of ["trackId", "status", "type", "name", "username", "customName", ...(detail === "full" ? ["kind", "class", "uuid"] : [])]) if (typeof entity[key] === "string") result[key] = entity[key];
   if (!Object.hasOwn(result, "type")) result.type = null;
-  if (Array.isArray(entity.unknownFields)) result.unknownFields = entity.unknownFields.filter((field) => field === "type" || field === "position");
-  for (const key of ["distance", ...(detail === "full" ? ["yaw", "pitch", "height", "width", "minecraftEntityId", "bindingGeneration", "worldEpoch"] : [])]) if (typeof entity[key] === "number" && Number.isFinite(entity[key])) result[key] = entity[key];
+  if (Array.isArray(entity.unknownFields)) {
+    const unknownFields = entity.unknownFields.filter((field) => ["type", "position", "customName", "item", ...(inspect ? ["equipment"] : [])].includes(String(field)));
+    if (unknownFields.length) result.unknownFields = unknownFields;
+  }
+  const item = projectItem(entity.item, detail);
+  if (item) result.item = item;
+  if (inspect && Array.isArray(entity.equipment)) result.equipment = Object.fromEntries(entity.equipment.flatMap((value, slot) => value ? [[String(slot), projectItem(value, "full")]] : []));
+  for (const key of ["distance", ...(detail === "full" || inspect ? ["yaw", "pitch", "height", "width"] : []), ...(detail === "full" ? ["minecraftEntityId", "bindingGeneration", "worldEpoch"] : [])]) if (typeof entity[key] === "number" && Number.isFinite(entity[key])) result[key] = entity[key];
   const position = point(entity.position);
   if (position) result.position = position;
-  if (detail === "full") {
+  if (detail === "full" || inspect) {
     const velocity = point(entity.velocity);
     if (velocity) result.velocity = velocity;
     if (typeof entity.onGround === "boolean") result.onGround = entity.onGround;
@@ -421,11 +462,17 @@ export class WorldModel {
     track.name = entity.name;
     track.username = entity.username;
     track.type = entitySpecies(entity, bot.registry);
+    const semantics = observedEntitySemantics(entity, track.type);
+    track.customName = semantics.customName;
+    track.item = semantics.item;
+    track.semanticUnknownFields = semantics.unknownFields;
     track.position = observedEntityPosition(entity);
     track.velocity = track.position ? point(entity.velocity) : undefined;
     track.yaw = track.position ? entity.yaw : undefined;
     track.pitch = track.position ? entity.pitch : undefined;
     track.onGround = track.position ? entity.onGround : undefined;
+    track.height = track.type && typeof entity.height === "number" && entity.height > 0 ? entity.height : undefined;
+    track.width = track.type && typeof entity.width === "number" && entity.width > 0 ? entity.width : undefined;
     track.lastObservedAt = now;
     if (track.username) this.rememberIdentity(track.username, track.uuid);
     this.proximity(track, observedEntityPosition(bot.entity));
@@ -482,6 +529,27 @@ export class WorldModel {
     const fingerprint = JSON.stringify(stable);
     if (fingerprint !== this.fingerprint) { this.fingerprint = fingerprint; this.revision += 1; }
     this.observed = { ...state, runtimeId: this.runtimeId, worldEpoch: this.worldEpoch, context: encodeActionContext(this.runtimeId, this.worldEpoch), observedAt: now, stateRevision: this.revision };
+  }
+
+  /** Inspect one current binding without allocating or evicting a frame baseline. */
+  inspect(bot: unknown, context: ObservationContext, trackId: string) {
+    const readiness = this.syncBindings(bot, context);
+    const entity = this.resolveTrack(trackId) as Entity;
+    const track = this.tracks.get(trackId)!;
+    const snapshot = this.serializeTrack(track);
+    const unknownFields = Array.isArray(snapshot.unknownFields) ? [...snapshot.unknownFields] : [];
+    const equipment = entity.equipment;
+    const equipmentKnown = Array.isArray(equipment) && Array.from({ length: equipment.length }, (_, slot) =>
+      Object.hasOwn(equipment, slot) && (equipment[slot] === null || equipment[slot] !== undefined && typeof equipment[slot] === "object")).every(Boolean);
+    if (!equipmentKnown) unknownFields.push("equipment");
+    return { context: encodeActionContext(this.runtimeId, this.worldEpoch), connection: this.projectConnection({
+      connected: readiness.connected, spawned: readiness.spawned, ready: readiness.connected && readiness.spawned,
+      ...readiness.getConnectionStatus?.(),
+    }), entity: projectEntity({ ...snapshot,
+      distance: distance(observedEntityPosition((bot as LiveBot)?.entity), track.position),
+      equipment: Array.isArray(equipment) ? equipment.map((item) => projectItem(item, "full")) : undefined,
+      unknownFields,
+    }, "compact", true)! };
   }
 
   /** Search every currently loaded track without allocating or evicting a frame baseline. */
@@ -722,6 +790,8 @@ export class WorldModel {
       this.bindings.delete(track.entity);
     }
     track.entity = undefined; track.position = undefined; track.velocity = undefined; track.yaw = undefined; track.pitch = undefined; track.onGround = undefined;
+    track.customName = undefined; track.item = undefined; track.semanticUnknownFields = undefined;
+    track.height = undefined; track.width = undefined;
     track.status = status; track.bindingGeneration += 1; track.nearby = undefined;
     if (track.uuid && this.uuidTracks.get(track.uuid) === track.trackId && this.uuidCollisions.has(track.uuid)) {
       const active = [...this.tracks.values()].filter((candidate) => candidate.uuid === track.uuid && candidate.status === "loaded");
@@ -755,8 +825,8 @@ export class WorldModel {
   }
   private tier(d?: number): number { return d === undefined ? 3 : d <= 16 ? 0 : d <= 64 ? 1 : 2; }
   private serializeTrack(track: Track): Record<string, unknown> {
-    const { entity: _entity, nearby: _nearby, proximityAt: _proximityAt, ...snapshot } = track;
-    const unknownFields = track.status === "loaded" ? [...(!track.type ? ["type"] : []), ...(!track.position ? ["position"] : [])] : [];
+    const { entity: _entity, nearby: _nearby, proximityAt: _proximityAt, semanticUnknownFields, ...snapshot } = track;
+    const unknownFields = track.status === "loaded" ? [...(!track.type ? ["type"] : []), ...(!track.position ? ["position"] : []), ...(semanticUnknownFields ?? [])] : [];
     return copy({ ...snapshot, type: track.type ?? null, ...(unknownFields.length ? { unknownFields } : {}) });
   }
   private compactTrack(track: Record<string, unknown>): Record<string, unknown> & { trackId: string } {

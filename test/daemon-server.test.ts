@@ -92,12 +92,12 @@ describe("daemon server", () => {
 
     const unauthorized = await fetch(`http://127.0.0.1:${port}/status`);
     expect(unauthorized.status).toBe(401);
-    expect(unauthorized.headers.get("X-MC-Agent-API")).toBe("3.1");
+    expect(unauthorized.headers.get("X-MC-Agent-API")).toBe("3.2");
     expect(await unauthorized.json()).toEqual({ code: "DAEMON_ERROR", message: "Unauthorized daemon request." });
 
     const missing = await fetch(`http://127.0.0.1:${port}/missing`, { headers: { Authorization: `Bearer ${TOKEN_A}` } });
     expect(missing.status).toBe(404);
-    expect(missing.headers.get("X-MC-Agent-API")).toBe("3.1");
+    expect(missing.headers.get("X-MC-Agent-API")).toBe("3.2");
     expect(await missing.json()).toEqual({ code: "BAD_INPUT", message: "Unknown daemon route." });
 
     fakeBot.emit("spawn");
@@ -190,7 +190,7 @@ describe("daemon server", () => {
 
     const status = await fetch(`http://127.0.0.1:${port}/status`, { headers: { Authorization: `Bearer ${TOKEN_A}` } });
     expect(status.ok).toBe(true);
-    expect(status.headers.get("X-MC-Agent-API")).toBe("3.1");
+    expect(status.headers.get("X-MC-Agent-API")).toBe("3.2");
     const compact = await status.json();
     expect(compact).toMatchObject({ ready: false, username: "AgentBot", connection: { state: "waiting_for_spawn" } });
     expect(compact).not.toHaveProperty("runtimeId");
@@ -571,10 +571,26 @@ describe("daemon server", () => {
     const get = async (path: string) => (await fetch(`http://127.0.0.1:${port}${path}`, {headers})).json() as Promise<any>;
     const post = async (path: string, body: unknown) => (await fetch(`http://127.0.0.1:${port}${path}`, {headers,method:"POST",body:JSON.stringify(body)})).json() as Promise<any>;
     try {
+      Object.assign(fakeBot.entities["12"], { name: "armor_stand", metadata: { 2: "Market" }, getCustomName: () => "Market",
+        equipment: [null, { name: "diamond_sword", count: 1, nbt: { private: "raw secret" } }] });
       fakeBot.emit("spawn");
       const first = await get("/frame"), track = first.entities[0].trackId;
       const context = { context: first.context };
       expect(first).toMatchObject({connection:{ready:true},eventCursor:expect.any(String),frame:expect.any(String),inventory:{known:true,slots:[{name:"dirt",count:2,slot:36}]}});
+      const inspected = await get(`/entity/inspect?track=${encodeURIComponent(track)}`);
+      expect(inspected).toMatchObject({ context: first.context, connection: { ready: true }, entity: {
+        trackId: track, type: "minecraft:armor_stand", customName: "Market", equipment: { 1: { name: "diamond_sword", count: 1 } },
+      } });
+      expect(inspected).not.toHaveProperty("entities");
+      for (const key of ["uuid", "minecraftEntityId", "bindingGeneration", "worldEpoch", "metadata"]) expect(inspected.entity).not.toHaveProperty(key);
+      expect(JSON.stringify(inspected)).not.toContain("raw secret");
+      expect(first.entities.find((entity: any) => entity.trackId === track).customName).toBe(inspected.entity.customName);
+      const missingInspect = await fetch(`http://127.0.0.1:${port}/entity/inspect`, { headers });
+      expect(missingInspect.status).toBe(400);
+      expect(await missingInspect.json()).toMatchObject({ code: "BAD_INPUT" });
+      expect(await get("/entity/inspect?track=12")).toMatchObject({ code: "BAD_INPUT" });
+      expect(await get(`/entity/inspect?track=${encodeHandle(decodeHandle(track).runtimeId,"e",999)}`)).toMatchObject({ code: "TRACK_UNKNOWN" });
+      expect(await get(`/entity/inspect?track=${encodeHandle("00000000-0000-0000-0000-000000000007","e",1)}`)).toMatchObject({ code: "RUNTIME_MISMATCH" });
       expect(await post("/navigate/follow", {track,range:2})).toMatchObject({code:"CONTEXT_REQUIRED"});
       expect(await post("/navigate/follow", {context:encodeActionContext("00000000-0000-0000-0000-000000000007",1),track})).toMatchObject({code:"RUNTIME_MISMATCH"});
       expect(await post("/entity/activate", {...context,id:12})).toMatchObject({code:"BAD_INPUT"});
@@ -587,9 +603,28 @@ describe("daemon server", () => {
       expect(delta).toMatchObject({since:first.frame,delta:{changed:{inventory:{slots:[{count:9,slot:36}]}}}});
       const follow = await post("/navigate/follow", {...context,track,range:2});
       fakeBot.emit("entityGone", fakeBot.entities["12"]);
+      expect(await get(`/entity/inspect?track=${encodeURIComponent(track)}`)).toMatchObject({ code: "TRACK_LOST" });
       expect(await get(`/actions/${follow.action}`)).toMatchObject({state:"failed",reason:"TRACK_LOST"});
       expect(await post("/navigate/follow", {...context,track})).toMatchObject({code:"TRACK_LOST"});
+      const dropped = { id: 14, name: "item", type: "object", position: { ...fakeBot.entity.position },
+        getDroppedItem: () => ({ name: "diamond", count: 3, nbt: { private: "raw secret" } }) };
+      Object.assign(fakeBot.entities, { 14: dropped });
+      fakeBot.emit("entitySpawn", dropped);
+      const collectionFrame = await get("/frame");
+      const itemTrack = collectionFrame.entities.find((entity: any) => entity.type === "minecraft:item").trackId;
+      const collecting = await post("/collect/item", { context: collectionFrame.context, track: itemTrack });
+      expect(await get(`/actions/${collecting.action}`)).toMatchObject({ state: "running" });
+      fakeBot.emit("playerCollect", fakeBot.entity, dropped);
+      delete (fakeBot.entities as Record<number, unknown>)[14];
+      fakeBot.emit("entityGone", dropped);
+      const collected = await get(`/actions/${collecting.action}/wait?timeout=1000`);
+      expect(collected).toMatchObject({ state: "completed", target: itemTrack, timedOut: false,
+        result: { pickupConfirmed: true, item: { name: "diamond" }, unknownFields: ["collectedCount"] } });
+      expect(collected.result.item).not.toHaveProperty("count");
+      expect(collected.result).not.toHaveProperty("inventory");
+      expect(JSON.stringify(collected)).not.toContain("raw secret");
       fakeBot.emit("death");
+      expect(await get(`/entity/inspect?track=${encodeURIComponent(track)}`)).toMatchObject({ code: "WORLD_CHANGED" });
       expect(await post("/navigate/goto", {...context,x:1,y:64,z:1})).toMatchObject({code:"WORLD_CHANGED"});
       expect(await get(`/frame?since=${first.frame}`)).toMatchObject({type:"full",reset:{reason:"WORLD_CHANGED"}});
     } finally { await post("/stop", {}); }
@@ -607,7 +642,7 @@ describe("daemon server", () => {
       const invalid = await fetch(`http://127.0.0.1:${port}/sample?track=${track}&rate=100`,{headers});
       expect(invalid.status).toBe(400); expect(await invalid.json()).toMatchObject({code:"BAD_INPUT"});
       const response = await fetch(`http://127.0.0.1:${port}/sample?track=${track}&fields=position,velocity,status&rate=10`,{headers});
-      expect(response.headers.get("X-MC-Agent-API")).toBe("3.1");
+      expect(response.headers.get("X-MC-Agent-API")).toBe("3.2");
       const reader = response.body!.getReader();
       const first = JSON.parse(Buffer.from((await reader.read()).value!).toString("utf8").trim());
       expect(first).toMatchObject({type:"track.sample",trackId:track,values:{status:"loaded",position:{x:3,y:2,z:3}}});

@@ -38,7 +38,7 @@ describe("observed world model", () => {
     const first = world.frame(live, ready);
     expect(first.type).toBe("full");
     expect(first.projection).toEqual({ included: 1, omitted: 0 });
-    expect(first.entities[0]).toEqual({ trackId: expect.any(String), status: "loaded", type: "minecraft:player", name: "player", username: "Alex", position: { x: 5, y: 64, z: 0 }, distance: 5 });
+    expect(first.entities[0]).toEqual({ trackId: expect.any(String), status: "loaded", type: "minecraft:player", name: "player", username: "Alex", position: { x: 5, y: 64, z: 0 }, distance: 5, unknownFields: ["customName"] });
     expect(first.inventory).toEqual({ known: true, slotCount: 46, slots: [{ name: "stone", count: 1, slot: 36 }] });
     expect(first.window).toMatchObject({ inventoryStart: 27, inventoryEnd: 63, slotCount: 3, slots: [{ name: "dirt", count: 2, slot: 1 }] });
     expect(first.self.heldItem).toEqual({ name: "book", count: 1 });

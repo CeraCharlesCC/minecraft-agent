@@ -306,6 +306,7 @@ export interface CliHandlers {
   windowClick(input: WindowClickInput): Promise<unknown>;
   windowClose(input: SessionInput): Promise<unknown>;
   entityFind(input: EntityFindInput): Promise<unknown>;
+  entityInspect(input: EntityInput): Promise<unknown>;
   entityActivate(input: EntityInput): Promise<unknown>;
   entityUseOn(input: EntityInput): Promise<unknown>;
   entityAttack(input: EntityAttackInput): Promise<unknown>;

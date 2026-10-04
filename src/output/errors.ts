@@ -77,7 +77,7 @@ export function projectErrorDetails(details?: Record<string, unknown>): Record<s
     if (typeof value === "boolean" || typeof value === "number" || value === null ||
       (typeof value === "string" && value.length <= 128 && !value.includes("@"))) result[key] = value;
   }
-  const reasons = new Set(["noPath", "timeout", "goal_not_reached", "world_changed", "disconnected", "death", "respawn", "dimension_changed", "target_lost", "already_within_range", "within_range", "cancelled", "replaced", "NO_PATH", "TIMEOUT", "GOAL_NOT_REACHED", "TERRAIN_MODIFICATION_BLOCKED", "PATH_STOPPED", "GOAL_CHANGED", "PATHFINDER_ERROR", "TRACK_LOST", "WORLD_CHANGED", "REPLACED", "CANCELLED"]);
+  const reasons = new Set(["noPath", "timeout", "goal_not_reached", "world_changed", "disconnected", "death", "respawn", "dimension_changed", "target_lost", "already_within_range", "within_range", "cancelled", "replaced", "NO_PATH", "TIMEOUT", "GOAL_NOT_REACHED", "TERRAIN_MODIFICATION_BLOCKED", "PATH_STOPPED", "GOAL_CHANGED", "PATHFINDER_ERROR", "TRACK_LOST", "WORLD_CHANGED", "REPLACED", "CANCELLED", "PICKUP_UNCONFIRMED"]);
   if (typeof details.reason === "string" && reasons.has(details.reason)) result.reason = details.reason;
   for (const key of ["goal", "position", "finalPosition", "target"]) {
     const value = details[key];

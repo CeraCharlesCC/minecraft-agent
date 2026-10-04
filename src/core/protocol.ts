@@ -1,2 +1,2 @@
-/** Observation semantics changed; older running daemons must not pass the probe. */
-export const API_VERSION = "3.1";
+/** Collection and entity observation contracts changed; reject older running daemons. */
+export const API_VERSION = "3.2";

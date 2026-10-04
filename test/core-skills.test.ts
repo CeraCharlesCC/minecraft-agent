@@ -20,7 +20,7 @@ describe("core skill content", () => {
   it("keeps ordinary play focused on observation and action", () => {
     const compact = getSkillContent("core", false);
     expect(compact).toContain("frame/find → action/wait → observation");
-    expect(compact).toContain("opaque `c2` context");
+    expect(compact).toContain("Copy `data.context` as `--context`");
     expect(compact).toContain("`unknownFields`");
     expect(compact).toContain("old actions are not replayed");
     expect(compact).not.toContain("`session diagnose`");
@@ -35,8 +35,6 @@ describe("core skill content", () => {
     expect(full).toContain("does not repair event gaps");
     expect(full).toContain("`chat.player`, `chat.unverified`");
     expect(full).toContain("does not acknowledge unread events");
-    expect(full).toContain("`X-MC-Agent-API: 3.1`");
-    expect(full).toContain("`DAEMON_INCOMPATIBLE`");
   });
 
   it("drops the oldest event of a type when its retention limit is reached", () => {

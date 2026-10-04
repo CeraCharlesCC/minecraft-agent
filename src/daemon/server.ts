@@ -549,6 +549,13 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
         return;
       }
 
+      if (request.method === "GET" && url.pathname === "/entity/inspect") {
+        const track = url.searchParams.get("track");
+        if (!track) throw badInput("Entity inspection requires a runtime-scoped track.");
+        sendJson(response, 200, controller.entityInspect(track));
+        return;
+      }
+
       if (request.method === "GET" && url.pathname === "/entity/find") {
         sendJson(
           response,

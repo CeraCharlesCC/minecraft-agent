@@ -166,9 +166,9 @@ export class ActionManager {
     }
   }
 
-  failTarget(track: string): void {
+  failTarget(track: string, exceptAction?: string): void {
     for (const record of this.records.values()) {
-      if (record.state === "running" && record.target === track) {
+      if (record.state === "running" && record.target === track && record.action !== exceptAction) {
         this.fail(record.action, new CliError("TRACK_LOST", "Action target left observation.", "Observe before starting a new action.", 1, { trackId: track }));
       }
     }

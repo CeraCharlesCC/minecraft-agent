@@ -144,6 +144,22 @@ describe("CLI protocol", () => {
     }
   });
 
+  it("inspects one tracked entity without requiring action context", async () => {
+    const { program, handlers, stdout } = makeProgram();
+    const result = { context: encodeActionContext(runtimeId, 2), entity: { trackId: `${runtimeTag}:e1`, customName: "Market" } };
+    vi.mocked(handlers.entityInspect).mockResolvedValue(result);
+    await program.parseAsync(["node", "mc-agent", "entity", "inspect", "--track", `${runtimeTag}:e1`, "--session", "market"]);
+    expect(handlers.entityInspect).toHaveBeenCalledWith({ session: "market", track: `${runtimeTag}:e1` });
+    expect(JSON.parse(stdout.value)).toEqual({ ok: true, data: result });
+    expect(handlers.actionWait).not.toHaveBeenCalled();
+  });
+
+  it.each(["12", `${runtimeTag}:a1`, "latest"])("rejects invalid inspect track %s", async track => {
+    const { program, handlers } = makeProgram();
+    await expect(program.parseAsync(["node", "mc-agent", "entity", "inspect", "--track", track])).rejects.toMatchObject({ code: "BAD_INPUT" });
+    expect(handlers.entityInspect).not.toHaveBeenCalled();
+  });
+
   it("parses full frames, inclusive species search, agent profiles, recovery and action waiting", async () => {
     const { program, handlers } = makeProgram();
     await program.parseAsync(["node", "mc-agent", "observe", "frame", "--detail", "full", "--max-entities", "0"]);

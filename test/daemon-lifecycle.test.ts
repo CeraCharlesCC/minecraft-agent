@@ -32,7 +32,7 @@ async function setup() {
     const response = await fetch(`http://127.0.0.1:${port}${path}`, { method: body === undefined ? "GET" : "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}) });
-    expect(response.headers.get("X-MC-Agent-API")).toBe("3.1");
+    expect(response.headers.get("X-MC-Agent-API")).toBe("3.2");
     return { status: response.status, body: await response.json() as any };
   };
   const cleanup = async () => {

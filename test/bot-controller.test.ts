@@ -247,7 +247,7 @@ describe("BotController", () => {
 
   it("distinguishes connection startup from terminal disconnect and retains the kick reason in frames", () => {
     const { subject, bot } = controller();
-    expect(subject.status().connection).toMatchObject({ state: "connecting", ready: false, recovery: { state: "disabled" } });
+    expect(subject.status().connection).toEqual({ state: "connecting", ready: false });
     bot.emit("spawn");
     expect(subject.frame().connection).toMatchObject({ state: "ready", ready: true });
     bot.emit("kicked", { text: "Server maintenance" });
@@ -391,7 +391,7 @@ describe("BotController", () => {
     movements.maxDropDown = 4;
     await subject.goto(12, 64, -2, 1);
     expect(bot.pathfinder.movements).toMatchObject({ canDig: false, allowSprinting: false, maxDropDown: 2 });
-    await expect(subject.collectItem(10, 1)).resolves.toMatchObject({ collectedTarget: { name: "cow", trackId: expect.any(String) } });
+    await expect(subject.collectItem(10, 1)).rejects.toMatchObject({ code: "COMMAND_BLOCKED" });
     expect(subject.stopNavigation()).toEqual({ stopped: true });
     expect(bot.pathfinder.stop).toHaveBeenCalled();
   });

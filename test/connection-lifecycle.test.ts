@@ -31,6 +31,15 @@ function setup(overrides = {}) {
 afterEach(() => { for (const subject of subjects.splice(0)) subject.stop(); vi.useRealTimers(); });
 
 describe("connection lifecycle", () => {
+  it.each([false, true])("omits recovery during healthy startup (autoReconnect=%s)", automatic => {
+    const { subject, bots } = setup({ autoReconnect: automatic });
+    expect(subject.connectionStatus()).toEqual({ state: "connecting", ready: false });
+    bots[0].emit("login");
+    expect(subject.connectionStatus()).toEqual({ state: "waiting_for_spawn", ready: false });
+    bots[0].emit("spawn");
+    expect(subject.connectionStatus()).toEqual({ state: "ready", ready: true });
+  });
+
   it("diagnoses structured errors and bounds history without guessing auth", () => {
     const { subject, bots } = setup();
     expect(subject.diagnose().connection.authentication.state).toBe("unknown");
