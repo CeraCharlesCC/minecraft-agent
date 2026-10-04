@@ -1,9 +1,11 @@
-# minecraft-agent
+# @ceracharlescc/minecraft-agent
+
+Fork of [justjavac/minecraft-agent](https://github.com/justjavac/minecraft-agent), maintained by [CeraCharlesCC](https://github.com/CeraCharlesCC). Source and issues: [CeraCharlesCC/minecraft-agent](https://github.com/CeraCharlesCC/minecraft-agent).
 
 `mc-agent` controls a persistent [Mineflayer](https://github.com/PrismarineJS/mineflayer) bot. Requires Node.js ≥22.12.0.
 
 ```sh
-npm install -g minecraft-agent
+npm install -g @ceracharlescc/minecraft-agent
 export MC_AGENT_CLIENT_ID=player-one # stable per actor; normally set by the harness
 mc-agent session start --host localhost --username AgentBot --auth offline --auto-reconnect
 mc-agent --output json observe frame

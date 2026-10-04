@@ -1,5 +1,5 @@
 {
-  "name": "minecraft-agent",
+  "name": "@ceracharlescc/minecraft-agent",
   "version": "4.0.0",
   "description": "Stateful Minecraft agent perception and action runtime powered by Mineflayer.",
   "keywords": [
@@ -10,13 +10,13 @@
     "automation",
     "skill"
   ],
-  "homepage": "https://github.com/justjavac/minecraft-agent#readme",
+  "homepage": "https://github.com/CeraCharlesCC/minecraft-agent#readme",
   "bugs": {
-    "url": "https://github.com/justjavac/minecraft-agent/issues"
+    "url": "https://github.com/CeraCharlesCC/minecraft-agent/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/justjavac/minecraft-agent.git"
+    "url": "git+https://github.com/CeraCharlesCC/minecraft-agent.git"
   },
   "license": "MIT",
   "author": {
@@ -24,6 +24,12 @@
     "email": "justjavac@gmail.com",
     "url": "https://github.com/justjavac"
   },
+  "contributors": [
+    {
+      "name": "CeraCharlesCC",
+      "url": "https://github.com/CeraCharlesCC"
+    }
+  ],
   "type": "module",
   "main": "./dist/cli/index.js",
   "bin": {
