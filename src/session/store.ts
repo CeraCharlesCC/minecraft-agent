@@ -20,14 +20,13 @@ export interface SessionRecord {
 
 export interface PublicSessionRecord {
   session: string;
-  pid: number;
-  controlPort: number;
-  host: string;
-  port: number;
-  username: string;
-  auth: string;
+  pid?: number;
+  controlPort?: number;
+  host?: string;
+  port?: number;
+  auth?: string;
   version?: string;
-  startedAt: string;
+  startedAt?: string;
   alive: boolean;
 }
 
@@ -141,18 +140,13 @@ export function isProcessAlive(pid: number): boolean {
   }
 }
 
-export function toPublicSession(record: SessionRecord): PublicSessionRecord {
+export function toPublicSession(record: SessionRecord, detail: "compact" | "full" = "compact"): PublicSessionRecord {
   return {
     session: record.session,
-    pid: record.pid,
-    controlPort: record.controlPort,
-    host: record.host,
-    port: record.port,
-    username: record.username,
-    auth: record.auth,
-    version: record.version,
-    startedAt: record.startedAt,
     alive: isProcessAlive(record.pid),
+    ...(detail === "full" ? { pid: record.pid, controlPort: record.controlPort,
+      host: record.host, port: record.port, auth: record.auth,
+      ...(record.version !== undefined ? { version: record.version } : {}), startedAt: record.startedAt } : {}),
   };
 }
 

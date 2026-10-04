@@ -35,7 +35,7 @@ describe("connection lifecycle", () => {
     const { subject, bots } = setup();
     expect(subject.diagnose().connection.authentication.state).toBe("unknown");
     for (let i = 0; i < 40; i++) bots[0].emit("error", Object.assign(new Error("write failed"), { code: "EPIPE" }));
-    expect(subject.diagnose()).toMatchObject({ ready: false, lastError: { code: "EPIPE", message: "write failed", generation: 1 }, retry: { enabled: false } });
+    expect(subject.diagnose()).toMatchObject({ ready: false, lastError: { code: "EPIPE", message: "The game connection is unavailable.", generation: 1 }, retry: { enabled: false } });
     expect(subject.diagnose().transitions).toHaveLength(32);
     expect(subject.diagnose().connection.authentication.state).toBe("unknown");
   });
@@ -59,7 +59,7 @@ describe("connection lifecycle", () => {
   it("fences late retired callbacks and preserves runtime while advancing epoch", async () => {
     const { subject, bots } = setup();
     bots[0].emit("spawn");
-    const before = subject.status();
+    const before = { runtimeId: subject.world.runtimeId, worldEpoch: subject.world.worldEpoch };
     const oldSpawn = bots[0].listeners("spawn")[0];
     const oldEnd = bots[0].listeners("end")[0];
     bots[0].emit("end", "socketClosed");
@@ -67,13 +67,14 @@ describe("connection lifecycle", () => {
     await new Promise((resolve) => setTimeout(resolve, 5));
     bots[1].emit("spawn");
     await recovery;
-    const after = subject.status();
+    const after = { runtimeId: subject.world.runtimeId, worldEpoch: subject.world.worldEpoch };
     expect(after.runtimeId).toBe(before.runtimeId);
     expect(after.worldEpoch).toBeGreaterThan(before.worldEpoch);
     oldSpawn(); oldEnd("late");
     bots[0].emit("error", new Error("late"));
     bots[0].emit("message", { text: "old chat" });
-    expect(subject.status()).toMatchObject({ spawned: true, worldEpoch: after.worldEpoch });
+    expect(subject.status()).toMatchObject({ ready: true });
+    expect(subject.world.worldEpoch).toBe(after.worldEpoch);
     expect(bots[0].listenerCount("spawn")).toBe(0);
     expect(bots[0].listenerCount("message")).toBe(0);
     expect(bots[0].quit).toHaveBeenCalledOnce();
@@ -128,7 +129,7 @@ describe("connection lifecycle", () => {
     const recovery = subject.ensureReady({ timeout: 100, maxAttempts: 2, backoff: 70 });
     await vi.advanceTimersByTimeAsync(10);
     bots[0].emit("kicked", "Banned");
-    expect(await recovery).toMatchObject({ ready: false, timedOut: false, connection: { reason: "KICKED: Banned", terminalFailure: true }, recommendedOperation: "resolve-terminal-failure" });
+    expect(await recovery).toMatchObject({ ready: false, timedOut: false, connection: { reason: "SERVER_REJECTED", terminalFailure: true }, recommendedOperation: "resolve-terminal-failure" });
     expect(create).toHaveBeenCalledOnce();
     const auth = setup({ autoReconnect: true, reconnectBackoff: 70 });
     auth.bots[0].emit("error", Object.assign(new Error("pipe closed"), { code: "EPIPE" }));
@@ -197,4 +198,70 @@ describe("connection lifecycle", () => {
     await vi.advanceTimersByTimeAsync(40_000);
     expect(transient.create).toHaveBeenCalledTimes(3);
   });
+  it("carries a finite incident budget through short ready cycles and repeated observations", async () => {
+    vi.useFakeTimers();
+    const { subject, bots, create } = setup({ autoReconnect: true, reconnectBackoff: 0, reconnectMaxAttempts: 2 });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      bots[attempt].emit("error", Object.assign(new Error("closed"), { code: "EPIPE" }));
+      await vi.advanceTimersByTimeAsync(1);
+      bots[attempt + 1].emit("spawn");
+      await vi.advanceTimersByTimeAsync(1);
+      expect(subject.connectionStatus().ready).toBe(true);
+    }
+    bots[2].emit("error", Object.assign(new Error("closed"), { code: "EPIPE" }));
+    for (let i = 0; i < 20; i++) subject.frame();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(create).toHaveBeenCalledTimes(3);
+    expect(subject.connectionStatus()).toMatchObject({ ready: false, recovery: { state: "exhausted", attempts: 2, maxAttempts: 2 } });
+    const resumed = subject.ensureReady({ timeout: 100, backoff: 0, maxAttempts: 1 });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(create).toHaveBeenCalledTimes(4);
+    bots[3].emit("spawn");
+    expect(await resumed).toMatchObject({ ready: true, attempts: 1 });
+  });
+
+  it("rearms automatic recovery after thirty seconds of uninterrupted ready state", async () => {
+    vi.useFakeTimers();
+    const { subject, bots, create } = setup({ autoReconnect: true, reconnectBackoff: 0, reconnectMaxAttempts: 1 });
+    bots[0].emit("error", Object.assign(new Error("closed"), { code: "EPIPE" }));
+    await vi.advanceTimersByTimeAsync(1);
+    bots[1].emit("spawn");
+    await vi.advanceTimersByTimeAsync(30_000);
+    bots[1].emit("error", Object.assign(new Error("closed"), { code: "EPIPE" }));
+    await vi.advanceTimersByTimeAsync(1);
+    expect(create).toHaveBeenCalledTimes(3);
+    bots[2].emit("spawn");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(subject.diagnose().retry.attempts).toBe(1);
+  });
+
+  it("carries the incident deadline through a brief successful retry", async () => {
+    vi.useFakeTimers();
+    const { subject, bots, create } = setup({ autoReconnect: true, reconnectBackoff: 0, reconnectMaxAttempts: 3 });
+    bots[0].emit("error", Object.assign(new Error("closed"), { code: "EPIPE" }));
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(5_000);
+    bots[1].emit("spawn");
+    await vi.advanceTimersByTimeAsync(25_000);
+    bots[1].emit("error", Object.assign(new Error("closed"), { code: "EPIPE" }));
+    await vi.advanceTimersByTimeAsync(1);
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(subject.connectionStatus()).toMatchObject({ recovery: { state: "exhausted", attempts: 1 } });
+  });
+
+  it("observes an unavailable world when a reconnect factory throws before producing a bot", async () => {
+    vi.useFakeTimers();
+    const bot = new Bot();
+    const create = vi.fn().mockReturnValueOnce(bot).mockImplementation(() => { throw Object.assign(new Error("unavailable"), { code: "ECONNREFUSED" }); });
+    const subject = new BotController(options, new EventStore(), create); subjects.push(subject); subject.start();
+    bot.emit("spawn"); bot.emit("end", "closed");
+    const recovery = subject.ensureReady({ timeout: 100, maxAttempts: 1, backoff: 0 });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await recovery).toMatchObject({ ready: false, attemptLimitReached: true });
+    expect(subject.frame()).toMatchObject({ connection: { ready: false }, self: {}, inventory: { known: false } });
+    expect(subject.position()).toEqual({ known: false });
+    expect(subject.inventory()).toEqual({ known: false });
+    expect(subject.findEntities({})).toMatchObject({ entities: [] });
+  });
+
 });

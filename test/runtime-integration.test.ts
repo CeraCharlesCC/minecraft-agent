@@ -48,8 +48,8 @@ describe("runtime integration", () => {
     bot.emit("message", json, "chat", UUID); bot.emit("chat", "Alex", "same", undefined, json);
     bot.emit("message", json, "chat", UUID); bot.emit("chat", "Alex", "same", undefined, json);
     const second = controller.frame({ detail: "full" });
-    expect(first.self.velocity.x).toBe(0); expect(first.inventory[0].count).toBe(3); expect(first.window.slots[0].count).toBe(2);
-    expect(second.self.velocity.x).toBe(2); expect(second.inventory[0].count).toBe(9);
+    expect(first.self.velocity.x).toBe(0); expect(first.inventory.slots[0].count).toBe(3); expect(first.window.slots[0].count).toBe(2);
+    expect(second.self.velocity.x).toBe(2); expect(second.inventory.slots[0].count).toBe(9);
     expect(second.eventCursor).toBe(events.getCursor());
     expect(events.query(0, 50, ["chat.player"]).events).toHaveLength(2);
   });
@@ -94,18 +94,18 @@ describe("runtime integration", () => {
     const frame = controller.frame(); const follow = controller.followTrack(track, 2);
     bot.emit("death");
     const dead = controller.frame({ tracks: [track] });
-    expect(dead.worldEpoch).toBeGreaterThan(frame.worldEpoch);
-    expect(dead.connection.ready).toBe(false); expect(dead.self.position).toBeUndefined(); expect(dead.window).toBeNull();
+    expect(dead.context).not.toBe(frame.context);
+    expect(dead.connection.ready).toBe(false); expect(dead.self.position).toBeUndefined(); expect(dead.window).toBeUndefined();
     expect(dead.entities[0].position).toBeUndefined(); expect(dead.entities[0].status).toBe("lost");
     expect(dead.actions.find((a: any) => a.action === follow.action)).toMatchObject({ state: "failed", reason: "WORLD_CHANGED", error: { code: "WORLD_CHANGED" } });
     expect(controller.actions.get(follow.action)).toMatchObject({ error: { details: { reason: "DEATH" } } });
-    expect(() => controller.validateContext({ runtimeId: frame.runtimeId, worldEpoch: frame.worldEpoch })).toThrow(/World context/);
+    expect(() => controller.validateContext({ context: frame.context })).toThrow(/World context/);
   });
 
   it("detects dimension changes before executing an action and waits for readiness", () => {
     const { controller, bot, track } = runtime(); const frame = controller.frame();
     controller.followTrack(track, 2); bot.game.dimension = "the_nether";
-    expect(() => controller.validateContext({ runtimeId: frame.runtimeId, worldEpoch: frame.worldEpoch })).toThrow(/World context/);
+    expect(() => controller.validateContext({ context: frame.context })).toThrow(/World context/);
     const next = controller.frame(); expect(next.connection.ready).toBe(false); expect(next.self.position).toBeUndefined();
     bot.emit("spawn"); expect(controller.frame().connection.ready).toBe(true);
   });
@@ -263,7 +263,7 @@ describe("runtime integration", () => {
   });
 
   it("keeps snapshot and inventory/window reads out of movement, ticks, guards, samples and find", async () => {
-    const { controller, bot, track } = runtime();
+    const { controller, bot, events, track } = runtime();
     const reconcile = vi.spyOn(controller.world, "reconcile");
     const inventoryReads = vi.fn(() => bot.slots);
     const windowReads = vi.fn(() => [{ name: "stone", count: 2 }]);
@@ -271,13 +271,15 @@ describe("runtime integration", () => {
     Object.defineProperty(bot.currentWindow, "slots", { get: windowReads });
     const unrelatedPosition = vi.fn(() => ({ x: 100, y: 64, z: 0 }));
     bot.entities[8] = { id: 8, type: "mob", name: "cod", get position() { return unrelatedPosition(); } };
+    const cursor = events.getLastEventId();
     for (let n = 0; n < 100; n++) {
-      bot.emit("entityMoved", bot.entities[7]);
+      for (let move = 0; move < 10; move++) bot.emit("entityMoved", bot.entities[7]);
       bot.emit("physicsTick");
       controller.sample(track, ["position", "velocity", "status"]);
       controller.validateContext({ runtimeId: controller.world.runtimeId, worldEpoch: 1 });
     }
     expect(unrelatedPosition).not.toHaveBeenCalled();
+    expect(events.list(cursor, 1024)).toEqual([]);
     const action = controller.runAction("entity.activate", ["item", "look"], () => bot._client.write("use_entity", {}), track);
     await controller.actions.wait(action.action);
     expect(bot.packetWrites).toHaveBeenCalledWith("use_entity", {});

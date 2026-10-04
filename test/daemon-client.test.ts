@@ -3,9 +3,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { daemonRequest, daemonStreamRequest, loadSessionForClient } from "../src/daemon/client.js";
+import { API_VERSION, API_VERSION_HEADER, daemonRequest, daemonStreamRequest, loadSessionForClient } from "../src/daemon/client.js";
 import { CliError } from "../src/output/errors.js";
 import { createSessionToken, SessionRecord, writeSession } from "../src/session/store.js";
+
+function apiResponse(body?: BodyInit | null, init: ResponseInit = {}): Response {
+  return new Response(body, { ...init, headers: { ...init.headers, [API_VERSION_HEADER]: API_VERSION } });
+}
 
 const tempDirs: string[] = [];
 const servers: Server[] = [];
@@ -71,7 +75,7 @@ describe("daemon client", () => {
 
   it("sends authorized local daemon requests and parses JSON responses", async () => {
     const saved = record({ controlPort: 39234, token: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
-    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ connected: true }), { status: 200 }));
+    const fetchMock = vi.fn().mockResolvedValue(apiResponse(JSON.stringify({ connected: true }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(daemonRequest(saved, "/status", { method: "GET", headers: { "X-Test": "1" } })).resolves.toEqual({
@@ -94,7 +98,7 @@ describe("daemon client", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
-        new Response(JSON.stringify({ error: "boom", code: "NAVIGATION_FAILED", remediation: "try a closer goal" }), { status: 409 }),
+        apiResponse(JSON.stringify({ error: "boom", code: "NAVIGATION_FAILED", remediation: "try a closer goal" }), { status: 409 }),
       ),
     );
 
@@ -108,26 +112,53 @@ describe("daemon client", () => {
     });
   });
 
+  it("reads compact v3 public errors and preserves CONTEXT_REQUIRED", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(apiResponse(JSON.stringify({
+      code: "CONTEXT_REQUIRED", message: "Pass context from observe frame or entity find.",
+    }), { status: 400 })));
+    await expect(daemonRequest(record(), "/look/at", { method: "POST", body: "{}" })).rejects.toMatchObject({
+      code: "CONTEXT_REQUIRED", message: "Pass context from observe frame or entity find.", exitCode: 3,
+    });
+  });
+
   it("identifies unsupported legacy routes without suggesting an observation retry", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: "not found" }), { status: 404 })));
     await expect(daemonRequest(record(), "/frame?maxEntities=50")).rejects.toMatchObject({
       code: "DAEMON_INCOMPATIBLE",
       remediation: expect.stringContaining("session stop --session default"),
-      details: { session: "default", expectedApiVersion: 2, path: "/frame", httpStatus: 404 },
+      details: { session: "default", expectedApiVersion: 3, path: "/frame", httpStatus: 404, actualApiVersion: null },
     });
   });
 
+  it("rejects successful old, missing, and future protocol headers before reading JSON", async () => {
+    for (const version of [undefined, "2", "4"]) {
+      const response = new Response("not valid JSON", { headers: version ? { [API_VERSION_HEADER]: version } : {} });
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response));
+      await expect(daemonRequest(record(), "/status")).rejects.toMatchObject({
+        code: "DAEMON_INCOMPATIBLE", details: { expectedApiVersion: 3, actualApiVersion: version ?? null },
+      });
+      expect(response.bodyUsed).toBe(true);
+    }
+  });
+
+  it("rejects incompatible stream headers and error bodies before decoding them", async () => {
+    for (const status of [200, 401, 503]) {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("legacy", { status, headers: { [API_VERSION_HEADER]: "2" } })));
+      await expect(daemonStreamRequest(record(), "/watch")).rejects.toMatchObject({ code: "DAEMON_INCOMPATIBLE" });
+    }
+  });
+
   it("preserves typed resource errors even when their HTTP status is 404", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: "ACTION_UNKNOWN", error: "Unknown action", remediation: "Inspect actions." }), { status: 404 })));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(apiResponse(JSON.stringify({ code: "ACTION_UNKNOWN", error: "Unknown action", remediation: "Inspect actions." }), { status: 404 })));
     await expect(daemonRequest(record(), "/actions/missing")).rejects.toMatchObject({ code: "ACTION_UNKNOWN" });
   });
 
   it("handles empty success bodies and fallback daemon error messages", async () => {
     const saved = record({ token: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(new Response("", { status: 200 })));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(apiResponse("", { status: 200 })));
     await expect(daemonRequest(saved, "/empty")).resolves.toEqual({});
 
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(new Response("", { status: 503 })));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(apiResponse("", { status: 503 })));
     await expect(daemonRequest(saved, "/down")).rejects.toMatchObject({
       code: "DAEMON_ERROR",
       message: "Daemon returned HTTP 503.",
@@ -136,9 +167,9 @@ describe("daemon client", () => {
   });
   it("preserves runtime errors and structured details through the client", async () => {
     const saved = record();
-    for (const code of ["DAEMON_TIMEOUT", "DAEMON_INCOMPATIBLE", "TRACK_UNKNOWN", "TRACK_LOST", "WORLD_CHANGED", "RUNTIME_MISMATCH", "FRAME_RESET_REQUIRED", "NOT_READY", "ACTION_UNKNOWN", "STREAM_OVERFLOW"]) {
+    for (const code of ["CONTEXT_REQUIRED", "DAEMON_TIMEOUT", "DAEMON_INCOMPATIBLE", "TRACK_UNKNOWN", "TRACK_LOST", "WORLD_CHANGED", "RUNTIME_MISMATCH", "FRAME_RESET_REQUIRED", "NOT_READY", "ACTION_UNKNOWN", "STREAM_OVERFLOW"]) {
       const details = { runtimeId: "runtime", trackId: "runtime:p1", resetRequired: true };
-      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ code, error: "stale context", remediation: "observe", details }), {status:409})));
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(apiResponse(JSON.stringify({ code, error: "stale context", remediation: "observe", details }), {status:409})));
       await expect(daemonRequest(saved, "/action")).rejects.toMatchObject({code, details, remediation:"observe"});
     }
   });
@@ -163,7 +194,7 @@ describe("daemon client", () => {
     const controlPort = await listen(createServer((request, response) => {
       requests++;
       expect(request.method).toBe("POST");
-      response.writeHead(200, { "Content-Type": "application/json" });
+      response.writeHead(200, { "Content-Type": "application/json", [API_VERSION_HEADER]: API_VERSION });
       response.write('{"accepted":');
       response.once("close", resolveDisconnected);
     }));
@@ -179,7 +210,7 @@ describe("daemon client", () => {
     let resolveDisconnected!: () => void;
     const disconnected = new Promise<void>(resolve => { resolveDisconnected = resolve; });
     const controlPort = await listen(createServer((_request, response) => {
-      response.writeHead(503, { "Content-Type": "application/json" });
+      response.writeHead(503, { "Content-Type": "application/json", [API_VERSION_HEADER]: API_VERSION });
       response.write('{"code":"DAEMON_ERROR",');
       response.once("close", resolveDisconnected);
     }));
@@ -193,7 +224,7 @@ describe("daemon client", () => {
     const controller = new AbortController();
     const reason = new DOMException("Cancelled by caller", "AbortError");
     const controlPort = await listen(createServer((_request, response) => {
-      response.writeHead(200, { "Content-Type": "application/json" });
+      response.writeHead(200, { "Content-Type": "application/json", [API_VERSION_HEADER]: API_VERSION });
       response.write('{"value":');
       setTimeout(() => controller.abort(reason), 20);
     }));
@@ -206,7 +237,7 @@ describe("daemon client", () => {
     const controller = new AbortController();
     const fetchMock = vi.fn((_url: string, init: RequestInit) => new Promise<Response>((resolve, reject) => {
       init.signal!.addEventListener("abort", () => reject(init.signal!.reason), { once: true });
-      setTimeout(() => resolve(new Response('{"timedOut":true}')), 5500);
+      setTimeout(() => resolve(apiResponse('{"timedOut":true}')), 5500);
     }));
     vi.stubGlobal("fetch", fetchMock);
     const request = daemonRequest(record(), "/actions/a1/wait?timeout=6000", { signal: controller.signal });
@@ -233,8 +264,8 @@ describe("daemon client", () => {
   it("clears successful request timers and limits stream startup without limiting its lifetime", async () => {
     vi.useFakeTimers();
     let streamController!: ReadableStreamDefaultController<Uint8Array>;
-    const response = new Response(new ReadableStream<Uint8Array>({ start(controller) { streamController = controller; } }));
-    const fetchMock = vi.fn().mockResolvedValueOnce(new Response('{"ready":true}')).mockResolvedValueOnce(response);
+    const response = apiResponse(new ReadableStream<Uint8Array>({ start(controller) { streamController = controller; } }));
+    const fetchMock = vi.fn().mockResolvedValueOnce(apiResponse('{"ready":true}')).mockResolvedValueOnce(response);
     vi.stubGlobal("fetch", fetchMock);
     await daemonRequest(record(), "/status");
     expect(vi.getTimerCount()).toBe(0);

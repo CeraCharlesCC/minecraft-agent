@@ -119,6 +119,14 @@ describe("daemon spawn", () => {
     expect(mocks.daemonRequest).toHaveBeenCalledTimes(2);
   });
 
+  it("fails immediately when the startup probe finds an incompatible daemon", async () => {
+    const { spawnSessionDaemon, mocks } = await loadSpawnWithNetMock({ port: 34569 });
+    const { CliError } = await import("../src/output/errors.js");
+    mocks.daemonRequest.mockRejectedValueOnce(new CliError("DAEMON_INCOMPATIBLE", "Old daemon.", "Restart using the current CLI."));
+    await expect(spawnSessionDaemon(input, "entry.js")).rejects.toMatchObject({ code: "DAEMON_INCOMPATIBLE" });
+    expect(mocks.daemonRequest).toHaveBeenCalledOnce();
+  });
+
   it("retries when the session file is temporarily incomplete", async () => {
     vi.useFakeTimers();
     const { spawnSessionDaemon, mocks } = await loadSpawnWithNetMock({ port: 34568 });

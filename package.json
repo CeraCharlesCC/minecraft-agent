@@ -1,6 +1,6 @@
 {
   "name": "minecraft-agent",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "Stateful Minecraft agent perception and action runtime powered by Mineflayer.",
   "keywords": [
     "minecraft",
@@ -46,6 +46,7 @@
     "coverage": "vitest run --coverage",
     "prepack": "npm run build",
     "test": "vitest run",
+    "measure:projection": "tsx scripts/measure-v3-projection.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

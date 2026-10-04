@@ -13,16 +13,18 @@ function startInput() {
 
 async function loadActionsWithMocks() {
   vi.resetModules();
+  const store = await vi.importActual<typeof import("../src/session/store.js")>("../src/session/store.js");
+  const record = { ...startInput(), pid: process.pid, controlPort: 3000, token: "private-token", startedAt: "2026-10-04T00:00:00Z" };
   const mocks = {
     isProcessAlive: vi.fn().mockReturnValue(false),
     daemonRequest: vi.fn(),
-    loadSessionForClient: vi.fn(),
+    loadSessionForClient: vi.fn().mockResolvedValue(record),
     runDaemon: vi.fn(),
     spawnSessionDaemon: vi.fn(),
     listSessions: vi.fn(),
     readSession: vi.fn(),
     removeSession: vi.fn(),
-    toPublicSession: vi.fn(),
+    toPublicSession: vi.fn(store.toPublicSession),
   };
 
   vi.doMock("../src/daemon/client.js", async () => ({
@@ -63,13 +65,13 @@ describe("CLI actions", () => {
     mocks.isProcessAlive.mockReturnValue(true);
     const pending = handlers.stopSession({ session: "default" });
     await vi.advanceTimersByTimeAsync(5100);
-    await expect(pending).resolves.toMatchObject({ runtimeId: "r7", stopping: true, stopped: false, timedOut: true });
+    await expect(pending).resolves.toMatchObject({ session: "default", stopping: true, stopped: false, timedOut: true });
     expect(mocks.isProcessAlive).toHaveBeenCalledWith(123);
     expect(mocks.removeSession).not.toHaveBeenCalled();
     mocks.isProcessAlive.mockReturnValueOnce(true).mockReturnValue(false);
     const completed = handlers.stopSession({ session: "default" });
     await vi.advanceTimersByTimeAsync(100);
-    await expect(completed).resolves.toMatchObject({ runtimeId: "r7", stopped: true, timedOut: false });
+    await expect(completed).resolves.toMatchObject({ session: "default", stopped: true, timedOut: false });
   });
 
   it("forwards recovery, compact frame, canonical species, profile, and action wait requests", async () => {
@@ -113,10 +115,10 @@ describe("CLI actions", () => {
     const { handlers, mocks } = await loadActionsWithMocks();
     mocks.loadSessionForClient.mockResolvedValue({ token: "secret", controlPort: 3000 });
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("{\"trackId\":\"r7:p1\"}\n")));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("{\"trackId\":\"r7:p1\"}\n", { headers: { "X-MC-Agent-API": "3" } })));
     await handlers.observeWatch({ session: "default", since: 0, types: [], track: "r7:p1", fields: ["position", "velocity"], rate: 3 });
     expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:3000/sample?track=r7%3Ap1&fields=position%2Cvelocity&rate=3", { signal: expect.any(AbortSignal), headers: { Authorization: "Bearer secret", "Content-Type": "application/json" } });
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: "RUNTIME_MISMATCH", error: "Old cursor", remediation: "Observe again", details: { runtimeId: "r8" } }), { status: 409 })));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: "RUNTIME_MISMATCH", error: "Old cursor", remediation: "Observe again", details: { runtimeId: "r8" } }), { status: 409, headers: { "X-MC-Agent-API": "3" } })));
     await expect(handlers.observeWatch({ session: "default", since: "r7:s2", types: [] })).rejects.toMatchObject({ code: "RUNTIME_MISMATCH", details: { runtimeId: "r8" } });
   });
 
@@ -129,24 +131,46 @@ describe("CLI actions", () => {
     expect(mocks.spawnSessionDaemon).not.toHaveBeenCalled();
   });
 
-  it("starts a new session by spawning the daemon", async () => {
+  it("starts a session, probes readiness, and returns the observed game username", async () => {
     const { handlers, mocks } = await loadActionsWithMocks();
+    const configured = { ...startInput(), username: "account@example.com", host: "private.example.net", pid: process.pid, controlPort: 45678, token: "private-control-token", startedAt: "2026-10-04T00:00:00Z" };
     mocks.readSession.mockResolvedValue(undefined);
-    mocks.spawnSessionDaemon.mockResolvedValue({ controlPort: 45678 });
+    mocks.spawnSessionDaemon.mockResolvedValue(configured);
+    mocks.loadSessionForClient.mockResolvedValue(configured);
+    mocks.daemonRequest.mockResolvedValue({ ready: true, connection: { state: "ready", ready: true }, username: "InGameBot" });
 
-    await expect(handlers.startSession(startInput())).resolves.toMatchObject({
-      session: "default",
-      controlPort: 45678,
-      username: "AgentBot",
+    await expect(handlers.startSession(startInput())).resolves.toEqual({
+      session: "default", alive: true, ready: true,
+      connection: { state: "ready", ready: true }, username: "InGameBot",
     });
-
     expect(mocks.spawnSessionDaemon).toHaveBeenCalledWith(startInput(), "entry.js");
+    expect(mocks.daemonRequest).toHaveBeenLastCalledWith(configured, "/status");
+  });
+
+  it.each(["compact", "full"] as const)("keeps configured account and secrets private in %s session status", async detail => {
+    const { handlers, mocks } = await loadActionsWithMocks();
+    const configured = { ...startInput(), username: "account@example.com", host: "private.example.net", pid: process.pid, controlPort: 45678, token: "private-control-token", startedAt: "2026-10-04T00:00:00Z", runtimeId: "private-runtime" };
+    mocks.loadSessionForClient.mockResolvedValue(configured);
+    mocks.daemonRequest.mockResolvedValue({ ready: false, connection: { state: "connecting", ready: false } });
+
+    const result = await handlers.sessionStatus({ session: "default", detail });
+    expect(result).toMatchObject({ session: "default", alive: true, ready: false, connection: { state: "connecting", ready: false } });
+    expect(result).not.toHaveProperty("username");
+    expect(result).not.toHaveProperty("status");
+    const json = JSON.stringify(result);
+    for (const secret of [configured.username, configured.token, configured.runtimeId]) expect(json).not.toContain(secret);
+    if (detail === "compact") {
+      expect(result).toEqual({ session: "default", alive: true, ready: false, connection: { state: "connecting", ready: false } });
+    } else {
+      expect(result).toMatchObject({ host: configured.host, port: 25565, auth: "offline", pid: process.pid, controlPort: 45678 });
+    }
+    expect(mocks.daemonRequest).toHaveBeenLastCalledWith(configured, detail === "full" ? "/status?detail=full" : "/status");
   });
 
   it("rejects already-running sessions and removes records only after their process exits", async () => {
     const { handlers, mocks } = await loadActionsWithMocks();
     mocks.readSession.mockResolvedValueOnce({ session: "default" });
-    mocks.daemonRequest.mockResolvedValueOnce({ apiVersion: 2, connected: true });
+    mocks.daemonRequest.mockResolvedValueOnce({ ready: true, connection: { state: "ready", ready: true } });
 
     await expect(handlers.startSession(startInput())).rejects.toMatchObject({ code: "SESSION_ALREADY_RUNNING" });
 
@@ -175,31 +199,24 @@ describe("CLI actions", () => {
     expect(mocks.spawnSessionDaemon).not.toHaveBeenCalled();
   });
 
-  it.each([undefined, 1, 3])("reports incompatible API %s without discarding or duplicating the live session", async (apiVersion) => {
+  it.each([null, "1", "2"])("preserves sessions when the client rejects API header %s", async actualApiVersion => {
     const { handlers, mocks } = await loadActionsWithMocks();
     const record = { session: "default", token: "secret", controlPort: 3000 };
     mocks.readSession.mockResolvedValue(record);
     mocks.loadSessionForClient.mockResolvedValue(record);
-    mocks.daemonRequest.mockResolvedValue({ apiVersion, connected: false, spawned: false });
-    mocks.toPublicSession.mockReturnValue({ session: "default", alive: true });
-    await expect(handlers.startSession(startInput())).rejects.toMatchObject({
-      code: "DAEMON_INCOMPATIBLE", details: { actualApiVersion: apiVersion ?? null },
-    });
+    // Compatibility is checked at the HTTP boundary, never by a JSON body field.
+    const { daemonIncompatible } = await import("../src/output/errors.js");
+    mocks.daemonRequest.mockRejectedValue(daemonIncompatible("default", { actualApiVersion }));
+    await expect(handlers.startSession(startInput())).rejects.toMatchObject({ code: "DAEMON_INCOMPATIBLE", details: { actualApiVersion } });
     expect(mocks.removeSession).not.toHaveBeenCalled();
     expect(mocks.spawnSessionDaemon).not.toHaveBeenCalled();
-    await expect(handlers.sessionStatus({ session: "default" })).resolves.toMatchObject({
-      alive: true, status: { connected: false },
-      compatibility: { compatible: false, expectedApiVersion: 2, actualApiVersion: apiVersion ?? null, remediation: expect.stringContaining("session stop") },
-    });
-    // Recovery must work against the legacy daemon as well.
-    await handlers.stopSession({ session: "default" });
-    expect(mocks.daemonRequest).toHaveBeenLastCalledWith(record, "/stop", { method: "POST", body: "{}", signal: expect.any(AbortSignal) });
+    await expect(handlers.sessionStatus({ session: "default" })).rejects.toMatchObject({ code: "DAEMON_INCOMPATIBLE" });
   });
 
   it("reports incompatible legacy watch routes", async () => {
     const { handlers, mocks } = await loadActionsWithMocks();
     mocks.loadSessionForClient.mockResolvedValue({ controlPort: 3000, token: "secret" });
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: "not found" }), { status: 404 })));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: "not found" }), { status: 404, headers: { "X-MC-Agent-API": "3" } })));
     await expect(handlers.observeWatch({ session: "default", since: 0, types: [], track: "r7:p1" })).rejects.toMatchObject({
       code: "DAEMON_INCOMPATIBLE", details: { path: "/sample" },
     });
@@ -451,7 +468,7 @@ describe("CLI actions", () => {
           controller.enqueue(new TextEncoder().encode('{"id":1}\n'));
           controller.close();
         },
-      }));
+      }), { headers: { "X-MC-Agent-API": "3" } });
     vi.stubGlobal(
       "fetch",
       vi.fn()
@@ -472,7 +489,7 @@ describe("CLI actions", () => {
       headers: { Authorization: "Bearer secret", "Content-Type": "application/json" },
     });
 
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 500 })));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 500, headers: { "X-MC-Agent-API": "3" } })));
     await expect(handlers.observeWatch({ session: "default", since: 0, types: [] })).rejects.toMatchObject({ code: "DAEMON_ERROR" });
   });
 
@@ -482,7 +499,7 @@ describe("CLI actions", () => {
     vi.useFakeTimers();
     let controller!: ReadableStreamDefaultController<Uint8Array>;
     const cancel = vi.fn();
-    const response = new Response(new ReadableStream<Uint8Array>({ start(value) { controller = value; }, cancel }));
+    const response = new Response(new ReadableStream<Uint8Array>({ start(value) { controller = value; }, cancel }), { headers: { "X-MC-Agent-API": "3" } });
     const fetchMock = vi.fn().mockResolvedValue(response);
     vi.stubGlobal("fetch", fetchMock);
     const failure = new Error("stdout closed");
@@ -511,12 +528,35 @@ describe("CLI actions", () => {
     expect(mocks.runDaemon).toHaveBeenCalledWith(expect.objectContaining({ token: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }));
   });
 
-  it("lists sessions using public session records", async () => {
+  it("probes listed sessions and distinguishes a live unresponsive process from readiness", async () => {
     const { handlers, mocks } = await loadActionsWithMocks();
-    mocks.listSessions.mockResolvedValue([{ session: "a" }]);
-    mocks.toPublicSession.mockReturnValue({ session: "a", alive: true });
+    const records = ["ready", "pending", "unresponsive"].map(session => ({ ...startInput(), session, pid: process.pid, controlPort: 3000, token: "private-token", username: "private-account@example.com", startedAt: "2026-10-04T00:00:00Z" }));
+    mocks.listSessions.mockResolvedValue(records);
+    mocks.daemonRequest.mockImplementation(async record => {
+      if (record.session === "unresponsive") throw new Error("ECONNREFUSED private.example.net private-account@example.com");
+      return record.session === "ready"
+        ? { ready: true, username: "InGameBot", connection: { state: "ready", ready: true } }
+        : { ready: false, connection: { state: "connecting", ready: false } };
+    });
 
-    await expect(handlers.listSessions()).resolves.toEqual({ sessions: [{ session: "a", alive: true }] });
+    await expect(handlers.listSessions()).resolves.toEqual({ sessions: [
+      { session: "ready", alive: true, ready: true, username: "InGameBot", connection: { state: "ready", ready: true } },
+      { session: "pending", alive: true, ready: false, connection: { state: "connecting", ready: false } },
+      { session: "unresponsive", alive: true, ready: false, connection: { state: "unresponsive", ready: false } },
+    ] });
+    expect(mocks.daemonRequest).toHaveBeenCalledTimes(3);
+    for (const record of records) expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/status", { signal: expect.any(AbortSignal) });
+  });
+
+  it("reports an incompatible listed daemon without exposing connection configuration", async () => {
+    const { handlers, mocks } = await loadActionsWithMocks();
+    mocks.listSessions.mockResolvedValue([{ ...startInput(), pid: process.pid, controlPort: 3000, token: "secret-token", username: "private-account@example.com", startedAt: "today" }]);
+    const { daemonIncompatible } = await import("../src/output/errors.js");
+    mocks.daemonRequest.mockRejectedValue(daemonIncompatible("default", { actualApiVersion: "2" }));
+    const result = await handlers.listSessions();
+    expect(result).toEqual({ sessions: [{ session: "default", alive: true, ready: false, connection: { state: "unresponsive", ready: false }, error: { code: "DAEMON_INCOMPATIBLE", message: expect.stringContaining("API v3") } }] });
+    expect(JSON.stringify(result)).not.toContain("private-account");
+    expect(JSON.stringify(result)).not.toContain("secret-token");
   });
 
   it("keeps CliError class import exercised", () => {

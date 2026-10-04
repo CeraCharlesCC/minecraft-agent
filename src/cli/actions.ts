@@ -31,16 +31,14 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
             "Wait for the original daemon to exit before starting this session again.", 1);
         }
         let daemonIsHealthy = false;
-        let apiVersion: unknown;
         try {
-          const status = await daemonRequest<{ apiVersion?: unknown }>(existing, "/status", { signal: AbortSignal.timeout(1500) });
-          apiVersion = status.apiVersion;
+          await daemonRequest(existing, "/status", { signal: AbortSignal.timeout(1500) });
           daemonIsHealthy = true;
-        } catch {
+        } catch (error) {
+          if (error instanceof CliError && error.code === "DAEMON_INCOMPATIBLE") throw error;
           // A failed probe does not prove a daemon exited; preserve unresolved live processes.
         }
         if (daemonIsHealthy) {
-          if (apiVersion !== 2) throw daemonIncompatible(input.session, { actualApiVersion: apiVersion ?? null });
           throw new CliError(
             "SESSION_ALREADY_RUNNING",
             `Session '${input.session}' is already running.`,
@@ -56,25 +54,16 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
         await removeSession(input.session);
       }
 
-      const { controlPort } = await spawnSessionDaemon(input, entryPoint);
-      return {
-        session: input.session,
-        host: input.host,
-        port: input.port,
-        username: input.username,
-        auth: input.auth,
-        controlPort,
-      };
+      await spawnSessionDaemon(input, entryPoint);
+      const record = await loadSessionForClient(input.session);
+      const status = await daemonRequest<Record<string, unknown>>(record, input.detail === "full" ? "/status?detail=full" : "/status");
+      return { ...toPublicSession(record, input.detail), ...status };
     },
 
     async sessionStatus(input) {
       const record = await loadSessionForClient(input.session);
-      const status = await daemonRequest<{ apiVersion?: unknown }>(record, "/status");
-      const compatible = status.apiVersion === 2;
-      return { ...toPublicSession(record), status, compatibility: {
-        compatible, expectedApiVersion: 2, actualApiVersion: status.apiVersion ?? null,
-        ...(!compatible ? { remediation: daemonIncompatible(input.session).remediation } : {}),
-      } };
+      const status = await daemonRequest<Record<string, unknown>>(record, input.detail === "full" ? "/status?detail=full" : "/status");
+      return { ...toPublicSession(record, input.detail), ...status };
     },
 
     async sessionDiagnose(input) {
@@ -89,22 +78,29 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
         signal: AbortSignal.timeout(input.timeout + 1500) });
     },
 
-    async listSessions() {
+    async listSessions(input) {
       const sessions = await listSessions();
-      return { sessions: sessions.map(toPublicSession) };
+      return { sessions: await Promise.all(sessions.map(async record => {
+        try {
+          const status = await daemonRequest<Record<string, unknown>>(record, input?.detail === "full" ? "/status?detail=full" : "/status", { signal: AbortSignal.timeout(1500) });
+          return { ...toPublicSession(record, input?.detail), ...status };
+        } catch (error) {
+          return { ...toPublicSession(record, input?.detail), ready: false, connection: { state: "unresponsive", ready: false },
+            ...(error instanceof CliError && error.code === "DAEMON_INCOMPATIBLE" ? { error: { code: error.code, message: error.message } } : {}) };
+        }
+      })) };
     },
 
     async stopSession(input) {
       const record = await loadSessionForClient(input.session);
-      const accepted = await daemonRequest<{ runtimeId?: string }>(record, "/stop", { method: "POST", body: JSON.stringify(context(input)), signal: AbortSignal.timeout(1500) });
-      const runtimeId = accepted?.runtimeId;
+      await daemonRequest(record, "/stop", { method: "POST", body: JSON.stringify(context(input)), signal: AbortSignal.timeout(1500) });
       const deadline = Date.now() + 5000;
       while (Date.now() < deadline) {
         // Keep the original process identity even if the session record disappears or is replaced.
-        if (!isProcessAlive(record.pid)) return { session: input.session, runtimeId, stopped: true, timedOut: false };
+        if (!isProcessAlive(record.pid)) return { session: input.session, stopped: true, timedOut: false };
         await new Promise(resolve => setTimeout(resolve, 100));
       }
-      return { session: input.session, runtimeId, stopping: true, stopped: false, timedOut: true };
+      return { session: input.session, stopping: true, stopped: false, timedOut: true };
     },
 
     async observeFrame(input) {

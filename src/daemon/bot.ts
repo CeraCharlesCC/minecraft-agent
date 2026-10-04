@@ -4,11 +4,11 @@ import { createBot } from "mineflayer";
 import pathfinderPackage from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import { EventStore, detachData } from "../core/events.js";
-import { WorldModel, FrameOptions } from "../core/world.js";
+import { WorldModel, FrameOptions, projectItem, projectEntity } from "../core/world.js";
 import { CanonicalChat } from "../core/chat.js";
 import { ActionManager, ActionResource } from "../core/actions.js";
 import { decodeActionContext } from "../core/context.js";
-import { CliError, commandBlocked } from "../output/errors.js";
+import { CliError, commandBlocked, contextRequired } from "../output/errors.js";
 
 const { goals, Movements, pathfinder } = pathfinderPackage;
 
@@ -144,6 +144,7 @@ type MineflayerBlock = {
 };
 type MineflayerEntity = { uuid?: string; velocity?: { x: number; y: number; z: number }; onGround?: boolean; id?: number; username?: string; name?: string; type?: string; position?: { x: number; y: number; z: number } };
 type MineflayerWindow = {
+  slots?: Array<MineflayerItem | null>;
   id?: number;
   type?: string;
   title?: unknown;
@@ -218,7 +219,7 @@ function serializePosition(position?: { x: number; y: number; z: number }) {
 }
 
 function serializeItem(item: MineflayerItem | null | undefined) {
-  return item ? { name: item.name, displayName: item.displayName, count: item.count, slot: item.slot } : undefined;
+  return item ? projectItem(item) : undefined;
 }
 
 function serializeBlock(block: MineflayerBlock | null | undefined) {
@@ -226,64 +227,67 @@ function serializeBlock(block: MineflayerBlock | null | undefined) {
     ? {
         name: block.name,
         displayName: block.displayName,
-        type: block.type,
-        stateId: block.stateId,
-        metadata: block.metadata,
-        properties: block.getProperties?.(),
+        properties: Object.fromEntries(Object.entries(block.getProperties?.() ?? {}).filter(([, value]) => ["string", "number", "boolean"].includes(typeof value))),
         position: serializePosition(block.position),
       }
     : undefined;
 }
 
-function serializeEntity(entity: MineflayerEntity | null | undefined, origin?: { x: number; y: number; z: number }) {
-  return entity
-    ? {
-        id: entity.id,
-        name: entity.name,
-        username: entity.username,
-        type: entity.type,
-        position: serializePosition(entity.position),
-        distance: distance(origin, entity.position),
-      }
-    : undefined;
+
+function chatText(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object") {
+    const component = value as { text?: unknown; toString?: () => string };
+    if (typeof component.text === "string") return component.text;
+    if (component.toString && component.toString !== Object.prototype.toString) return component.toString();
+  }
+  return undefined;
 }
 
-function safePlain(value: unknown, depth = 0): unknown {
-  if (value === null || value === undefined || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-    return value;
+function projectScoreboard(record: unknown) {
+  if (!record || typeof record !== "object") return undefined;
+  const value = record as Record<string, unknown>;
+  return { ...(typeof value.name === "string" ? { name: value.name } : {}),
+    ...(chatText(value.title) !== undefined ? { title: chatText(value.title) } : {}),
+    ...(Array.isArray(value.items) ? { items: value.items.flatMap((entry) => {
+      if (!entry || typeof entry !== "object") return [];
+      const item = entry as Record<string, unknown>;
+      return [{ ...(typeof item.name === "string" ? { name: item.name } : {}),
+        ...(typeof item.value === "number" && Number.isFinite(item.value) ? { value: item.value } : {}),
+        ...(chatText(item.displayName) !== undefined ? { displayName: chatText(item.displayName) } : {}) }];
+    }) } : {}),
+  };
+}
+
+function projectTeam(record: unknown) {
+  if (!record || typeof record !== "object") return undefined;
+  const value = record as Record<string, unknown>;
+  const result: Record<string, unknown> = {};
+  for (const field of ["name", "prefix", "suffix"]) {
+    const text = chatText(value[field]);
+    if (text !== undefined) result[field] = text;
   }
-  if (depth > 2) {
-    return String(value);
-  }
-  if (Array.isArray(value)) {
-    return value.slice(0, 50).map((item) => safePlain(item, depth + 1));
-  }
-  if (typeof value === "object") {
-    const output: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      if (typeof item !== "function") {
-        output[key] = safePlain(item, depth + 1);
-      }
-    }
-    return output;
-  }
-  return String(value);
+  for (const field of ["team", "color", "nameTagVisibility", "collisionRule"]) if (typeof value[field] === "string") result[field] = value[field];
+  if (typeof value.friendlyFire === "boolean" || typeof value.friendlyFire === "number") result.friendlyFire = value.friendlyFire;
+  if (Array.isArray(value.members)) result.members = value.members.filter((member) => typeof member === "string");
+  return result;
 }
 
 function serializeWindow(window: MineflayerWindow | null | undefined) {
   if (!window) {
     return undefined;
   }
-  const items = typeof window.containerItems === "function" ? window.containerItems() : typeof window.items === "function" ? window.items() : [];
+  const indexed = Array.isArray(window.slots);
+  const items = indexed ? window.slots : typeof window.containerItems === "function" ? window.containerItems() : typeof window.items === "function" ? window.items() : undefined;
   return {
-    id: window.id,
     type: window.type,
     title: typeof window.title?.toString === "function" ? window.title.toString() : window.title,
     inventoryStart: window.inventoryStart,
     inventoryEnd: window.inventoryEnd,
     hotbarStart: window.hotbarStart,
     hotbarEnd: window.hotbarEnd,
-    items: items.map(serializeItem),
+    ...(items ? { slots: items.flatMap((item, slot) => item ? [{ ...serializeItem(item), ...(indexed ? { slot } : {}) }] : []),
+      ...(indexed ? { slotCount: items.length } : {}) } : { unknownFields: ["/slots"] }),
   };
 }
 
@@ -329,6 +333,8 @@ export class BotController {
   private readonly botListeners: Array<{ bot: MineflayerBot; event: string; listener: (...args: any[]) => void }> = [];
   private readonly transitions: Array<{ state: string; at: string; generation: number; reason?: string }> = [];
   private recovery?: Promise<ReturnType<BotController["recoveryResult"]>>;
+  private incident?: { deadline: number; maxAttempts: number; consumed: number };
+  private readySince?: number;
   private retryState = { active: false, automatic: false, attempts: 0, maxAttempts: 0, nextRetryAt: undefined as string | undefined };
   private readonly controlState: Record<string, boolean> = {};
   readonly world: WorldModel;
@@ -355,6 +361,7 @@ export class BotController {
 
   start(): void {
     this.assertNotStopping();
+    this.leaveReady();
     if (this.bot) {
       this.connected = false;
       this.spawned = false;
@@ -392,6 +399,7 @@ export class BotController {
     on("login", () => {
       if (this.connectionEnded) return;
       this.lastError = undefined;
+      this.lastConnectionError = undefined;
       this.connected = true;
       this.spawned = false;
       this.authentication = "authenticated";
@@ -404,6 +412,7 @@ export class BotController {
       if (this.spawned) this.world.reset("RESPAWN");
       this.connected = true;
       this.spawned = true;
+      this.readySince ??= Date.now();
       this.lifecycleReset = false;
       this.transition("ready");
       this.events.add({ type: "connection.ready", text: "Bot spawned." });
@@ -411,6 +420,7 @@ export class BotController {
       this.world.observeHealth(bot, this.observationContext());
     });
     const disconnected = (reason: string, terminal = false) => {
+      this.leaveReady();
       const wasEnded = this.connectionEnded;
       this.connectionEnded = true;
       if (terminal) this.lastDisconnectReason = reason;
@@ -437,6 +447,7 @@ export class BotController {
       disconnected(this.lastConnectionError!.code, terminalAuthCodes.has(this.lastConnectionError!.code));
     });
     on("death", () => {
+      this.leaveReady();
       this.spawned = false;
       this.world.reset("DEATH");
       this.lifecycleReset = true;
@@ -444,6 +455,7 @@ export class BotController {
       this.events.add({ type: "self.died" });
     });
     on("respawn", () => {
+      this.leaveReady();
       if (!this.lifecycleReset) this.world.reset("RESPAWN");
       this.spawned = false;
       this.lifecycleReset = true;
@@ -586,42 +598,23 @@ export class BotController {
     }
   }
 
-  status() {
+  status(options: { detail?: "compact" | "full" } = {}) {
     this.flushChat();
+    const connection = this.connectionStatus();
     return {
-      apiVersion: 2,
-      runtimeId: this.world.runtimeId,
-      worldEpoch: this.world.worldEpoch,
-      eventCursor: this.events.getCursor(),
-      connected: this.connected,
-      spawned: this.spawned,
-      connection: this.connectionStatus(),
-      username: this.bot?.username ?? this.options.username,
-      host: this.options.host,
-      port: this.options.port,
-      auth: this.options.auth,
-      version: this.options.version,
-      health: this.bot?.health,
-      food: this.bot?.food,
-      foodSaturation: this.bot?.foodSaturation,
-      oxygenLevel: this.bot?.oxygenLevel,
-      experience: safePlain(this.bot?.experience),
-      time: safePlain(this.bot?.time),
-      isRaining: this.bot?.isRaining,
-      thunderState: this.bot?.thunderState,
-      quickBarSlot: this.bot?.quickBarSlot,
-      isSleeping: this.bot?.isSleeping,
-      usingHeldItem: this.bot?.usingHeldItem,
-      heldItem: this.bot?.heldItem ? { name: this.bot.heldItem.name, displayName: this.bot.heldItem.displayName } : undefined,
-      controlState: safePlain(this.bot?.controlState),
-      lastError: this.lastError,
-      lastEventId: this.events.getLastEventId(),
+      ready: connection.ready,
+      connection,
+      ...(this.connected && typeof this.bot?.username === "string" && /^[A-Za-z0-9_]{1,16}$/.test(this.bot.username) ? { username: this.bot.username } : {}),
+      ...(options.detail === "full" ? {
+        host: this.options.host, port: this.options.port, auth: this.options.auth,
+        ...(this.options.version ? { version: this.options.version } : {}),
+      } : {}),
     };
   }
 
   frame(options: FrameOptions = {}) {
     this.flushChat();
-    return this.world.frame(this.requireBot(), this.observationContext(), options);
+    return this.world.frame(this.bot, this.observationContext(), options);
   }
 
   flushChat() { this.chatReceiver?.flush(); }
@@ -633,13 +626,15 @@ export class BotController {
     if (fields.includes("position")) values.position = serializePosition(entity.position);
     if (fields.includes("velocity")) values.velocity = serializePosition(entity.velocity);
     if (fields.includes("status")) values.status = "loaded";
-    return { type: "track.sample", runtimeId: this.world.runtimeId, worldEpoch: this.world.worldEpoch,
-      trackId: track, observedAt: new Date().toISOString(), values };
+    return { type: "track.sample", trackId: track, values };
   }
 
   validateContext(input: { runtimeId?: unknown; worldEpoch?: unknown; context?: unknown }, requireReady = true) {
     if (!input || typeof input !== "object" || Array.isArray(input)) {
       throw new CliError("BAD_INPUT", "Action body must be an object.", "Send runtimeId and worldEpoch from a frame.", 3);
+    }
+    if (input.context === undefined && input.runtimeId === undefined && input.worldEpoch === undefined) {
+      throw contextRequired();
     }
     let runtimeId = input.runtimeId, worldEpoch = input.worldEpoch;
     if (input.context !== undefined) {
@@ -658,15 +653,15 @@ export class BotController {
     const connection = this.connectionStatus();
     if (runtimeId !== this.world.runtimeId) {
       throw new CliError("RUNTIME_MISMATCH", "Action belongs to another runtime.", "Observe a fresh frame.", 1,
-        { runtimeId: this.world.runtimeId, expectedRuntimeId: runtimeId, connection });
+        { reason: "RUNTIME_MISMATCH" });
     }
     if (worldEpoch !== this.world.worldEpoch) {
-      throw new CliError("WORLD_CHANGED", "World context has changed.", connection.state === "ready" ? "Observe a fresh frame." : connection.remediation ?? "Inspect session diagnose, then observe a fresh frame.", 1,
-        { worldEpoch: this.world.worldEpoch, expectedWorldEpoch: worldEpoch, connection });
+      throw new CliError("WORLD_CHANGED", "World context has changed.", "Observe a fresh frame.", 1,
+        { reason: "WORLD_CHANGED", connection });
     }
     this.assertNotStopping();
     if (requireReady && (!this.connected || !this.spawned)) {
-      throw new CliError("NOT_READY", "Bot has no ready world context.", connection.remediation!, 1, connection);
+      throw new CliError("NOT_READY", "Bot has no ready world context.", "Observe a fresh frame after the connection is ready.", 1, connection);
     }
   }
 
@@ -704,9 +699,14 @@ export class BotController {
   }
 
   private observationContext() {
+    const controls = () => {
+      const observed = this.bot?.controlState;
+      return observed && typeof observed === "object" && !Array.isArray(observed)
+        ? { ...observed, ...this.controlState } : undefined;
+    };
     return { connected: this.connected, spawned: this.spawned,
-      controls: { ...this.bot?.controlState, ...this.controlState }, getActions: () => this.actions.observation(),
-      getControls: () => ({ ...this.bot?.controlState, ...this.controlState }),
+      controls: controls(), getActions: () => this.actions.observation(),
+      getControls: controls,
       getReadiness: () => ({ connected: this.connected, spawned: this.spawned }),
       getConnectionStatus: () => this.connectionStatus() };
   }
@@ -714,23 +714,61 @@ export class BotController {
   connectionStatus() {
     const state = this.stopping ? "stopping" : this.connectionEnded ? "disconnected" : this.connected
       ? this.spawned ? "ready" : "waiting_for_spawn" : this.lastError ? "error" : "connecting";
-    const remediation = this.stopping ? "Wait for daemon shutdown completion."
-      : state === "ready" ? undefined
-      : this.terminalFailure ? "Resolve the server kick or authentication rejection, then restart the session explicitly with 'mc-agent session stop' and 'mc-agent session start'."
-      : "Inspect 'mc-agent session diagnose', then run 'mc-agent session ensure-ready' with a bounded timeout. Automatic reconnect is disabled unless explicitly enabled; device login is required only when authentication reports intervention_required.";
-    return { state, connected: this.connected, spawned: this.spawned, ready: this.connected && this.spawned && !this.stopping,
-      stopping: this.stopping, terminalFailure: this.terminalFailure, reason: this.lastDisconnectReason, lastError: this.lastConnectionError,
-      authentication: { state: this.authentication }, remediation };
+    const ready = this.connected && this.spawned && !this.stopping;
+    const code = this.authentication === "intervention_required" ? "AUTHENTICATION_REQUIRED"
+      : this.authentication === "rejected" ? "AUTHENTICATION_REJECTED"
+      : this.terminalFailure ? "SERVER_REJECTED" : this.publicConnectionCode()
+      ?? (this.connectionEnded ? "DISCONNECTED" : undefined);
+    const message = code === "AUTHENTICATION_REQUIRED" ? "Authentication requires operator intervention."
+      : code === "AUTHENTICATION_REJECTED" ? "Authentication was rejected."
+      : code === "SERVER_REJECTED" ? "The server rejected the connection."
+      : code ? "The game connection is unavailable." : undefined;
+    const exhausted = this.incident && (this.incident.consumed >= this.incident.maxAttempts || Date.now() >= this.incident.deadline);
+    const recoveryState = this.terminalFailure || this.authentication === "intervention_required" ? "intervention_required"
+      : this.retryState.active ? "recovering" : exhausted ? "exhausted"
+      : this.options.autoReconnect ? "intervention_required" : "disabled";
+    return { state, ready,
+      ...(!ready && code ? { cause: { code, message: message! } } : {}),
+      ...(!ready && !this.stopping ? { recovery: { state: recoveryState,
+        ...(this.incident ? { attempts: this.retryState.attempts, maxAttempts: this.incident.maxAttempts } : {}) } } : {}),
+    };
+  }
+
+  private connectionDetails() {
+    return { ...this.connectionStatus(), connected: this.connected, spawned: this.spawned,
+      stopping: this.stopping, terminalFailure: this.terminalFailure,
+      authentication: { state: this.authentication },
+      ...(this.lastDisconnectReason ? { reason: this.safeDisconnectReason() } : {}),
+      ...(this.lastConnectionError ? { lastError: { ...this.lastConnectionError, code: this.publicConnectionCode(), message: "The game connection is unavailable." } } : {}),
+    };
+  }
+
+  private publicConnectionCode() {
+    const code = this.lastConnectionError?.code;
+    return code === undefined ? undefined : transientTransportCodes.has(code) || terminalAuthCodes.has(code) ? code : "CONNECTION_ERROR";
+  }
+
+  private safeDisconnectReason() {
+    return this.terminalFailure ? "SERVER_REJECTED" : this.stopping ? "STOPPED" : this.publicConnectionCode() ?? "DISCONNECTED";
   }
 
   diagnose() {
-    return { apiVersion: 2, daemonResponsive: true, runtimeId: this.world.runtimeId, worldEpoch: this.world.worldEpoch,
-      ready: this.connectionStatus().ready, connection: this.connectionStatus(),
-      lastError: this.lastConnectionError, transitions: this.transitions.map((transition) => ({ ...transition })),
+    return { apiVersion: 3, daemonResponsive: true,
+      ready: this.connectionStatus().ready, connection: this.connectionDetails(),
+      ...(this.lastConnectionError ? { lastError: { ...this.lastConnectionError, code: this.publicConnectionCode(), message: "The game connection is unavailable." } } : {}),
+      transitions: this.transitions.map(({ state, at, generation, reason }) => ({ state, at, generation, ...(reason ? { reason: this.safeDisconnectReason() } : {}) })),
       retry: { ...this.retryState, enabled: this.options.autoReconnect === true },
       recommendedOperation: this.stopping ? "wait-for-stop" : this.connectionStatus().ready ? "observe-frame"
         : this.authentication === "intervention_required" ? "complete-authentication"
         : this.terminalFailure ? "resolve-terminal-failure" : "ensure-ready" };
+  }
+
+  private leaveReady() {
+    if (this.readySince !== undefined && Date.now() - this.readySince >= 30_000) {
+      this.incident = undefined;
+      this.retryState.attempts = 0;
+    }
+    this.readySince = undefined;
   }
 
   assertNotStopping() {
@@ -751,33 +789,50 @@ export class BotController {
         !Number.isSafeInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10 ||
         !Number.isSafeInteger(backoff) || backoff < 0 || backoff > 30_000)
       throw new CliError("BAD_INPUT", "Recovery timeout must be 1-120000ms, maxAttempts 1-10, and backoff 0-30000ms.", "Choose bounded recovery options.", 3);
-    if (this.connectionStatus().ready) return Promise.resolve(this.recoveryResult());
+    if (this.connectionStatus().ready) {
+      if (!this.recovery) { this.incident = undefined; this.retryState.attempts = 0; }
+      return Promise.resolve(this.recoveryResult());
+    }
+    // This explicit operator operation may rearm an exhausted incident.
+    return this.beginRecovery(timeout, maxAttempts, backoff, false);
+  }
+
+  private beginRecovery(timeout: number, maxAttempts: number, backoff: number, automatic: boolean) {
     if (!this.recovery) {
-      this.retryState = { active: true, automatic: false, attempts: 0, maxAttempts, nextRetryAt: undefined };
-      const flight = this.recover(timeout, maxAttempts, backoff);
+      if (!automatic || !this.incident) {
+        this.incident = { deadline: Date.now() + timeout, maxAttempts, consumed: 0 };
+        this.retryState.attempts = 0;
+      }
+      const incident = this.incident!;
+      if (this.stopping || this.terminalFailure || incident.consumed >= incident.maxAttempts || Date.now() >= incident.deadline) {
+        return Promise.resolve(this.recoveryResult(Date.now() >= incident.deadline, this.retryState.attempts, incident.consumed >= incident.maxAttempts));
+      }
+      this.retryState = { ...this.retryState, active: true, automatic, maxAttempts: incident.maxAttempts, nextRetryAt: undefined };
+      const flight = this.recover(backoff, incident);
       this.recovery = flight;
       void flight.finally(() => {
         if (this.recovery === flight) this.recovery = undefined;
         this.retryState.active = false;
         this.retryState.nextRetryAt = undefined;
+        // A disconnect may race with a just-settled successful flight.
+        if (!this.connectionStatus().ready) this.maybeAutoReconnect();
       }).catch(() => {});
     }
     return this.withRecoveryDeadline(this.recovery, timeout);
   }
 
-  private async recover(timeout: number, maxAttempts: number, backoff: number) {
-    const deadline = Date.now() + timeout;
-    let consumedAttempts = 0;
-    for (let attempt = 0; attempt < maxAttempts && Date.now() < deadline; attempt++) {
+  private async recover(backoff: number, incident: { deadline: number; maxAttempts: number; consumed: number }) {
+    const deadline = incident.deadline;
+    while (incident.consumed < incident.maxAttempts && Date.now() < deadline) {
       if (this.connectionStatus().ready || this.stopping || this.terminalFailure ||
           (this.retryState.automatic && this.connectionEnded && this.lastConnectionError && !transientTransportCodes.has(this.lastConnectionError.code))) break;
-      consumedAttempts = attempt + 1;
       if (this.authentication === "intervention_required" && this.bot && !this.connectionEnded) {
-        // Preserve the current login attempt while the user completes its challenge.
+        // Preserve the current login attempt while the operator completes its challenge.
         while (!this.stopping && !this.connectionEnded && !this.connectionStatus().ready && Date.now() < deadline)
           await this.waitForLifecycle(deadline - Date.now());
         break;
       }
+      const attempt = incident.consumed++;
       if (!this.bot || this.connectionEnded || attempt > 0) {
         if (attempt > 0 || this.connectionEnded) {
           const delay = Math.min(backoff * 2 ** Math.max(0, attempt - 1), 30_000, Math.max(0, deadline - Date.now()));
@@ -785,8 +840,6 @@ export class BotController {
           await this.waitForLifecycle(delay, true);
           this.retryState.nextRetryAt = undefined;
           if (this.connectionStatus().ready) break;
-          // A kick/auth rejection may arrive while the transport retry sleeps.
-          // Recheck evidence before start() clears the prior attempt state.
           if (this.stopping || Date.now() >= deadline || this.terminalFailure ||
               this.authentication === "intervention_required" ||
               (this.retryState.automatic && this.lastConnectionError && !transientTransportCodes.has(this.lastConnectionError.code))) break;
@@ -801,8 +854,9 @@ export class BotController {
         }
         this.retryState.attempts++;
       }
-      // An existing in-flight startup occupies one attempt budget too.
-      const sliceDeadline = Math.min(deadline, Date.now() + Math.max(1, Math.floor((deadline - Date.now()) / (maxAttempts - attempt))));
+      // A pending initial startup also consumes a bounded wait slice.
+      const remaining = incident.maxAttempts - incident.consumed + 1;
+      const sliceDeadline = Math.min(deadline, Date.now() + Math.max(1, Math.floor((deadline - Date.now()) / remaining)));
       while (!this.stopping && !this.connectionEnded && !this.connectionStatus().ready && Date.now() < sliceDeadline) {
         await this.waitForLifecycle(sliceDeadline - Date.now());
       }
@@ -812,7 +866,7 @@ export class BotController {
     this.retryState.nextRetryAt = undefined;
     const failed = !this.connectionStatus().ready && !this.stopping && !this.terminalFailure;
     return this.recoveryResult(failed && Date.now() >= deadline, this.retryState.attempts,
-      failed && Date.now() < deadline && consumedAttempts >= maxAttempts && this.authentication !== "intervention_required");
+      failed && incident.consumed >= incident.maxAttempts && this.authentication !== "intervention_required");
   }
 
   private waitForLifecycle(timeout: number, delayOnly = false) {
@@ -833,17 +887,17 @@ export class BotController {
   }
 
   private maybeAutoReconnect() {
-    if (this.stopping || this.options.autoReconnect !== true || this.recovery || this.terminalFailure ||
-        !this.lastConnectionError || this.lastConnectionError.generation !== this.generation ||
-        !transientTransportCodes.has(this.lastConnectionError.code)) return;
+    const eligible = () => !this.stopping && this.options.autoReconnect === true && !this.recovery && !this.terminalFailure &&
+      this.authentication !== "intervention_required" && !this.connectionStatus().ready &&
+      this.lastConnectionError?.generation === this.generation && transientTransportCodes.has(this.lastConnectionError.code) &&
+      (!this.incident || (this.incident.consumed < this.incident.maxAttempts && Date.now() < this.incident.deadline));
+    if (!eligible()) return;
     // Defer until the error/kick/end burst is fully classified.
     queueMicrotask(() => {
-      if (this.stopping || this.terminalFailure || this.recovery) return;
+      if (!eligible()) return;
       try {
-        const recovery = this.ensureReady({ timeout: 30_000,
-          maxAttempts: this.options.reconnectMaxAttempts ?? 3, backoff: this.options.reconnectBackoff ?? 250 });
-        this.retryState.automatic = true;
-        void recovery.catch(() => {});
+        void this.beginRecovery(30_000, this.options.reconnectMaxAttempts ?? 3,
+          this.options.reconnectBackoff ?? 250, true).catch(() => {});
       } catch (error) {
         this.recordConnectionError(error);
         this.transition("error");
@@ -866,7 +920,7 @@ export class BotController {
   }
 
   private invalidateWorld(reason: string) {
-    if (reason === "dimension_changed") this.spawned = false;
+    if (reason === "dimension_changed") { this.leaveReady(); this.spawned = false; }
     this.actions.failAll(reason);
     this.stopResources(["movement", "look", "item", "window"]);
     if (this.bot) {
@@ -967,53 +1021,41 @@ export class BotController {
   }
 
   position() {
-    const position = this.requireBot().entity?.position;
-    return {
-      position: position ? { x: position.x, y: position.y, z: position.z } : undefined,
-      dimension: this.bot?.game?.dimension,
-    };
+    if (!this.connectionStatus().ready) return { known: false };
+    const bot = this.requireBot();
+    const position = serializePosition(bot.entity?.position);
+    return { known: position !== undefined, ...(position ? { position } : {}),
+      ...(bot.game?.dimension !== undefined ? { dimension: bot.game.dimension } : {}) };
   }
 
   inventory() {
+    if (!this.connectionStatus().ready) return { known: false };
     const bot = this.requireBot();
+    if (!bot.inventory) return { known: false };
     return {
-      items: bot
-        .inventory?.items()
-        .map((item) => ({ name: item.name, displayName: item.displayName, count: item.count, slot: item.slot })) ?? [],
-      heldItem: bot.heldItem ? { name: bot.heldItem.name, displayName: bot.heldItem.displayName } : undefined,
-      quickBarSlot: bot.quickBarSlot,
+      known: true,
+      items: bot.inventory.items().map(serializeItem),
+      ...(bot.heldItem ? { heldItem: projectItem(bot.heldItem) } : {}),
+      ...(bot.quickBarSlot !== undefined ? { quickBarSlot: bot.quickBarSlot } : {}),
+      ...(!("heldItem" in bot) ? { unknownFields: ["/heldItem"] } : {}),
     };
   }
 
   players() {
+    if (!this.connectionStatus().ready) return { known: false };
     const bot = this.requireBot();
+    if (!bot.players) return { known: false };
     const origin = bot.entity?.position;
-    return {
-      players: Object.entries(bot.players ?? {}).map(([username, player]) => ({
+    return { known: true,
+      players: Object.entries(bot.players).map(([username, player]) => ({
         username: player.username ?? username,
-        entityId: player.entity?.id,
-        position: serializePosition(player.entity?.position),
-        distance: distance(origin, player.entity?.position),
+        ...(player.entity?.position ? { position: serializePosition(player.entity.position), distance: distance(origin, player.entity.position) } : {}),
       })),
     };
   }
 
   entities(radius = 32, limit = 50) {
-    const bot = this.requireBot();
-    const origin = bot.entity?.position;
-    const entities = Object.values(bot.entities ?? {})
-      .map((entity) => ({
-        id: entity.id,
-        name: entity.name,
-        username: entity.username,
-        type: entity.type,
-        position: serializePosition(entity.position),
-        distance: distance(origin, entity.position),
-      }))
-      .filter((entity) => entity.distance === undefined || entity.distance <= radius)
-      .sort((a, b) => (a.distance ?? Number.POSITIVE_INFINITY) - (b.distance ?? Number.POSITIVE_INFINITY))
-      .slice(0, limit);
-    return { entities };
+    return this.findEntities({ radius, limit });
   }
 
   findEntities(input: {
@@ -1025,48 +1067,66 @@ export class BotController {
     includePlayers?: boolean;
     includePassive?: boolean;
   }) {
-    const bot = this.requireBot();
     this.flushChat();
-    return this.world.searchLoaded(bot, this.observationContext(), input);
+    return this.world.searchLoaded(this.bot, this.observationContext(), input);
   }
 
   tablist() {
-    return { tablist: safePlain(this.requireBot().tablist) };
+    if (!this.connectionStatus().ready) return { known: false };
+    const tablist = this.requireBot().tablist as { header?: unknown; footer?: unknown } | undefined;
+    return { tablist: tablist ? { header: chatText(tablist.header), footer: chatText(tablist.footer) } : undefined };
   }
 
   scoreboards() {
+    if (!this.connectionStatus().ready) return { known: false };
     const bot = this.requireBot();
-    return { scoreboards: safePlain(bot.scoreboards), scoreboard: safePlain(bot.scoreboard) };
+    const positions = bot.scoreboard ?? {};
+    return { scoreboards: bot.scoreboards ? Object.fromEntries(Object.entries(bot.scoreboards).map(([name, record]) => [name, projectScoreboard(record)])) : undefined,
+      scoreboard: Object.fromEntries(["list", "sidebar", "belowName"].flatMap((position, index) => {
+        const board = projectScoreboard(positions[position] ?? positions[index]);
+        return board ? [[position, board]] : [];
+      })) };
   }
 
   teams() {
+    if (!this.connectionStatus().ready) return { known: false };
     const bot = this.requireBot();
-    return { teams: safePlain(bot.teams), teamMap: safePlain(bot.teamMap) };
+    return { teams: bot.teams ? Object.fromEntries(Object.entries(bot.teams).map(([name, record]) => [name, projectTeam(record)])) : undefined,
+      teamMap: Object.fromEntries(Object.entries(bot.teamMap ?? {}).flatMap(([member, record]) => {
+        const value = record && typeof record === "object" ? record as Record<string, unknown> : undefined;
+        const name = typeof record === "string" ? record : typeof value?.team === "string" ? value.team
+          : Object.entries(bot.teams ?? {}).find(([, team]) => team === record)?.[0];
+        return name === undefined ? [] : [[member, name]];
+      })) };
   }
 
   controls() {
-    const botState = safePlain(this.requireBot().controlState);
-    const controlState =
-      botState && typeof botState === "object" && !Array.isArray(botState) ? { ...(botState as Record<string, unknown>) } : {};
-    return { controlState: { ...controlState, ...this.controlState } };
+    if (!this.connectionStatus().ready) return { known: false };
+    const bot = this.requireBot();
+    if (!bot.controlState) return { known: false };
+    return { known: true, controls: Object.entries({ ...bot.controlState, ...this.controlState }).filter(([, value]) => value === true).map(([name]) => name) };
   }
 
   blockAt(x: number, y: number, z: number) {
+    if (!this.connectionStatus().ready) return { known: false };
     const block = this.requireMethod("blockAt").call(this.requireBot(), new Vec3(x, y, z)) as MineflayerBlock | null;
-    return { block: serializeBlock(block) };
+    return { known: block !== null, block: serializeBlock(block) };
   }
 
   blockInSight(maxSteps: number, vectorLength: number) {
+    if (!this.connectionStatus().ready) return { known: false };
     const block = this.requireMethod("blockInSight").call(this.requireBot(), maxSteps, vectorLength) as MineflayerBlock | null;
-    return { block: serializeBlock(block) };
+    return { known: block !== null, block: serializeBlock(block) };
   }
 
   blockAtCursor(maxDistance: number) {
+    if (!this.connectionStatus().ready) return { known: false };
     const block = this.requireMethod("blockAtCursor").call(this.requireBot(), maxDistance) as MineflayerBlock | null;
-    return { block: serializeBlock(block) };
+    return { known: block !== null, block: serializeBlock(block) };
   }
 
   findBlocks(name: string, radius: number, count: number) {
+    if (!this.connectionStatus().ready) return { known: false };
     const bot = this.requireBot();
     const blockType = this.blockType(name);
     const positions = this.requireMethod("findBlocks").call(bot, { matching: blockType, maxDistance: radius, count }) as Vec3[];
@@ -1076,6 +1136,7 @@ export class BotController {
   }
 
   blockInfo(x: number, y: number, z: number) {
+    if (!this.connectionStatus().ready) return { known: false };
     const bot = this.requireBot();
     const block = this.getRequiredBlock(x, y, z);
     return {
@@ -1124,11 +1185,11 @@ export class BotController {
     return { looked: true, yaw, pitch, force };
   }
 
-  async goto(x: number, y: number, z: number, range: number): Promise<void> {
-    await this.navigateNear(x, y, z, range);
+  async goto(x: number, y: number, z: number, range: number) {
+    return this.navigateNear(x, y, z, range);
   }
 
-  private async navigateNear(x: number, y: number, z: number, range: number): Promise<void> {
+  private async navigateNear(x: number, y: number, z: number, range: number) {
     const expected = { runtimeId: this.world.runtimeId, worldEpoch: this.world.worldEpoch };
     this.validateContext(expected);
     const bot = this.requireBot();
@@ -1155,7 +1216,12 @@ export class BotController {
       position: serializePosition(bot.entity?.position),
       policy: { canDig: this.navigationMovementConfig.canDig === true, canPlace: this.navigationMovementConfig.canPlace === true },
       searchRadius: pathfinder.searchRadius, thinkTimeout: pathfinder.thinkTimeout });
-    if (atGoal()) return;
+    const result = (completionReason: "within_range" | "already_within_range") => ({
+      completionReason, goal: { x, y, z, range },
+      finalPosition: serializePosition(bot.entity?.position)!,
+      distanceToGoal: distance(bot.entity?.position, { x, y, z })!,
+    });
+    if (atGoal()) { verify(); this.validateContext(expected); return result("already_within_range"); }
     bot.on("path_update", onUpdate);
     try {
       try { await pathfinder.goto(goal); }
@@ -1177,6 +1243,7 @@ export class BotController {
         throw new CliError("NAVIGATION_FAILED", "Pathfinder stopped without reaching the goal.",
           "Observe the current position and nearby terrain; no digging or placement permission is granted automatically.", 1, details(reason));
       }
+      return result("within_range");
     } finally { bot.off("path_update", onUpdate); }
   }
 
@@ -1184,7 +1251,7 @@ export class BotController {
     const bot = this.requireBot();
     const target = bot.players?.[player]?.entity;
     if (!target) {
-      throw new Error(`Player '${player}' is not visible.`);
+      throw new CliError("COMMAND_BLOCKED", `Player '${player}' is not visible.`, "Observe the current game state and choose a valid operation.");
     }
     this.configurePathfinderMovements();
     this.requirePathfinder().setGoal(new goals.GoalFollow(target as never, range), true);
@@ -1251,17 +1318,17 @@ export class BotController {
     const entity = this.getRequiredEntity(id);
     const position = entity.position;
     if (!position) {
-      throw new Error(`Entity '${id}' has no position.`);
+      throw new CliError("COMMAND_BLOCKED", `Entity '${id}' has no position.`, "Observe the current game state and choose a valid operation.");
     }
     await this.navigateNear(position.x, position.y, position.z, range);
-    return { collectedTarget: serializeEntity(entity, this.requireBot().entity?.position), inventory: this.inventory() };
+    return { collectedTarget: this.publicEntity(entity), inventory: this.inventory() };
   }
 
   async equip(itemName: string, destination: string): Promise<{ equipped: string; destination: string; heldItem?: { name: string; displayName?: string } }> {
     const bot = this.requireBot();
     const item = bot.inventory?.items().find((candidate) => candidate.name === itemName || candidate.displayName === itemName);
     if (!item) {
-      throw new Error(`Item '${itemName}' is not in inventory.`);
+      throw new CliError("COMMAND_BLOCKED", `Item '${itemName}' is not in inventory.`, "Observe the current game state and choose a valid operation.");
     }
     await this.requireMethod("equip").call(bot, item, destination);
     return { equipped: item.name, destination, heldItem: bot.heldItem ? { name: bot.heldItem.name, displayName: bot.heldItem.displayName } : undefined };
@@ -1286,7 +1353,7 @@ export class BotController {
   async consume(): Promise<{ consumed: true }> {
     const bot = this.requireBot();
     if (!bot.heldItem) {
-      throw new Error("No held item is equipped to consume.");
+      throw new CliError("COMMAND_BLOCKED", "No held item is equipped to consume.", "Observe the current game state and choose a valid operation.");
     }
     await this.requireMethod("consume").call(bot);
     return { consumed: true };
@@ -1295,7 +1362,7 @@ export class BotController {
   async fish(): Promise<{ fished: true }> {
     const bot = this.requireBot();
     if (bot.heldItem?.name !== "fishing_rod") {
-      throw new Error("A fishing_rod must be equipped before fishing.");
+      throw new CliError("COMMAND_BLOCKED", "A fishing_rod must be equipped before fishing.", "Observe the current game state and choose a valid operation.");
     }
     await this.requireMethod("fish").call(bot);
     return { fished: true };
@@ -1315,7 +1382,24 @@ export class BotController {
     const itemType = this.itemType(itemName);
     const craftingTable = table ? this.getRequiredBlock(table.x, table.y, table.z) : null;
     const recipes = this.requireMethod("recipesFor").call(this.requireBot(), itemType, null, count, craftingTable) as unknown[];
-    return { item: itemName, recipes };
+    return { item: itemName, recipes: recipes.map((recipe, index) => {
+      const value = recipe && typeof recipe === "object" ? recipe as Record<string, unknown> : {};
+      const ingredient = (entry: unknown): unknown => {
+        if (Array.isArray(entry)) return entry.map(ingredient);
+        if (!entry || typeof entry !== "object") return entry === null ? null : undefined;
+        const item = entry as Record<string, unknown>;
+        return { ...(typeof item.id === "number" ? { type: item.id } : {}),
+          ...(typeof item.metadata === "number" ? { metadata: item.metadata } : {}),
+          ...(typeof item.count === "number" ? { count: item.count } : {}),
+          ...(typeof item.name === "string" ? { name: item.name } : {}) };
+      };
+      return { index, ...(this.recipeId(recipe) ? { id: this.recipeId(recipe) } : {}),
+        result: ingredient(value.result),
+        ...(Array.isArray(value.ingredients) ? { ingredients: value.ingredients.map(ingredient) } : {}),
+        ...(Array.isArray(value.inShape) ? { inShape: value.inShape.map(ingredient) } : {}),
+        ...(typeof value.requiresTable === "boolean" ? { requiresTable: value.requiresTable } : {}),
+      };
+    }) };
   }
 
   async craft(
@@ -1339,7 +1423,7 @@ export class BotController {
     const selected = this.selectRecipe(recipes, recipeIndex, recipeId);
     const recipe = recipes[selected.index];
     if (!recipe) {
-      throw new Error(`No recipe found for '${itemName}'.`);
+      throw new CliError("COMMAND_BLOCKED", `No recipe found for '${itemName}'.`, "Observe the current game state and choose a valid operation.");
     }
     const resultCount = this.recipeResultCount(recipe);
     const craftCount = Math.ceil(count / resultCount);
@@ -1386,7 +1470,7 @@ export class BotController {
     verify();
     const block = this.getRequiredBlock(x, y, z);
     const entity = await this.requireMethod("placeEntity").call(this.requireBot(), block, faceVector(face));
-    return { placed: true, entity: serializeEntity(entity), referenceBlock: serializeBlock(block), face };
+    return { placed: true, entity: this.publicEntity(entity), referenceBlock: serializeBlock(block), face };
   }
 
   async activate(x: number, y: number, z: number): Promise<{ activated: true; block: ReturnType<typeof serializeBlock> }> {
@@ -1431,17 +1515,18 @@ export class BotController {
     const window = await this.openContainerObserved(entity);
     try { verify(); if (typeof id === "string") this.getRequiredEntity(id); }
     catch (error) { window.close?.(); throw error; }
-    return { opened: true, entity: serializeEntity(entity, this.requireBot().entity?.position), window: serializeWindow(window) };
+    return { opened: true, entity: this.publicEntity(entity), window: serializeWindow(window) };
   }
 
   windowStatus() {
-    return { window: serializeWindow(this.requireBot().currentWindow) };
+    if (!this.connectionStatus().ready || !("currentWindow" in this.requireBot())) return { known: false };
+    return { known: true, ...(this.bot?.currentWindow ? { window: serializeWindow(this.bot.currentWindow) } : {}) };
   }
 
   async windowDeposit(itemName: string, count: number) {
     const window = this.requireWindow();
     if (!window.deposit) {
-      throw new Error("Current window does not support deposit.");
+      throw new CliError("COMMAND_BLOCKED", "Current window does not support deposit.", "Observe the current game state and choose a valid operation.");
     }
     await window.deposit(this.itemType(itemName), null, count);
     return { deposited: itemName, count, window: serializeWindow(window) };
@@ -1450,7 +1535,7 @@ export class BotController {
   async windowWithdraw(itemName: string, count: number) {
     const window = this.requireWindow();
     if (!window.withdraw) {
-      throw new Error("Current window does not support withdraw.");
+      throw new CliError("COMMAND_BLOCKED", "Current window does not support withdraw.", "Observe the current game state and choose a valid operation.");
     }
     await window.withdraw(this.itemType(itemName), null, count);
     return { withdrew: itemName, count, window: serializeWindow(window) };
@@ -1475,20 +1560,20 @@ export class BotController {
   async activateEntity(id: number | string) {
     const entity = this.getRequiredEntity(id);
     await this.requireMethod("activateEntity").call(this.requireBot(), entity);
-    return { activated: true, entity: serializeEntity(entity, this.requireBot().entity?.position) };
+    return { activated: true, entity: this.publicEntity(entity) };
   }
 
   useOnEntity(id: number | string) {
     const entity = this.getRequiredEntity(id);
     this.requireMethod("useOn").call(this.requireBot(), entity);
-    return { usedOn: true, entity: serializeEntity(entity, this.requireBot().entity?.position) };
+    return { usedOn: true, entity: this.publicEntity(entity) };
   }
 
   attackEntity(id: number | string, options: { allowPlayers?: boolean; allowPassive?: boolean } = {}) {
     const entity = this.getRequiredEntity(id);
     this.assertAttackAllowed(entity, options);
     this.requireMethod("attack").call(this.requireBot(), entity);
-    return { attacked: true, entity: serializeEntity(entity, this.requireBot().entity?.position) };
+    return { attacked: true, entity: this.publicEntity(entity) };
   }
 
   swingArm(hand: "left" | "right", showHand: boolean) {
@@ -1499,7 +1584,7 @@ export class BotController {
   mountEntity(id: number | string) {
     const entity = this.getRequiredEntity(id);
     this.requireMethod("mount").call(this.requireBot(), entity);
-    return { mounted: true, entity: serializeEntity(entity, this.requireBot().entity?.position) };
+    return { mounted: true, entity: this.publicEntity(entity) };
   }
 
   dismount() {
@@ -1514,6 +1599,7 @@ export class BotController {
 
   stop(): void {
     if (this.stopping) return;
+    this.leaveReady();
     this.stopping = true;
     this.connectionEnded = true;
     this.lastDisconnectReason = "STOPPED";
@@ -1528,9 +1614,18 @@ export class BotController {
     }
   }
 
+  private publicEntity(entity: MineflayerEntity) {
+    const name = entity.type === "player" || entity.username ? "player" : entity.name?.replace(/^minecraft:/, "");
+    return projectEntity({ trackId: this.world.trackFor(entity), status: "loaded",
+      type: name && /^[a-z][a-z0-9_]*$/.test(name) ? `minecraft:${name}` : undefined,
+      name: entity.name, username: entity.username, position: entity.position,
+      distance: distance(this.bot?.entity?.position, entity.position),
+    });
+  }
+
   private requireBot(): MineflayerBot {
     if (!this.bot) {
-      throw new Error("Bot is not started.");
+      throw new CliError("NOT_READY", "Bot is not started.", "Observe the current game state and choose a valid operation.");
     }
     return this.bot;
   }
@@ -1562,7 +1657,7 @@ export class BotController {
   private requirePathfinder(): NonNullable<MineflayerBot["pathfinder"]> {
     const bot = this.requireBot();
     if (!bot.pathfinder) {
-      throw new Error("Pathfinder is not available.");
+      throw new CliError("COMMAND_BLOCKED", "Pathfinder is not available.", "Observe the current game state and choose a valid operation.");
     }
     return bot.pathfinder;
   }
@@ -1570,7 +1665,7 @@ export class BotController {
   private requireMethod<T extends keyof MineflayerBot>(name: T): NonNullable<MineflayerBot[T]> {
     const method = this.requireBot()[name];
     if (typeof method !== "function") {
-      throw new Error(`Bot method '${String(name)}' is not available.`);
+      throw new CliError("COMMAND_BLOCKED", `Bot method '${String(name)}' is not available.`, "Observe the current game state and choose a valid operation.");
     }
     return method as NonNullable<MineflayerBot[T]>;
   }
@@ -1578,7 +1673,7 @@ export class BotController {
   private getRequiredBlock(x: number, y: number, z: number): MineflayerBlock {
     const block = this.requireMethod("blockAt").call(this.requireBot(), new Vec3(x, y, z)) as MineflayerBlock | null;
     if (!block) {
-      throw new Error(`No loaded block at ${x}, ${y}, ${z}.`);
+      throw new CliError("COMMAND_BLOCKED", `No loaded block at ${x}, ${y}, ${z}.`, "Observe the current game state and choose a valid operation.");
     }
     return block;
   }
@@ -1586,7 +1681,7 @@ export class BotController {
   private blockType(name: string): number {
     const block = this.requireBot().registry?.blocksByName?.[name];
     if (!block) {
-      throw new Error(`Unknown block '${name}' for this Minecraft version.`);
+      throw new CliError("BAD_INPUT", `Unknown block '${name}' for this Minecraft version.`, "Observe the current game state and choose a valid operation.");
     }
     return block.id;
   }
@@ -1594,7 +1689,7 @@ export class BotController {
   private itemType(name: string): number {
     const item = this.requireBot().registry?.itemsByName?.[name];
     if (!item) {
-      throw new Error(`Unknown item '${name}' for this Minecraft version.`);
+      throw new CliError("BAD_INPUT", `Unknown item '${name}' for this Minecraft version.`, "Observe the current game state and choose a valid operation.");
     }
     return item.id;
   }
@@ -1604,7 +1699,7 @@ export class BotController {
       .inventory?.items()
       .find((candidate) => candidate.slot !== excludeSlot && (candidate.name === name || candidate.displayName === name));
     if (!item) {
-      throw new Error(`Item '${name}' is not in inventory.`);
+      throw new CliError("COMMAND_BLOCKED", `Item '${name}' is not in inventory.`, "Observe the current game state and choose a valid operation.");
     }
     return item;
   }
@@ -1616,7 +1711,7 @@ export class BotController {
     }
     const entity = this.requireBot().entities?.[String(id)];
     if (!entity) {
-      throw new Error(`Entity '${id}' is not visible.`);
+      throw new CliError("COMMAND_BLOCKED", `Entity '${id}' is not visible.`, "Observe the current game state and choose a valid operation.");
     }
     return entity;
   }
@@ -1624,25 +1719,25 @@ export class BotController {
   private requireWindow(): MineflayerWindow {
     const window = this.requireBot().currentWindow;
     if (!window) {
-      throw new Error("No window is currently open.");
+      throw new CliError("COMMAND_BLOCKED", "No window is currently open.", "Observe the current game state and choose a valid operation.");
     }
     return window;
   }
 
   private selectRecipe(recipes: unknown[], recipeIndex?: number, recipeId?: string): { index: number; id?: string } {
     if (recipeIndex !== undefined && recipeId !== undefined) {
-      throw new Error("Choose either recipeIndex or recipeId, not both.");
+      throw new CliError("BAD_INPUT", "Choose either recipeIndex or recipeId, not both.", "Observe the current game state and choose a valid operation.");
     }
     if (recipeId !== undefined) {
       const index = recipes.findIndex((recipe) => this.recipeId(recipe) === recipeId);
       if (index < 0) {
-        throw new Error(`No recipe with id '${recipeId}' was found.`);
+        throw new CliError("BAD_INPUT", `No recipe with id '${recipeId}' was found.`, "Observe the current game state and choose a valid operation.");
       }
       return { index, id: recipeId };
     }
     const index = recipeIndex ?? 0;
     if (index < 0 || index >= recipes.length) {
-      throw new Error(`Recipe index ${index} is out of range.`);
+      throw new CliError("BAD_INPUT", `Recipe index ${index} is out of range.`, "Observe the current game state and choose a valid operation.");
     }
     return { index, id: this.recipeId(recipes[index]) };
   }

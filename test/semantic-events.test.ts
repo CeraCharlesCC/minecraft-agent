@@ -1,11 +1,46 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it } from "vitest";
 import { CanonicalChat } from "../src/core/chat.js";
-import { AGENT_EVENT_TYPES, EventStore, eventMatchesFilter, resolveEventFilter } from "../src/core/events.js";
+import { AGENT_EVENT_TYPES, EventStore, eventMatchesFilter, projectEvent, resolveEventFilter } from "../src/core/events.js";
+import { decodeHandle, encodeHandle } from "../src/core/handles.js";
 
 const tick = async (): Promise<void> => { await Promise.resolve(); };
 
 describe("semantic event replay", () => {
+  it("uses the same short runtime tag for cursors and debug message references", () => {
+    const events = new EventStore();
+    expect(events.runtimeTag).toHaveLength(22);
+    expect(events.getCursor()).toBe(`${events.runtimeTag}:s0`);
+    const messageId = events.allocateMessageId();
+    expect(messageId).toBe(`${events.runtimeTag}:m1`);
+    const event = events.add({ type: "chat.player", messageId, text: "hello", raw: { packet: "raw" } });
+    expect(decodeHandle(event.cursor, "s")).toMatchObject({ runtimeId: events.runtimeId, sequence: 1 });
+    expect(events.getDebug(messageId)).toEqual(events.getDebug(event.cursor));
+    expect(events.getDebug(messageId)).toHaveLength(1);
+    for (const malformed of [`${events.runtimeTag}:s01`, `${events.runtimeTag}:s1\n`, `${events.runtimeTag}:m1`, `${events.runtimeId}:s1`]) {
+      expect(() => events.query(malformed)).toThrow(expect.objectContaining({ code: "BAD_INPUT" }));
+    }
+    expect(() => events.query(encodeHandle(events.runtimeId, "s", 2))).toThrow(expect.objectContaining({ code: "BAD_INPUT" }));
+  });
+
+  it("projects transport events without account or host text and preserves internal diagnostics", () => {
+    const events = new EventStore();
+    let internal: unknown;
+    events.subscribe(event => { internal = event; });
+    const event = events.add({ type: "connection.error", text: "account@example.com private.example:25565", error: { code: "ECONNRESET", message: "private.example", stack: "secret" } });
+    expect(internal).toEqual(event);
+    expect(projectEvent(event)).toEqual({ id: event.id, cursor: event.cursor, type: "connection.error", timestamp: event.timestamp, error: { code: "ECONNRESET" } });
+    events.add({ type: "connection.disconnected", reason: "KICKED: private account" });
+    events.add({ type: "world.reset", reason: "KICKED: private account", worldEpoch: 2, runtimeId: events.runtimeId });
+    events.add({ type: "action.failed", action: `${events.runtimeTag}:a1`, kind: "world.dig", reason: "DAEMON_ERROR",
+      error: { code: "DAEMON_ERROR", message: "private account", details: { runtimeId: events.runtimeId, outcomeUnknown: true } } });
+    const replay = events.query();
+    expect(replay.events[1]).toMatchObject({ reason: "DISCONNECTED" });
+    expect(replay.events[2]).toMatchObject({ reason: "WORLD_CHANGED" });
+    expect(replay.events[3]).toMatchObject({ error: { code: "DAEMON_ERROR", details: { outcomeUnknown: true } } });
+    expect(JSON.stringify(replay)).not.toMatch(/private|account|runtimeId|worldEpoch|stack/);
+  });
+
   it("uses a stable agent allowlist with explicit narrowing and independent subscription cursors", () => {
     const events = new EventStore({ maxEvents: 1 });
     events.add({ type: "entity.appeared" });
@@ -45,7 +80,7 @@ describe("semantic event replay", () => {
     expect(first.runtimeId).not.toBe(restarted.runtimeId);
     expect(() => restarted.query(first.getCursor())).toThrow(expect.objectContaining({ code: "RUNTIME_MISMATCH" }));
     expect(() => first.query(1)).toThrow(expect.objectContaining({ code: "BAD_INPUT" }));
-    expect(() => first.query(`${first.runtimeId}:s900`)).toThrow(expect.objectContaining({ code: "BAD_INPUT" }));
+    expect(() => first.query(`${first.runtimeTag}:s900`)).toThrow(expect.objectContaining({ code: "BAD_INPUT" }));
   });
 
   it("reports sparse retention gaps by the requested types", () => {
@@ -115,7 +150,7 @@ describe("canonical chat receipt", () => {
   function setup() {
     const events = new EventStore();
     const bot = new EventEmitter();
-    const chat = new CanonicalChat(events, (username, senderUuid) => username === "Alex" ? { username, uuid: senderUuid, trackId: `${events.runtimeId}:p1` } : undefined);
+    const chat = new CanonicalChat(events, (username, senderUuid) => username === "Alex" ? { username, uuid: senderUuid, trackId: `${events.runtimeTag}:p1` } : undefined);
     chat.attach(bot);
     return { bot, chat, events };
   }
@@ -132,7 +167,7 @@ describe("canonical chat receipt", () => {
     }
     await tick();
     expect(events.query().events).toHaveLength(1);
-    expect(events.query().events[0]).toMatchObject({ type: "chat.player", text: "hello", sender: "Alex", channel: "player", senderIdentity: { trackId: `${events.runtimeId}:p1` } });
+    expect(events.query().events[0]).toMatchObject({ type: "chat.player", text: "hello", sender: "Alex", channel: "player", senderIdentity: { trackId: `${events.runtimeTag}:p1` } });
     expect(events.getDebug(events.query().events[0]!.messageId as string)).toHaveLength(1);
   });
 
@@ -192,7 +227,7 @@ describe("canonical chat receipt", () => {
     bot.emit("message", { text: "announcement" }, "system", null);
     await tick();
     expect(events.query().events).toEqual([
-      expect.objectContaining({ type: "chat.player", text: "hello", attribution: "verified", senderIdentity: { username: "Alex", uuid: senderUuid, trackId: `${events.runtimeId}:p1` } }),
+      expect.objectContaining({ type: "chat.player", text: "hello", attribution: "verified", senderIdentity: { username: "Alex", uuid: senderUuid, trackId: `${events.runtimeTag}:p1` } }),
       expect.objectContaining({ type: "chat.whisper", text: "secret", channel: "whisper" }),
       expect.objectContaining({ type: "server.message", text: "announcement", attribution: "unknown", senderIdentity: {} }),
     ]);

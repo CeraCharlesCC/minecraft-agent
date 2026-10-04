@@ -1,7 +1,7 @@
 import { Writable } from "node:stream";
 import { z } from "zod";
 import { describe, expect, it } from "vitest";
-import { badInput, CliError, commandBlocked, normalizeError, sessionNotFound } from "../src/output/errors.js";
+import { badInput, CliError, commandBlocked, contextRequired, normalizeError, sessionNotFound } from "../src/output/errors.js";
 import { failure, formatDefaultText, resolveOutputMode, success, writeJson, writeText } from "../src/output/response.js";
 
 class MemoryStream extends Writable {
@@ -39,7 +39,7 @@ describe("output responses", () => {
   it("formats success, failure, and output modes", () => {
     const error = new CliError("DAEMON_ERROR", "boom", "restart", 1);
     expect(success({ ok: true })).toEqual({ ok: true, data: { ok: true } });
-    expect(failure(error)).toEqual({ ok: false, error: { code: "DAEMON_ERROR", message: "boom", remediation: "restart" } });
+    expect(failure(error)).toEqual({ ok: false, error: { code: "DAEMON_ERROR", message: "The operation failed. Inspect operational diagnostics for the cause." } });
     expect(resolveOutputMode(undefined, true)).toBe("text");
     expect(resolveOutputMode(undefined, false)).toBe("json");
     expect(resolveOutputMode("json", true)).toBe("json");
@@ -56,9 +56,36 @@ describe("output responses", () => {
     expect(formatDefaultText("plain")).toBe("plain");
     expect(formatDefaultText({ nested: true })).toBe(JSON.stringify({ nested: true }, null, 2));
   });
-  it("preserves typed runtime details in machine-readable failures", () => {
+  it("keeps actionable track facts while excluding internal runtime details", () => {
     const details = { trackId: "runtime:p1", worldEpoch: 3 };
-    expect(failure(new CliError("TRACK_LOST", "lost", "observe", 1, details))).toMatchObject({ ok:false, error: {code:"TRACK_LOST", details} });
+    expect(failure(new CliError("TRACK_LOST", "lost", "observe", 1, details))).toMatchObject({ ok:false, error: {code:"TRACK_LOST", details: { trackId: details.trackId }} });
+  });
+
+  it("projects context guidance and meaningful navigation facts without private diagnostics", () => {
+    expect(failure(contextRequired())).toEqual({ ok: false, error: {
+      code: "CONTEXT_REQUIRED", message: "Pass context from observe frame or entity find.",
+    } });
+    const error = new CliError("NAVIGATION_FAILED", "account@example.com at private.example:25565", "long manual steps", 1, {
+      reason: "NO_PATH", goal: { x: 10, y: 64, z: 5, range: 1 }, reachedGoal: false,
+      runtimeId: "internal-runtime", worldEpoch: 3, bindingGeneration: 4,
+      connection: { username: "account@example.com" }, stack: "private-stack", configuration: { canDig: true },
+    });
+    expect(failure(error)).toEqual({ ok: false, error: { code: "NAVIGATION_FAILED",
+      message: "Navigation did not reach the goal.", details: {
+        reason: "NO_PATH", goal: { x: 10, y: 64, z: 5, range: 1 }, reachedGoal: false,
+      } } });
+  });
+
+  it("preserves uncertain POST outcomes and hides untrusted transport messages", () => {
+    const result = failure(new CliError("DAEMON_TIMEOUT", "account@example.com private.example", "inspect stack", 1, {
+      outcome: "unknown", mayHaveExecuted: true, responseConfirmed: false, timeoutMs: 0,
+      pid: 123, controlPort: 3000, token: "secret", path: "/internal", stack: "private",
+    }));
+    expect(result).toEqual({ ok: false, error: { code: "DAEMON_TIMEOUT",
+      message: "The daemon request timed out; its outcome may be unknown.",
+      details: { outcome: "unknown", mayHaveExecuted: true, responseConfirmed: false, timeoutMs: 0 } } });
+    const unknown = failure(normalizeError(new Error("account@example.com at private.example\nprivate stack")));
+    expect(JSON.stringify(unknown)).not.toMatch(/account|private/);
   });
 
 });

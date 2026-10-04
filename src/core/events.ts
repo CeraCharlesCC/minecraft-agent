@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { badInput, CliError } from "../output/errors.js";
+import { badInput, CliError, publicError, type ErrorCode } from "../output/errors.js";
+import { decodeHandle, encodeHandle, encodeRuntimeTag } from "./handles.js";
 
 export interface BotEvent {
   id: number;
@@ -87,8 +88,38 @@ export function detachData<T>(value: T): T {
   return copy(value) as T;
 }
 
+const connectionCauses = new Set(["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "ENETUNREACH", "EHOSTUNREACH", "EAI_AGAIN", "ENOTFOUND", "EAUTH", "AUTHENTICATION_FAILED", "INVALID_CREDENTIALS", "AUTH_CHALLENGE", "INVALID_SESSION", "TOKEN_EXPIRED", "FORBIDDEN", "UNAUTHORIZED", "DISCONNECTED", "STOPPED"]);
+
+/** Routine replay and live streams omit transport text that may contain credentials. */
+export function projectEvent(event: BotEvent): BotEvent {
+  const base = { id: event.id, cursor: event.cursor, type: event.type, timestamp: event.timestamp };
+  if (event.type.startsWith("connection.")) {
+    if (event.type === "connection.error") {
+      const error = event.error && typeof event.error === "object" ? event.error as Record<string, unknown> : undefined;
+      const code = typeof error?.code === "string" && connectionCauses.has(error.code) ? error.code : "CONNECTION_ERROR";
+      return { ...base, error: { code } };
+    }
+    if (event.type === "connection.disconnected") return { ...base, reason: typeof event.reason === "string" && connectionCauses.has(event.reason) ? event.reason : "DISCONNECTED" };
+    return base;
+  }
+  if (event.type.startsWith("action.")) {
+    const error = event.error && typeof event.error === "object" ? event.error as { code: ErrorCode; message: string; details?: Record<string, unknown> } : undefined;
+    return { ...base,
+      ...(typeof event.action === "string" ? { action: event.action } : {}),
+      ...(typeof event.kind === "string" ? { kind: event.kind } : {}),
+      ...(typeof event.target === "string" ? { target: event.target } : {}),
+      ...(event.result === undefined ? {} : { result: detachData(event.result) }),
+      ...(typeof event.reason === "string" && (["CANCELLED", "REPLACED", "STOPPED", "TRACK_LOST", "WORLD_CHANGED"].includes(event.reason) || event.reason === error?.code) ? { reason: event.reason } : {}),
+      ...(error ? { error: publicError(new CliError(error.code, error.message, "Observe current actions.", 1, error.details)) } : {}),
+    };
+  }
+  if (event.type === "world.reset") return { ...base, reason: typeof event.reason === "string" && ["DEATH", "RESPAWN", "DIMENSION_CHANGED", "DISCONNECTED", "STOPPED"].includes(event.reason) ? event.reason : "WORLD_CHANGED" };
+  return detachData(event);
+}
+
 export class EventStore {
   readonly runtimeId = randomUUID();
+  readonly runtimeTag = encodeRuntimeTag(this.runtimeId);
   private nextId = 1;
   private nextMessageId = 1;
   private readonly eventsByType = new Map<string, BotEvent[]>();
@@ -106,7 +137,7 @@ export class EventStore {
   }
 
   allocateMessageId(): string {
-    return `${this.runtimeId}:m${this.nextMessageId++}`;
+    return encodeHandle(this.runtimeId, "m", this.nextMessageId++);
   }
 
   add(event: { type: string; timestamp?: string; [field: string]: unknown }): BotEvent {
@@ -150,7 +181,7 @@ export class EventStore {
     for (const event of this.ordered()) {
       if (event.id <= sequence) continue;
       examined = event.id;
-      if (eventMatchesFilter(event, filter)) events.push(detachData(event));
+      if (eventMatchesFilter(event, filter)) events.push(projectEvent(event));
       if (events.length === limit) break;
     }
     // If the limit was not reached, all retained events and expired holes were examined.
@@ -187,15 +218,13 @@ export class EventStore {
     return this.options.retention[type] ?? this.options.retention[category] ?? this.options.maxEvents * (important ? 4 : 1);
   }
 
-  private cursor(sequence: number): string { return `${this.runtimeId}:s${sequence}`; }
+  private cursor(sequence: number): string { return encodeHandle(this.runtimeId, "s", sequence); }
 
   private parseCursor(cursor: string | number): number {
     if (cursor === 0 || cursor === "0") return 0;
     if (typeof cursor !== "string") throw badInput("Use a runtime-scoped event cursor, or 0 to start replay.");
-    const match = /^(.*):s(\d+)$/.exec(cursor);
-    if (!match) throw badInput("Invalid event cursor.");
-    if (match[1] !== this.runtimeId) throw new CliError("RUNTIME_MISMATCH", "The event cursor belongs to another runtime.", "Observe a fresh frame and restart replay with cursor 0.", 3, { runtimeId: this.runtimeId, cursor });
-    const sequence = Number(match[2]);
+    const { runtimeId, sequence } = decodeHandle(cursor, "s");
+    if (runtimeId !== this.runtimeId) throw new CliError("RUNTIME_MISMATCH", "The event cursor belongs to another runtime.", "Observe a fresh frame and restart replay with cursor 0.", 3, { cursor });
     if (!Number.isSafeInteger(sequence) || sequence > this.nextId - 1) throw badInput("Event cursor is ahead of this runtime.");
     return sequence;
   }

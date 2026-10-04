@@ -1,5 +1,5 @@
 import { Writable } from "node:stream";
-import { CliError } from "./errors.js";
+import { CliError, publicError } from "./errors.js";
 
 export type OutputMode = "json" | "text";
 
@@ -13,7 +13,6 @@ export interface ApiFailure {
   error: {
     code: string;
     message: string;
-    remediation: string;
     details?: Record<string, unknown>;
   };
 }
@@ -27,12 +26,7 @@ export function success<T>(data: T): ApiSuccess<T> {
 export function failure(error: CliError): ApiFailure {
   return {
     ok: false,
-    error: {
-      code: error.code,
-      message: error.message,
-      remediation: error.remediation,
-      ...(error.details ? { details: error.details } : {}),
-    },
+    error: publicError(error),
   };
 }
 

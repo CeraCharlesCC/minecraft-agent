@@ -1,30 +1,23 @@
 import { badInput } from "../output/errors.js";
+import { decodeRuntimeTag, decodeSequence, encodeRuntimeTag, RUNTIME_TAG_PATTERN } from "./handles.js";
 
 export interface ActionContext { runtimeId: string; worldEpoch: number }
 
-function valid(runtimeId: unknown, worldEpoch: unknown): runtimeId is string {
-  return typeof runtimeId === "string" && runtimeId.length > 0 && runtimeId.length <= 256 &&
-    Number.isSafeInteger(worldEpoch) && Number(worldEpoch) > 0;
-}
+const contextPattern = new RegExp(`^c2\\.(${RUNTIME_TAG_PATTERN})\\.([1-9a-z][0-9a-z]{0,10})$`);
 
 /** A convenience encoding of runtime/epoch, independent of frame retention. */
 export function encodeActionContext(runtimeId: string, worldEpoch: number): string {
-  if (!valid(runtimeId, worldEpoch)) throw badInput("Invalid action runtime or world epoch.");
-  return `mcctx1.${Buffer.from(JSON.stringify([runtimeId, worldEpoch]), "utf8").toString("base64url")}`;
+  if (!Number.isSafeInteger(worldEpoch) || worldEpoch < 1) throw badInput("Invalid action world epoch.");
+  return `c2.${encodeRuntimeTag(runtimeId)}.${worldEpoch.toString(36)}`;
 }
 
 export function decodeActionContext(token: string): ActionContext {
-  if (typeof token !== "string" || !/^mcctx1\.[A-Za-z0-9_-]+$/.test(token) || token.length > 2048) {
-    throw badInput("Invalid action context. Use context from a frame or entity search.");
-  }
+  const invalid = () => badInput("Invalid action context. Use context from a frame or entity search.");
+  const match = typeof token === "string" ? contextPattern.exec(token) : null;
+  if (!match) throw invalid();
   try {
-    const payload = JSON.parse(Buffer.from(token.slice(7), "base64url").toString("utf8")) as unknown;
-    if (!Array.isArray(payload) || payload.length !== 2 || !valid(payload[0], payload[1])) throw new Error("Invalid payload");
-    const [runtimeId, worldEpoch] = payload as [string, number];
-    // Reject alternate encodings and malformed base64 rather than silently repairing them.
-    if (encodeActionContext(runtimeId, worldEpoch) !== token) throw new Error("Noncanonical payload");
+    const runtimeId = decodeRuntimeTag(match[1]!), worldEpoch = decodeSequence(match[2]!);
+    if (encodeActionContext(runtimeId, worldEpoch) !== token) throw invalid();
     return { runtimeId, worldEpoch };
-  } catch {
-    throw badInput("Invalid action context. Use context from a frame or entity search.");
-  }
+  } catch { throw invalid(); }
 }

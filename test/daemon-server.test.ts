@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Vec3 } from "vec3";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { encodeActionContext } from "../src/core/context.js";
+import { decodeHandle, encodeHandle } from "../src/core/handles.js";
 import { runDaemon } from "../src/daemon/server.js";
 
 const TOKEN_A = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -90,11 +92,13 @@ describe("daemon server", () => {
 
     const unauthorized = await fetch(`http://127.0.0.1:${port}/status`);
     expect(unauthorized.status).toBe(401);
-    expect(await unauthorized.json()).toEqual({ error: "unauthorized" });
+    expect(unauthorized.headers.get("X-MC-Agent-API")).toBe("3");
+    expect(await unauthorized.json()).toEqual({ code: "DAEMON_ERROR", message: "Unauthorized daemon request." });
 
     const missing = await fetch(`http://127.0.0.1:${port}/missing`, { headers: { Authorization: `Bearer ${TOKEN_A}` } });
     expect(missing.status).toBe(404);
-    expect(await missing.json()).toEqual({ error: "not found" });
+    expect(missing.headers.get("X-MC-Agent-API")).toBe("3");
+    expect(await missing.json()).toEqual({ code: "BAD_INPUT", message: "Unknown daemon route." });
 
     fakeBot.emit("spawn");
     fakeBot.emit("kicked", { text: "Server maintenance" });
@@ -102,7 +106,7 @@ describe("daemon server", () => {
     const logEntries = log.mock.calls.map(([line]) => JSON.parse(String(line)));
     expect(logEntries).toEqual(expect.arrayContaining([
       expect.objectContaining({ session: "errors", type: "connection.ready", connection: expect.objectContaining({ state: "ready" }) }),
-      expect.objectContaining({ session: "errors", type: "connection.disconnected", connection: expect.objectContaining({ state: "disconnected", reason: 'KICKED: {"text":"Server maintenance"}', remediation: expect.stringContaining("session stop") }) }),
+      expect.objectContaining({ session: "errors", type: "connection.disconnected", reason: 'KICKED: {"text":"Server maintenance"}', connection: expect.objectContaining({ state: "disconnected" }) }),
     ]));
     log.mockRestore();
 
@@ -116,9 +120,8 @@ describe("daemon server", () => {
     });
     expect(failed.status).toBe(500);
     expect(await failed.json()).toMatchObject({
-      error: "chat failed",
+      message: "The operation failed. Inspect operational diagnostics for the cause.",
       code: "DAEMON_ERROR",
-      remediation: expect.stringContaining("daemon log"),
     });
 
     fakeBot.chat.mockImplementationOnce(() => {
@@ -129,7 +132,7 @@ describe("daemon server", () => {
       headers: { Authorization: `Bearer ${TOKEN_A}`, "Content-Type": "application/json" },
       body: JSON.stringify({ message: "hello" }),
     });
-    expect(await stringFailure.json()).toMatchObject({ error: "string failure", code: "DAEMON_ERROR" });
+    expect(await stringFailure.json()).toEqual({ message: "The operation failed. Inspect operational diagnostics for the cause.", code: "DAEMON_ERROR" });
 
     await fetch(`http://127.0.0.1:${port}/stop`, { method: "POST", headers: { Authorization: `Bearer ${TOKEN_A}` } });
   });
@@ -187,13 +190,14 @@ describe("daemon server", () => {
 
     const status = await fetch(`http://127.0.0.1:${port}/status`, { headers: { Authorization: `Bearer ${TOKEN_A}` } });
     expect(status.ok).toBe(true);
-    expect(await status.json()).toMatchObject({
-      connected: true,
-      username: "AgentBot",
-      experience: { level: "1" },
-      time: { age: "2" },
-      lastEventId: 2,
-    });
+    expect(status.headers.get("X-MC-Agent-API")).toBe("3");
+    const compact = await status.json();
+    expect(compact).toMatchObject({ ready: false, username: "AgentBot", connection: { state: "waiting_for_spawn" } });
+    expect(compact).not.toHaveProperty("runtimeId");
+    expect(compact).not.toHaveProperty("host");
+    expect(compact).not.toHaveProperty("experience");
+    const full = await (await fetch(`http://127.0.0.1:${port}/status?detail=full`, { headers: { Authorization: `Bearer ${TOKEN_A}` } })).json();
+    expect(full).toMatchObject({ host: "localhost", port: 25565, auth: "offline" });
 
     const events = await fetch(`http://127.0.0.1:${port}/events?since=0&limit=10`, {
       headers: { Authorization: `Bearer ${TOKEN_A}` },
@@ -326,17 +330,17 @@ describe("daemon server", () => {
     });
 
     fakeBot.emit("spawn");
-    const context = await (await fetch(`http://127.0.0.1:${port}/status`, { headers: { Authorization: `Bearer ${TOKEN_C}` } })).json() as { runtimeId: string; worldEpoch: number };
+    const context = (await (await fetch(`http://127.0.0.1:${port}/frame`, { headers: { Authorization: `Bearer ${TOKEN_C}` } })).json() as { context: string }).context;
     const failed = await fetch(`http://127.0.0.1:${port}/navigate/goto`, {
       method: "POST",
       headers: { Authorization: `Bearer ${TOKEN_C}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ runtimeId: context.runtimeId, worldEpoch: context.worldEpoch, x: 10, y: 64, z: 10, range: 2 }),
+      body: JSON.stringify({ context, x: 10, y: 64, z: 10, range: 2 }),
     });
 
     expect(failed.status).toBe(200);
     const started = await failed.json() as { action: string };
     const status = await fetch(`http://127.0.0.1:${port}/actions/${started.action}`, { headers: { Authorization: `Bearer ${TOKEN_C}` } });
-    expect(await status.json()).toMatchObject({ state: "failed", error: { code: "NAVIGATION_FAILED", message: "Took to long to decide path to goal!" } });
+    expect(await status.json()).toMatchObject({ state: "failed", error: { code: "NAVIGATION_FAILED", message: "Navigation did not reach the goal." } });
 
     await fetch(`http://127.0.0.1:${port}/stop`, { method: "POST", headers: { Authorization: `Bearer ${TOKEN_C}` } });
   });
@@ -361,13 +365,13 @@ describe("daemon server", () => {
 
     (fakeBot.entities as Record<string, unknown>)["13"] = fakeBot.players.Steve.entity;
     fakeBot.emit("spawn");
-    const context = await (await fetch(`http://127.0.0.1:${port}/status`, { headers: { Authorization: `Bearer ${TOKEN_C}` } })).json() as { runtimeId: string; worldEpoch: number };
+    const context = (await (await fetch(`http://127.0.0.1:${port}/frame`, { headers: { Authorization: `Bearer ${TOKEN_C}` } })).json() as { context: string }).context;
     const frame = await (await fetch(`http://127.0.0.1:${port}/frame`, { headers: { Authorization: `Bearer ${TOKEN_C}` } })).json() as { entities: { trackId: string; username?: string }[] };
     const playerTrack = frame.entities.find(entity => entity.username === "Steve")!.trackId;
     await fetch(`http://127.0.0.1:${port}/chat`, {
       method: "POST",
       headers: { Authorization: `Bearer ${TOKEN_C}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ runtimeId: context.runtimeId, worldEpoch: context.worldEpoch, message: "hello" }),
+      body: JSON.stringify({ context, message: "hello" }),
     });
     expect(fakeBot.chat).toHaveBeenCalledWith("hello");
 
@@ -386,7 +390,7 @@ describe("daemon server", () => {
     await fetch(`http://127.0.0.1:${port}/control/tap`, {
       method: "POST",
       headers: { Authorization: `Bearer ${TOKEN_C}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ runtimeId: context.runtimeId, worldEpoch: context.worldEpoch, state: "forward", durationMs: 1 }),
+      body: JSON.stringify({ context, state: "forward", durationMs: 1 }),
     });
     expect(fakeBot.setControlState).toHaveBeenCalledWith("forward", true);
     await new Promise(resolve => setTimeout(resolve, 5));
@@ -395,7 +399,7 @@ describe("daemon server", () => {
     await fetch(`http://127.0.0.1:${port}/look/at`, {
       method: "POST",
       headers: { Authorization: `Bearer ${TOKEN_C}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ runtimeId: context.runtimeId, worldEpoch: context.worldEpoch, x: 4, y: 5, z: 6 }),
+      body: JSON.stringify({ context, x: 4, y: 5, z: 6 }),
     });
     expect(fakeBot.lookAtCalls).toHaveBeenCalledWith(expect.objectContaining({ x: 4, y: 5, z: 6 }));
 
@@ -416,14 +420,14 @@ describe("daemon server", () => {
     await fetch(`http://127.0.0.1:${port}/navigate/goto`, {
       method: "POST",
       headers: { Authorization: `Bearer ${TOKEN_C}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ runtimeId: context.runtimeId, worldEpoch: context.worldEpoch, x: 10, y: 64, z: 10, range: 2 }),
+      body: JSON.stringify({ context, x: 10, y: 64, z: 10, range: 2 }),
     });
     expect(fakeBot.pathfinder.goto).toHaveBeenCalledWith(expect.objectContaining({ x: 10, y: 64, z: 10 }));
 
     const follow = await fetch(`http://127.0.0.1:${port}/navigate/follow`, {
       method: "POST",
       headers: { Authorization: `Bearer ${TOKEN_C}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ runtimeId: context.runtimeId, worldEpoch: context.worldEpoch, track: playerTrack, range: 3 }),
+      body: JSON.stringify({ context, track: playerTrack, range: 3 }),
     });
     expect(await follow.json()).toMatchObject({ kind: "navigate.follow", target: playerTrack, state: "running" });
     expect(fakeBot.pathfinder.setGoal).toHaveBeenCalledWith(expect.objectContaining({ entity: fakeBot.players.Steve.entity }), true);
@@ -431,51 +435,51 @@ describe("daemon server", () => {
     const navigateStatus = await fetch(`http://127.0.0.1:${port}/navigate/status`, { headers: { Authorization: `Bearer ${TOKEN_C}` } });
     expect(await navigateStatus.json()).toEqual({ moving: true, mining: false, building: false });
 
-    await fetch(`http://127.0.0.1:${port}/navigate/stop`, { method: "POST", headers: { Authorization: `Bearer ${TOKEN_C}` }, body: JSON.stringify(context) });
+    await fetch(`http://127.0.0.1:${port}/navigate/stop`, { method: "POST", headers: { Authorization: `Bearer ${TOKEN_C}` }, body: JSON.stringify({ context }) });
     expect(fakeBot.pathfinder.stop).toHaveBeenCalled();
 
     await fetch(`http://127.0.0.1:${port}/inventory/equip`, {
       method: "POST",
       headers: { Authorization: `Bearer ${TOKEN_C}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ runtimeId: context.runtimeId, worldEpoch: context.worldEpoch, item: "dirt", destination: "hand" }),
+      body: JSON.stringify({ context, item: "dirt", destination: "hand" }),
     });
     expect(fakeBot.equipCalls).toHaveBeenCalledWith(expect.objectContaining({ name: "dirt" }), "hand");
 
     await fetch(`http://127.0.0.1:${port}/world/dig`, {
       method: "POST",
       headers: { Authorization: `Bearer ${TOKEN_C}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ runtimeId: context.runtimeId, worldEpoch: context.worldEpoch, x: 1, y: 2, z: 3 }),
+      body: JSON.stringify({ context, x: 1, y: 2, z: 3 }),
     });
     expect(fakeBot.digCalls).toHaveBeenCalledWith(expect.objectContaining({ name: "dirt" }), true);
 
     await fetch(`http://127.0.0.1:${port}/world/place`, {
       method: "POST",
       headers: { Authorization: `Bearer ${TOKEN_C}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ runtimeId: context.runtimeId, worldEpoch: context.worldEpoch, x: 1, y: 2, z: 3, face: "up", item: "dirt" }),
+      body: JSON.stringify({ context, x: 1, y: 2, z: 3, face: "up", item: "dirt" }),
     });
     expect(fakeBot.placeBlockCalls).toHaveBeenCalledWith(expect.objectContaining({ name: "dirt" }), expect.objectContaining({ x: 0, y: 1, z: 0 }));
 
     await fetch(`http://127.0.0.1:${port}/world/activate`, {
       method: "POST",
       headers: { Authorization: `Bearer ${TOKEN_C}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ runtimeId: context.runtimeId, worldEpoch: context.worldEpoch, x: 1, y: 2, z: 3 }),
+      body: JSON.stringify({ context, x: 1, y: 2, z: 3 }),
     });
     expect(fakeBot.activateBlockCalls).toHaveBeenCalledWith(expect.objectContaining({ name: "dirt" }));
 
     const opened = await fetch(`http://127.0.0.1:${port}/window/open-block`, {
       method: "POST",
       headers: { Authorization: `Bearer ${TOKEN_C}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ runtimeId: context.runtimeId, worldEpoch: context.worldEpoch, x: 1, y: 2, z: 3 }),
+      body: JSON.stringify({ context, x: 1, y: 2, z: 3 }),
     });
     const openAction = await opened.json() as { action: string };
-    expect(await (await fetch(`http://127.0.0.1:${port}/actions/${openAction.action}`, { headers: { Authorization: `Bearer ${TOKEN_C}` } })).json()).toMatchObject({ state: "completed", result: { opened: true, window: { id: 1 } } });
+    expect(await (await fetch(`http://127.0.0.1:${port}/actions/${openAction.action}`, { headers: { Authorization: `Bearer ${TOKEN_C}` } })).json()).toMatchObject({ state: "completed", result: { opened: true, window: { type: "minecraft:chest" } } });
 
     const clicked = await fetch(`http://127.0.0.1:${port}/window/click`, {
       method: "POST",
       headers: { Authorization: `Bearer ${TOKEN_C}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ runtimeId: context.runtimeId, worldEpoch: context.worldEpoch, slot: 5, mouseButton: 1, mode: 0 }),
+      body: JSON.stringify({ context, slot: 5, mouseButton: 1, mode: 0 }),
     });
-    expect(await clicked.json()).toMatchObject({ kind: "window.click", action: expect.stringContaining(":a") });
+    expect(await clicked.json()).toMatchObject({ kind: "window.click", action: expect.any(String) });
     expect(fakeBot.clickWindow).toHaveBeenCalledWith(5, 1, 0);
 
     await fetch(`http://127.0.0.1:${port}/stop`, { method: "POST", headers: { Authorization: `Bearer ${TOKEN_C}` } });
@@ -490,15 +494,15 @@ describe("daemon server", () => {
     try {
       fakeBot.emit("spawn");
       const first = await get("/frame"), track = first.entities[0].trackId;
-      const context = { runtimeId:first.runtimeId, worldEpoch:first.worldEpoch };
-      expect(first).toMatchObject({connection:{ready:true},eventCursor:expect.stringContaining(":s"),frame:expect.stringContaining(":f"),inventory:{ready:true,known:true,slotCount:null,slots:[{name:"dirt",count:2,slot:36}]}});
-      expect(await post("/navigate/follow", {track,range:2})).toMatchObject({code:"BAD_INPUT"});
-      expect(await post("/navigate/follow", {...context,runtimeId:"previous-runtime",track})).toMatchObject({code:"RUNTIME_MISMATCH",details:{runtimeId:first.runtimeId}});
+      const context = { context: first.context };
+      expect(first).toMatchObject({connection:{ready:true},eventCursor:expect.any(String),frame:expect.any(String),inventory:{known:true,slots:[{name:"dirt",count:2,slot:36}]}});
+      expect(await post("/navigate/follow", {track,range:2})).toMatchObject({code:"CONTEXT_REQUIRED"});
+      expect(await post("/navigate/follow", {context:encodeActionContext("00000000-0000-0000-0000-000000000007",1),track})).toMatchObject({code:"RUNTIME_MISMATCH"});
       expect(await post("/entity/activate", {...context,id:12})).toMatchObject({code:"BAD_INPUT"});
-      expect(await post("/entity/activate", {...context,track:`${first.runtimeId}:e999`})).toMatchObject({code:"TRACK_UNKNOWN",details:{trackId:`${first.runtimeId}:e999`}});
-      expect(await get("/events?since=previous-runtime:s2")).toMatchObject({code:"RUNTIME_MISMATCH"});
+      expect(await post("/entity/activate", {...context,track:encodeHandle(decodeHandle(track).runtimeId,"e",999)})).toMatchObject({code:"TRACK_UNKNOWN",details:{trackId:encodeHandle(decodeHandle(track).runtimeId,"e",999)}});
+      expect(await get(`/events?since=${encodeHandle("00000000-0000-0000-0000-000000000007","s",2)}`)).toMatchObject({code:"RUNTIME_MISMATCH"});
       expect(await get("/events?since=1")).toMatchObject({code:"BAD_INPUT"});
-      expect(await get(`/frame?since=${first.frame}&radius=32`)).toMatchObject({code:"FRAME_RESET_REQUIRED",details:{resetRequired:true,reason:"PROJECTION_CHANGED"}});
+      expect(await get(`/frame?since=${first.frame}&radius=32`)).toMatchObject({type:"full",reset:{reason:"PROJECTION_CHANGED"}});
       fakeBot.inventory.items = () => [{name:"dirt",displayName:"Dirt",count:9,slot:36}];
       const delta = await get(`/frame?since=${first.frame}`);
       expect(delta).toMatchObject({since:first.frame,delta:{changed:{inventory:{slots:[{count:9,slot:36}]}}}});
@@ -507,8 +511,8 @@ describe("daemon server", () => {
       expect(await get(`/actions/${follow.action}`)).toMatchObject({state:"failed",reason:"TRACK_LOST"});
       expect(await post("/navigate/follow", {...context,track})).toMatchObject({code:"TRACK_LOST"});
       fakeBot.emit("death");
-      expect(await post("/navigate/goto", {...context,x:1,y:64,z:1})).toMatchObject({code:"WORLD_CHANGED",details:{expectedWorldEpoch:first.worldEpoch}});
-      expect(await get(`/frame?since=${first.frame}`)).toMatchObject({code:"FRAME_RESET_REQUIRED",details:{reason:"WORLD_CHANGED"}});
+      expect(await post("/navigate/goto", {...context,x:1,y:64,z:1})).toMatchObject({code:"WORLD_CHANGED"});
+      expect(await get(`/frame?since=${first.frame}`)).toMatchObject({type:"full",reset:{reason:"WORLD_CHANGED"}});
     } finally { await post("/stop", {}); }
   });
 
@@ -524,6 +528,7 @@ describe("daemon server", () => {
       const invalid = await fetch(`http://127.0.0.1:${port}/sample?track=${track}&rate=100`,{headers});
       expect(invalid.status).toBe(400); expect(await invalid.json()).toMatchObject({code:"BAD_INPUT"});
       const response = await fetch(`http://127.0.0.1:${port}/sample?track=${track}&fields=position,velocity,status&rate=10`,{headers});
+      expect(response.headers.get("X-MC-Agent-API")).toBe("3");
       const reader = response.body!.getReader();
       const first = JSON.parse(Buffer.from((await reader.read()).value!).toString("utf8").trim());
       expect(first).toMatchObject({type:"track.sample",trackId:track,values:{status:"loaded",position:{x:3,y:2,z:3}}});

@@ -4,6 +4,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { encodeHandle } from "../src/core/handles.js";
 import { runDaemon } from "../src/daemon/server.js";
 import { CliError } from "../src/output/errors.js";
 
@@ -31,7 +32,11 @@ async function server() {
   await new Promise<void>(resolve => allocation.close(() => resolve()));
   const bot = new WaitBot();
   const headers = { Authorization: "Bearer wait-protocol-test-token-123456789", "Content-Type": "application/json" };
-  const request = (path: string, init: RequestInit = {}) => fetch(`http://127.0.0.1:${port}${path}`, { ...init, headers });
+  const request = async (path: string, init: RequestInit = {}) => {
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, { ...init, headers });
+    expect(response.headers.get("X-MC-Agent-API")).toBe("3");
+    return response;
+  };
   const get = async (path: string) => (await request(path)).json() as Promise<any>;
   const post = async (path: string, body: unknown) => (await request(path, { method: "POST", body: JSON.stringify(body) })).json() as Promise<any>;
   await runDaemon({ session: "wait", host: "localhost", port: 25565, username: "AgentBot", auth: "offline", controlPort: port,
@@ -54,6 +59,7 @@ describe("authoritative action waits over HTTP", () => {
     let resolve!: () => void;
     bot.lookAtCalls.mockReturnValue(new Promise<void>(done => { resolve = done; }));
     const action = await post("/look/at", { context, x: 6, y: 64, z: 0 });
+    expect(Object.keys(action).sort()).toEqual(["action", "kind", "state"]);
     const waiting = get(`/actions/${action.action}/wait?timeout=1000`);
     expect(await get(`/actions/${action.action}`)).toMatchObject({ state: "running" });
     expect(await post(`/actions/${action.action}/cancel`, { context })).toMatchObject({ state: "cancelled" });
@@ -72,7 +78,7 @@ describe("authoritative action waits over HTTP", () => {
       error: { code: "TRACK_LOST", details: { trackId: "lost-target" } } });
     const invalid = await request(`/actions/${failed.action}/wait?timeout=-1`);
     expect(invalid.status).toBe(400); expect(await invalid.json()).toMatchObject({ code: "BAD_INPUT" });
-    expect(await get("/actions/another-runtime:a1/wait?timeout=0")).toMatchObject({ code: "RUNTIME_MISMATCH" });
+    expect(await get(`/actions/${encodeHandle("00000000-0000-0000-0000-000000000007","a",1)}/wait?timeout=0`)).toMatchObject({ code: "RUNTIME_MISMATCH" });
   });
 
   it("does not cancel continuous work at a deadline or when a waiting client disconnects", async () => {

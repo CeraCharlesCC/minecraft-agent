@@ -1,6 +1,7 @@
 import { EventStore } from "./events.js";
 import { CliError, badInput } from "../output/errors.js";
 import { encodeActionContext } from "./context.js";
+import { decodeHandle, encodeHandle } from "./handles.js";
 
 export interface ObservationContext {
   connected: boolean;
@@ -9,10 +10,10 @@ export interface ObservationContext {
   actions?: unknown[];
   /** Read authoritative actions after reconciliation may have failed an old binding. */
   getActions?: () => unknown[];
-  getControls?: () => Record<string, boolean>;
+  getControls?: () => Record<string, boolean> | undefined;
   /** Lifecycle callbacks can change readiness during reconciliation. */
   getReadiness?: () => { connected: boolean; spawned: boolean };
-  getConnectionStatus?: () => { state: string; reason?: string; lastError?: string | { code: string; message: string; occurredAt: string; generation: number }; remediation?: string };
+  getConnectionStatus?: () => { state: string; ready?: boolean; reason?: string; cause?: { code: string; message: string }; recovery?: { state: string; attempts?: number; maxAttempts?: number }; lastError?: string | { code: string; message: string; occurredAt: string; generation: number }; remediation?: string };
 }
 
 export interface ProjectionOptions {
@@ -52,12 +53,14 @@ interface Track {
   entity?: Entity; nearby?: boolean; proximityAt?: number;
 }
 export interface WorldFrame {
-  runtimeId: string; worldEpoch: number; context: string; frame: string; observedAt: string;
+  type: "full"; context: string; frame: string; eventCursor: string;
+  runtimeId?: string; worldEpoch?: number; observedAt?: string;
   /** Revision of content observed at frame boundaries, not a physical tick counter. */
-  stateRevision: number; eventCursor: string; connection: unknown; dimension: unknown;
-  self: unknown; players: unknown[]; entities: Record<string, unknown>[];
-  inventory: unknown; window: unknown; actions: unknown[]; navigation: unknown;
-  projection: unknown;
+  stateRevision?: number; connection: unknown; dimension?: unknown;
+  self: unknown; players?: unknown[]; entities: Record<string, unknown>[];
+  inventory: unknown; window?: unknown; actions: unknown[]; navigation?: unknown;
+  projection: unknown; unknownFields?: string[];
+  reset?: { reason: "BASELINE_EXPIRED" | "WORLD_CHANGED" | "PROJECTION_CHANGED" };
 }
 
 /** Only a protocol UUID is sufficient to reconnect an object after an unload. */
@@ -78,27 +81,94 @@ function species(entity: Entity): string | undefined {
   const name = entity.type === "player" || entity.username ? "player" : entity.name?.replace(/^minecraft:/, "");
   return name && /^[a-z][a-z0-9_]*$/.test(name) ? `minecraft:${name}` : undefined;
 }
-function compactItem(value: unknown): unknown {
-  if (!value || typeof value !== "object") return value;
-  const item = value as Record<string, unknown>;
-  return copy(Object.fromEntries(["name", "displayName", "count", "slot", "type", "metadata"].filter((key) => item[key] !== undefined).map((key) => [key, item[key]])));
+/** Extract visible custom-name text from chat JSON or typed chat NBT. */
+function itemNameText(value: unknown, depth = 0): string | undefined {
+  if (depth > 8) return undefined;
+  if (typeof value === "string") {
+    if (/^[\s]*[\[{"]/.test(value)) {
+      try { return itemNameText(JSON.parse(value), depth + 1); } catch { /* Plain names can begin with JSON punctuation. */ }
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    const texts = value.map((entry) => itemNameText(entry, depth + 1)).filter((entry): entry is string => entry !== undefined);
+    return texts.length ? texts.join("") : undefined;
+  }
+  if (!value || typeof value !== "object") return undefined;
+  const name = value as Record<string, unknown>;
+  if (["string", "compound", "list"].includes(String(name.type))) return itemNameText(name.value, depth + 1);
+  const text = itemNameText(name.text, depth + 1);
+  const extra = itemNameText(name.extra, depth + 1);
+  if (text !== undefined || extra !== undefined) return `${text ?? ""}${extra ?? ""}`;
+  const translation = itemNameText(name.translate, depth + 1);
+  if (translation !== undefined) {
+    const parameters = itemNameText(name.with, depth + 1);
+    return `${translation}${parameters ? ` ${parameters}` : ""}`;
+  }
+  return undefined;
+}
+/** Public item facts; getters may read NBT, but raw NBT/components never escape. */
+export function projectItem(value: unknown, detail: "compact" | "full" = "compact"): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const item = value as Record<string, unknown>, result: Record<string, unknown> = {};
+  for (const key of ["name", "displayName"]) {
+    try { if (typeof item[key] === "string") result[key] = item[key]; } catch { /* An unsupported getter does not make the whole item unavailable. */ }
+  }
+  try {
+    const customName = itemNameText(item.customName);
+    if (customName !== undefined) result.customName = customName;
+  } catch { /* An unavailable custom-name getter does not hide other item facts. */ }
+  for (const key of ["count", "slot", "type", "metadata", "durabilityUsed", "maxDurability", ...(detail === "full" ? ["stackSize"] : [])]) {
+    try { if (typeof item[key] === "number" && Number.isFinite(item[key])) result[key] = item[key]; } catch { /* Unsupported protocol getter. */ }
+  }
+  try {
+    const raw = item.enchants;
+    const values = Array.isArray(raw) ? raw : raw && typeof raw === "object" && Array.isArray((raw as Record<string, unknown>).enchantments) ? (raw as { enchantments: unknown[] }).enchantments : undefined;
+    if (values) {
+      const enchants = values.flatMap((value): Record<string, unknown>[] => {
+        if (!value || typeof value !== "object") return [];
+        const enchant = value as Record<string, unknown>;
+        if (typeof enchant.name === "string" && typeof enchant.lvl === "number" && Number.isFinite(enchant.lvl)) return [{ name: enchant.name, lvl: enchant.lvl }];
+        if (Number.isSafeInteger(enchant.id) && Number(enchant.id) >= 0 && Number.isSafeInteger(enchant.level)) return [{ id: enchant.id, level: enchant.level }];
+        return [];
+      });
+      if (enchants.length) result.enchants = enchants;
+    }
+  } catch { /* Unsupported protocol getter. */ }
+  return result;
+}
+
+export function projectEntity(value: unknown, detail: "compact" | "full" = "compact"): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const entity = value as Record<string, unknown>, result: Record<string, unknown> = {};
+  for (const key of ["trackId", "status", "type", "name", "username", ...(detail === "full" ? ["kind", "class", "uuid"] : [])]) if (typeof entity[key] === "string") result[key] = entity[key];
+  for (const key of ["distance", ...(detail === "full" ? ["yaw", "pitch", "height", "width", "minecraftEntityId", "bindingGeneration", "worldEpoch"] : [])]) if (typeof entity[key] === "number" && Number.isFinite(entity[key])) result[key] = entity[key];
+  const position = point(entity.position);
+  if (position) result.position = position;
+  if (detail === "full") {
+    const velocity = point(entity.velocity);
+    if (velocity) result.velocity = velocity;
+    if (typeof entity.onGround === "boolean") result.onGround = entity.onGround;
+  }
+  return result;
 }
 function slotObservation(slots: unknown, fallback: unknown, ready: boolean) {
   const indexed = Array.isArray(slots);
   const values = indexed ? slots : Array.isArray(fallback) ? fallback : null;
   return { ready, known: ready && values !== null && (indexed || values.every((item: any) => item && Number.isSafeInteger(item.slot) && item.slot >= 0)), slotCount: ready && indexed ? slots.length : null,
-    slots: ready ? copy(values) : null, indexed };
+    slots: ready && values ? values.map((item) => item === null ? null : projectItem(item, "full")) : null, indexed };
 }
-function compactSlots(input: ReturnType<typeof slotObservation>) {
+function publicSlots(input: ReturnType<typeof slotObservation>, detail: "compact" | "full" = "compact") {
+  if (!input.known) return { known: false };
   const slots: unknown[] = [];
   for (const [index, value] of (input.slots ?? []).entries()) {
     if (!value || typeof value !== "object") continue;
     const slot = input.indexed ? index : (value as Record<string, unknown>).slot;
     // items() without slot numbers cannot establish an actionable slot index.
     if (!Number.isSafeInteger(slot) || Number(slot) < 0) continue;
-    slots.push({ ...compactItem(value) as Record<string, unknown>, slot });
+    slots.push({ ...projectItem(value, detail), slot });
   }
-  return { ready: input.ready, known: input.known, slotCount: input.slotCount, slots };
+  return { known: true, ...(input.slotCount !== null ? { slotCount: input.slotCount } : {}), slots };
 }
 /** Detach public data without retaining live Mineflayer objects or cyclic references. */
 function copy(value: unknown, seen = new WeakSet<object>(), depth = 0): any {
@@ -135,8 +205,11 @@ export class WorldModel {
   private invalidated = new WeakSet<object>();
   private identities = new Map<string, { username?: string; uuid?: string }>();
   private uuidTracks = new Map<string, string>();
-  private baselines = new Map<string, { signature: string; frame: WorldFrame }>();
-  private observed: Omit<WorldFrame, "frame" | "eventCursor" | "projection" | "entities"> & { entities: Record<string, unknown>[] } | undefined;
+  private baselines = new Map<string, { signature: string; worldEpoch: number; frame: WorldFrame }>();
+  private observed: { runtimeId: string; worldEpoch: number; context: string; observedAt: string; stateRevision: number;
+    connection: Record<string, unknown>; dimension: unknown; self: Record<string, unknown>; players: unknown[];
+    entities: Record<string, unknown>[]; inventory: ReturnType<typeof slotObservation>; window: unknown;
+    actions: unknown[]; navigation: unknown; unknownFields: string[] } | undefined;
   private previousHealth?: number;
   private liveBot?: LiveBot;
   private dictionaryKeys = new WeakMap<object, string>();
@@ -172,7 +245,7 @@ export class WorldModel {
   }
 
   resolveTrack(trackId: string): any {
-    this.validateRuntime(trackId);
+    this.validateRuntime(trackId, ["p", "e"]);
     const track = this.tracks.get(trackId);
     if (!track) throw failure("TRACK_UNKNOWN", `Unknown track '${trackId}'.`, { trackId });
     if (track.worldEpoch !== this.worldEpoch) throw failure("WORLD_CHANGED", `Track '${trackId}' belongs to an earlier world.`, { trackId, expectedWorldEpoch: track.worldEpoch, worldEpoch: this.worldEpoch });
@@ -347,6 +420,21 @@ export class WorldModel {
     const now = new Date().toISOString();
     this.observeHealth(bot, context);
     const nextDimension = copy(bot.game?.dimension);
+    const controls = context.getControls?.() ?? context.controls ?? bot.controlState;
+    const unknownFields: string[] = [];
+    if (ready) {
+      const values = { position: point(bot.entity?.position), yaw: bot.entity?.yaw, pitch: bot.entity?.pitch,
+        health: bot.health, food: bot.food, oxygenLevel: bot.oxygenLevel, quickBarSlot: bot.quickBarSlot,
+        heldItem: bot.heldItem, equipment: bot.entity?.equipment, controls };
+      for (const [key, value] of Object.entries(values)) {
+        const unknown = key === "heldItem" ? value === undefined
+          : key === "equipment" ? !Array.isArray(value)
+          : key === "controls" ? !value || typeof value !== "object" || Array.isArray(value)
+          : key === "position" ? !value : typeof value !== "number" || !Number.isFinite(value);
+        if (unknown) unknownFields.push(`/self/${key}`);
+      }
+      if (bot.currentWindow === undefined) unknownFields.push("/window");
+    }
     const players = context.connected ? Object.entries(bot.players ?? {}).map(([name, player]) => {
       const username = player.username ?? name;
       const uuid = verifiedUuid(player.uuid ?? player.entity?.uuid);
@@ -359,13 +447,14 @@ export class WorldModel {
       dimension: context.connected ? nextDimension ?? null : null,
       self: ready ? { username: bot.username, position: point(bot.entity?.position), velocity: point(bot.entity?.velocity), yaw: bot.entity?.yaw, pitch: bot.entity?.pitch,
         health: bot.health, food: bot.food, foodSaturation: bot.foodSaturation, oxygenLevel: bot.oxygenLevel,
-        experience: copy(bot.experience), controls: copy(context.getControls?.() ?? context.controls ?? bot.controlState ?? {}), equipment: copy(bot.entity?.equipment), heldItem: copy(bot.heldItem), quickBarSlot: bot.quickBarSlot } : { username: bot.username, controls: {} },
+        onGround: bot.entity?.onGround, experience: copy(bot.experience), controls: copy(controls), equipment: Array.isArray(bot.entity?.equipment) ? bot.entity.equipment.map((item) => projectItem(item, "full")) : undefined, heldItem: projectItem(bot.heldItem, "full"), quickBarSlot: bot.quickBarSlot } : {},
       players,
       entities: [...this.tracks.values()].map((track) => this.serializeTrack(track)),
       inventory: slotObservation(bot.inventory?.slots, ready ? bot.inventory?.items?.() : undefined, ready),
       window: ready ? this.serializeWindow(bot.currentWindow) : null,
       actions: copy(context.getActions?.() ?? context.actions ?? []),
       navigation: ready ? { moving: bot.pathfinder?.isMoving?.() ?? false, goal: this.serializeGoal(bot.pathfinder?.goal) } : { moving: false, goal: null },
+      unknownFields,
     };
     // Observation timestamps are excluded so repeated observations do not invent state changes.
     const stable = copy(state);
@@ -399,13 +488,25 @@ export class WorldModel {
       .filter((entity) => entity.distance === undefined || entity.distance <= radius)
       .sort((a, b) => (a.distance ?? Infinity) - (b.distance ?? Infinity) || String(a.trackId).localeCompare(String(b.trackId)))
       .slice(0, limit).map((entity) => this.compactTrack(entity));
-    return { runtimeId: this.runtimeId, worldEpoch: this.worldEpoch, context: encodeActionContext(this.runtimeId, this.worldEpoch), observedAt: new Date().toISOString(), entities };
+    return { context: encodeActionContext(this.runtimeId, this.worldEpoch), connection: this.projectConnection({
+      connected: readiness.connected, spawned: readiness.spawned, ready: readiness.connected && readiness.spawned,
+      ...readiness.getConnectionStatus?.(),
+    }), entities };
   }
 
   frame(bot: unknown, context: ObservationContext, options: ProjectionOptions = {}): any {
-    const projection = this.options(options);
+    let projection = this.options(options);
     this.reconcile(bot, context);
     const state = this.observed!;
+    let resetReason: "BASELINE_EXPIRED" | "WORLD_CHANGED" | "PROJECTION_CHANGED" | undefined;
+    let baseline: { signature: string; worldEpoch: number; frame: WorldFrame } | undefined;
+    if (options.since !== undefined) {
+      this.validateRuntime(options.since, "f");
+      baseline = this.baselines.get(options.since);
+      resetReason = !baseline ? "BASELINE_EXPIRED" : baseline.worldEpoch !== this.worldEpoch ? "WORLD_CHANGED"
+        : baseline.signature !== this.projectionSignature(projection) ? "PROJECTION_CHANGED" : undefined;
+      if (resetReason) projection = { ...projection, detail: "compact" };
+    }
     const preserved = new Set(projection.tracks);
     for (const action of state.actions as any[]) {
       if (action?.state !== "running") continue;
@@ -442,36 +543,43 @@ export class WorldModel {
     const aggregated: Record<string, number> = {};
     for (const { entity } of loaded) if (!selectedIds.has(entity.trackId)) { const kind = String(entity.name ?? entity.class ?? entity.kind); aggregated[kind] = (aggregated[kind] ?? 0) + 1; }
     const compact = projection.detail === "compact";
-    const self = copy(state.self) as any;
-    if (compact) {
-      self.heldItem = compactItem(self.heldItem);
-      if (Array.isArray(self.equipment)) self.equipment = self.equipment.map(compactItem);
-    }
-    const inventory = state.inventory as ReturnType<typeof slotObservation>;
-    const snapshot = copy({ ...state, self, inventory: compact ? compactSlots(inventory) : inventory.slots,
-      window: this.projectWindow(state.window, compact),
-      entities: compact ? selected.map((entity) => this.compactTrack(entity)) : selected,
-      frame: `${this.runtimeId}:f${this.nextFrame++}`, eventCursor: this.events.getCursor(), projection: { ...projection, totalLimit: projection.maxEntities + preserved.size, loaded: loaded.length, included: selected.filter((e) => e.status === "loaded").length, omitted: loaded.length - selected.filter((e) => e.status === "loaded").length, truncated: Object.keys(aggregated).length > 0, aggregates: aggregated, preservedTracks: [...preserved].sort() } }) as WorldFrame;
-    const signature = JSON.stringify(projection);
+    const included = selected.filter((entity) => entity.status === "loaded").length;
+    const snapshot: WorldFrame = {
+      type: "full", context: state.context, frame: encodeHandle(this.runtimeId, "f", this.nextFrame++), eventCursor: this.events.getCursor(),
+      connection: this.projectConnection(state.connection),
+      ...(state.dimension !== null && state.dimension !== undefined ? { dimension: copy(state.dimension) } : {}),
+      self: this.projectSelf(state.self, projection.detail),
+      inventory: publicSlots(state.inventory, projection.detail),
+      ...(state.window ? { window: this.projectWindow(state.window, projection.detail) } : {}),
+      entities: selected.map((entity) => projectEntity(entity, projection.detail)!),
+      actions: this.projectActions(state.actions),
+      projection: { included, omitted: loaded.length - included, ...(Object.keys(aggregated).length ? { aggregates: aggregated } : {}) },
+      ...(state.unknownFields.length ? { unknownFields: [...state.unknownFields] } : {}),
+      ...(resetReason ? { reset: { reason: resetReason } } : {}),
+      ...(!compact ? { runtimeId: state.runtimeId, worldEpoch: state.worldEpoch, observedAt: state.observedAt,
+        stateRevision: state.stateRevision, players: state.players, navigation: state.navigation } : {}),
+    };
+    const signature = this.projectionSignature(projection);
     let result: unknown = snapshot;
-    if (options.since) {
-      this.validateRuntime(options.since);
-      const baseline = this.baselines.get(options.since);
-      const reason = !baseline ? "BASELINE_EXPIRED" : baseline.frame.worldEpoch !== this.worldEpoch ? "WORLD_CHANGED" : baseline.signature !== signature ? "PROJECTION_CHANGED" : undefined;
-      if (!baseline || reason) throw failure("FRAME_RESET_REQUIRED", "The baseline expired, its projection changed, or its world context reset.", { resetRequired: true, reason, frame: options.since, worldEpoch: this.worldEpoch });
-      const changed: Record<string, unknown> = {};
-      for (const key of ["connection", "dimension", "self", "players", "inventory", "window", "actions", "navigation", "projection"] as const) if (JSON.stringify(baseline.frame[key]) !== JSON.stringify(snapshot[key])) changed[key] = snapshot[key];
+    if (baseline && !resetReason) {
+      const changed: Record<string, unknown> = {}, unset: string[] = [];
+      for (const key of ["connection", "dimension", "self", "players", "inventory", "window", "actions", "navigation", "projection", "unknownFields", "reset"] as const) {
+        if (Object.hasOwn(baseline.frame, key) && !Object.hasOwn(snapshot, key)) unset.push(`/${key}`);
+        else if (JSON.stringify(baseline.frame[key]) !== JSON.stringify(snapshot[key])) changed[key] = copy(snapshot[key]);
+      }
       const before = new Map(baseline.frame.entities.map((entity) => [entity.trackId, entity]));
       const after = new Map(snapshot.entities.map((entity) => [entity.trackId, entity]));
       const removed = [...before.keys()].filter((id) => !after.has(id)).map((id) => {
         const status = this.tracks.get(String(id))?.status;
         return { trackId: id, status: status === "loaded" ? "omitted" : status ?? "lost" };
       });
-      const comparable = (entity: Record<string, unknown> | undefined) => entity && Object.fromEntries(Object.entries(entity).filter(([key]) => key !== "lastObservedAt"));
-      changed.entities = snapshot.entities.filter((entity) => JSON.stringify(comparable(entity)) !== JSON.stringify(comparable(before.get(entity.trackId))));
-      result = { runtimeId: snapshot.runtimeId, worldEpoch: snapshot.worldEpoch, context: snapshot.context, frame: snapshot.frame, observedAt: snapshot.observedAt, stateRevision: snapshot.stateRevision, eventCursor: snapshot.eventCursor, since: options.since, delta: { changed, removed } };
+      changed.entities = snapshot.entities.filter((entity) => JSON.stringify(entity) !== JSON.stringify(before.get(entity.trackId)));
+      const beforeOrder = baseline.frame.entities.map((entity) => entity.trackId), afterOrder = snapshot.entities.map((entity) => entity.trackId);
+      result = { type: "delta", context: snapshot.context, frame: snapshot.frame, eventCursor: snapshot.eventCursor,
+        ...(!compact ? { runtimeId: snapshot.runtimeId, worldEpoch: snapshot.worldEpoch, observedAt: snapshot.observedAt, stateRevision: snapshot.stateRevision } : {}),
+        since: options.since, delta: { changed, unset, removed, ...(JSON.stringify(beforeOrder) !== JSON.stringify(afterOrder) ? { entityOrder: afterOrder } : {}) } };
     }
-    this.baselines.set(snapshot.frame, { signature, frame: copy(snapshot) });
+    this.baselines.set(snapshot.frame, { signature, worldEpoch: this.worldEpoch, frame: copy(snapshot) });
     while (this.baselines.size > this.frameRetention) this.baselines.delete(this.baselines.keys().next().value!);
     return result;
   }
@@ -485,8 +593,52 @@ export class WorldModel {
     if (!Number.isFinite(radius) || radius < 0 || radius > 4096) throw badInput("radius must be between 0 and 4096.");
     if (options.tracks && (!Array.isArray(options.tracks) || options.tracks.length > 512 || options.tracks.some((id) => typeof id !== "string"))) throw badInput("tracks must contain at most 512 track IDs.");
     const tracks = [...new Set(options.tracks ?? [])].sort();
-    for (const id of tracks) this.validateRuntime(id);
+    for (const id of tracks) this.validateRuntime(id, ["p", "e"]);
     return { maxEntities, radius, tracks, detail };
+  }
+  private projectionSignature(projection: Required<Omit<ProjectionOptions, "since">>): string {
+    return JSON.stringify({ schema: 3, ...projection });
+  }
+  private projectConnection(connection: Record<string, unknown>): Record<string, unknown> {
+    const ready = connection.ready === true;
+    const result: Record<string, unknown> = { state: typeof connection.state === "string" ? connection.state : ready ? "ready" : connection.connected ? "connecting" : "disconnected", ready };
+    if (!ready) {
+      const cause = connection.cause as { code?: unknown; message?: unknown } | undefined;
+      if (cause && typeof cause.code === "string" && typeof cause.message === "string") result.cause = { code: cause.code, message: cause.message };
+      const recovery = connection.recovery as { state?: unknown; attempts?: unknown; maxAttempts?: unknown } | undefined;
+      if (recovery && typeof recovery.state === "string") result.recovery = { state: recovery.state,
+        ...(typeof recovery.attempts === "number" ? { attempts: recovery.attempts } : {}),
+        ...(typeof recovery.maxAttempts === "number" ? { maxAttempts: recovery.maxAttempts } : {}) };
+    }
+    return result;
+  }
+  private projectSelf(input: Record<string, unknown>, detail: "compact" | "full"): Record<string, unknown> {
+    const self: Record<string, unknown> = {};
+    for (const key of ["position", ...(detail === "full" ? ["velocity"] : [])]) {
+      const value = point(input[key]);
+      if (value) self[key] = value;
+    }
+    for (const key of ["yaw", "pitch", "health", "food", "oxygenLevel", "quickBarSlot", ...(detail === "full" ? ["foodSaturation"] : [])]) if (typeof input[key] === "number" && Number.isFinite(input[key])) self[key] = input[key];
+    if (typeof input.onGround === "boolean") self.onGround = input.onGround;
+    if (input.controls && typeof input.controls === "object") self.controls = Object.entries(input.controls).filter(([key, active]) => ["forward", "back", "left", "right", "jump", "sprint", "sneak"].includes(key) && active === true).map(([key]) => key).sort();
+    if (Array.isArray(input.equipment)) self.equipment = Object.fromEntries(input.equipment.flatMap((value, slot) => value ? [[String(slot), projectItem(value, detail)]] : []));
+    const heldItem = projectItem(input.heldItem, detail);
+    if (heldItem) self.heldItem = heldItem;
+    if (detail === "full") {
+      if (typeof input.username === "string") self.username = input.username;
+      if (input.experience && typeof input.experience === "object") self.experience = Object.fromEntries(Object.entries(input.experience).filter(([key, value]) => ["level", "points", "progress"].includes(key) && typeof value === "number" && Number.isFinite(value)));
+    }
+    return self;
+  }
+  private projectActions(input: unknown[]): Record<string, unknown>[] {
+    const actions = input.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object");
+    const settled = actions.filter((action) => action.state !== "running").slice(-8);
+    return [...actions.filter((action) => action.state === "running"), ...settled].map((action) => {
+      const summary: Record<string, unknown> = {};
+      for (const key of ["action", "kind", "state", "reason", "target"]) if (typeof action[key] === "string") summary[key] = action[key];
+      if (action.error && typeof action.error === "object" && typeof (action.error as Record<string, unknown>).code === "string") summary.error = { code: (action.error as Record<string, unknown>).code };
+      return summary;
+    });
   }
   private serializeGoal(value: unknown): Record<string, unknown> | null {
     if (!value || typeof value !== "object") return null;
@@ -500,8 +652,9 @@ export class WorldModel {
     const target = this.trackFor(goal.entity);
     return { kind: value.constructor.name, parameters, ...(target ? { target } : {}) };
   }
-  private validateRuntime(id: string): void {
-    if (typeof id !== "string" || !id.startsWith(`${this.runtimeId}:`)) throw failure("RUNTIME_MISMATCH", `Handle '${id}' belongs to another runtime.`, { handle: id, runtimeId: this.runtimeId });
+  private validateRuntime(id: string, kind?: "f" | readonly ("p" | "e")[]): void {
+    const handle = decodeHandle(id, kind);
+    if (handle.runtimeId !== this.runtimeId) throw failure("RUNTIME_MISMATCH", "Handle belongs to another runtime.", { handle: id });
   }
   private bind(entity: Entity, now: string): Track {
     const existing = this.bindings.get(entity);
@@ -514,7 +667,7 @@ export class WorldModel {
       if (known && known.status !== "loaded" && known.status !== "dead") track = known;
     }
     if (!track) {
-      track = { trackId: `${this.runtimeId}:${entity.type === "player" || entity.username ? "p" : "e"}${this.nextTrack++}`, ...(uuid ? { uuid } : {}), bindingGeneration: 0,
+      track = { trackId: encodeHandle(this.runtimeId, entity.type === "player" || entity.username ? "p" : "e", this.nextTrack++), ...(uuid ? { uuid } : {}), bindingGeneration: 0,
         worldEpoch: this.worldEpoch, kind: entity.type ?? entity.kind ?? "entity", class: entity.class ?? entity.kind, name: entity.name, username: entity.username, firstSeen: now, lastObservedAt: now, status: "lost" };
       this.tracks.set(track.trackId, track);
       if (uuid) this.uuidTracks.set(uuid, track.trackId);
@@ -569,18 +722,20 @@ export class WorldModel {
     return copy(snapshot);
   }
   private compactTrack(track: Record<string, unknown>): Record<string, unknown> & { trackId: string } {
-    return copy(Object.fromEntries(["trackId", "status", "type", "name", "username", "position", "distance"].filter((key) => track[key] !== undefined).map((key) => [key, track[key]])));
+    return projectEntity(track) as Record<string, unknown> & { trackId: string };
   }
-  private projectWindow(input: unknown, compact: boolean): unknown {
-    if (!input || typeof input !== "object") return null;
-    const { observation, ...window } = input as Record<string, unknown>;
-    const slots = observation as ReturnType<typeof slotObservation>;
-    return compact ? { ...window, ...compactSlots(slots), selectedItem: compactItem(window.selectedItem) } : { ...window, slots: slots.slots };
+  private projectWindow(input: unknown, detail: "compact" | "full"): unknown {
+    if (!input || typeof input !== "object") return undefined;
+    const window = input as Record<string, unknown>, result: Record<string, unknown> = {};
+    for (const key of ["id", "inventoryStart", "inventoryEnd"]) if (typeof window[key] === "number" && Number.isFinite(window[key])) result[key] = window[key];
+    for (const key of ["type", "title"]) if (typeof window[key] === "string") result[key] = window[key];
+    const selectedItem = projectItem(window.selectedItem, detail);
+    return { ...result, ...publicSlots(window.observation as ReturnType<typeof slotObservation>, detail), ...(selectedItem ? { selectedItem } : {}) };
   }
   private serializeWindow(input: unknown): unknown {
     if (!input || typeof input !== "object") return null;
     const window = input as Record<string, unknown>;
     const fallback = typeof window.items === "function" ? window.items.call(window) : typeof window.containerItems === "function" ? window.containerItems.call(window) : undefined;
-    return copy({ id: window.id, type: window.type, title: window.title, observation: slotObservation(window.slots, fallback, true), inventoryStart: window.inventoryStart, inventoryEnd: window.inventoryEnd, selectedItem: window.selectedItem });
+    return { id: window.id, type: window.type, title: typeof window.title === "string" ? window.title : undefined, observation: slotObservation(window.slots, fallback, true), inventoryStart: window.inventoryStart, inventoryEnd: window.inventoryEnd, selectedItem: projectItem(window.selectedItem, "full") };
   }
 }

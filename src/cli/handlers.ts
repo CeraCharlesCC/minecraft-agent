@@ -1,4 +1,5 @@
 export interface StartSessionInput {
+  detail?: "compact" | "full";
   session: string;
   host: string;
   port: number;
@@ -12,6 +13,7 @@ export interface StartSessionInput {
 
 export interface SessionInput {
   session: string;
+  detail?: "compact" | "full";
   context?: string;
   runtimeId?: string;
   worldEpoch?: number;
@@ -245,7 +247,7 @@ export interface CliHandlers {
   lookTrack?(input: EntityInput): Promise<unknown>;
   startSession(input: StartSessionInput): Promise<unknown>;
   sessionStatus(input: SessionInput): Promise<unknown>;
-  listSessions(): Promise<unknown>;
+  listSessions(input?: { detail?: "compact" | "full" }): Promise<unknown>;
   stopSession(input: SessionInput): Promise<unknown>;
   observeEvents(input: EventsInput): Promise<unknown>;
   observeWatch(input: WatchInput): Promise<void>;

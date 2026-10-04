@@ -48,6 +48,45 @@ describe("navigation safety and observation context", () => {
     controller.stop();
   });
 
+  it("settles detached arrival evidence without replacing it with a later position", async () => {
+    const { bot, controller } = runtime();
+    bot.pathfinder.goto.mockImplementation(async () => { bot.entity.position = { x: 5.5, y: 64, z: 0.5 }; });
+    const action = controller.runAction("navigate.goto", ["movement", "look"], () => controller.goto(6, 64, 0, 1));
+    const settlement = await controller.actions.wait(action.action, 1000);
+    expect(settlement).toMatchObject({ state: "completed", timedOut: false, result: {
+      completionReason: "within_range", goal: { x: 6, y: 64, z: 0, range: 1 },
+      finalPosition: { x: 5.5, y: 64, z: 0.5 }, distanceToGoal: Math.sqrt(0.5),
+    } });
+    bot.entity.position.x = 100;
+    expect(controller.actions.get(action.action).result).toEqual(settlement.result);
+    expect((settlement.result as any).finalPosition.x).toBe(5.5);
+    expect(controller.frame().actions.find((entry: any) => entry.action === action.action)).not.toHaveProperty("result");
+    controller.stop();
+  });
+
+  it("reports already within range using GoalNear nodes even when straight distance exceeds range", async () => {
+    const { bot, controller } = runtime();
+    bot.entity.position = { x: 0.9, y: 64, z: 0.9 };
+    const action = controller.runAction("navigate.goto", ["movement", "look"], () => controller.goto(0, 64, 0, 0));
+    const settlement = await controller.actions.wait(action.action, 1000);
+    expect(settlement).toMatchObject({ state: "completed", result: {
+      completionReason: "already_within_range", goal: { x: 0, y: 64, z: 0, range: 0 },
+      finalPosition: { x: 0.9, y: 64, z: 0.9 }, distanceToGoal: Math.sqrt(1.62),
+    } });
+    expect(bot.pathfinder.goto).not.toHaveBeenCalled();
+    controller.stop();
+  });
+
+  it("keeps partial-block GoalNear height correction in the arrival decision", async () => {
+    const { bot, controller } = runtime();
+    Object.assign(bot.entity, { position: { x: 0, y: 64.5, z: 0 }, onGround: true });
+    Object.assign(bot, { blockAt: () => ({ type: 1 }) });
+    const settlement = await controller.goto(0, 65, 0, 0);
+    expect(settlement).toMatchObject({ completionReason: "already_within_range", finalPosition: { y: 64.5 }, distanceToGoal: 0.5 });
+    expect(bot.pathfinder.goto).not.toHaveBeenCalled();
+    controller.stop();
+  });
+
   it.each(["noPath", "timeout"])("does not trust installed goto's empty %s success", async status => {
     const { bot, controller } = runtime();
     bot.pathfinder.goto.mockImplementation((goal) => installedGoto(bot, goal));
@@ -152,7 +191,7 @@ describe("navigation safety and observation context", () => {
     expect(() => controller.validateContext({ context: frame.context, runtimeId: "other" })).toThrow(expect.objectContaining({ code: "BAD_INPUT" }));
     bot.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
     bot.emit("end", "socketClosed");
-    expect(() => controller.validateContext({ context: frame.context })).toThrow(expect.objectContaining({ code: "WORLD_CHANGED", details: expect.objectContaining({ connection: expect.objectContaining({ state: "disconnected", lastError: expect.objectContaining({ code: "EPIPE" }) }) }) }));
+    expect(() => controller.validateContext({ context: frame.context })).toThrow(expect.objectContaining({ code: "WORLD_CHANGED", details: expect.objectContaining({ connection: expect.objectContaining({ state: "disconnected", cause: expect.objectContaining({ code: "EPIPE" }) }) }) }));
     expect(() => controller.validateContext({ context: controller.frame().context })).toThrow(expect.objectContaining({ code: "NOT_READY" }));
     controller.stop();
   });

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { EventStore } from "../src/core/events.js";
 import { encodeActionContext, decodeActionContext } from "../src/core/context.js";
+import { encodeHandle } from "../src/core/handles.js";
 import { WorldModel } from "../src/core/world.js";
 import { goals } from "mineflayer-pathfinder";
 
@@ -10,8 +11,8 @@ function entity(id = 1, x = 5, uuid?: string) {
   return { id, type: "player", username: "Alex", name: "player", uuid, position: { x, y: 64, z: 0 }, velocity: { x: 0, y: 0, z: 0 } };
 }
 function bot(target = entity()) {
-  return { username: "Agent", game: { dimension: "overworld" }, health: 20, food: 20,
-    entity: { id: 0, position: { x: 0, y: 64, z: 0 }, velocity: { x: 0, y: 0, z: 0 } },
+  return { username: "Agent", game: { dimension: "overworld" }, health: 20, food: 20, oxygenLevel: 20, quickBarSlot: 0, heldItem: null, controlState: {},
+    entity: { id: 0, yaw: 0, pitch: 0, onGround: true, equipment: [] as unknown[], position: { x: 0, y: 64, z: 0 }, velocity: { x: 0, y: 0, z: 0 } },
     entities: { "1": target } as Record<string, ReturnType<typeof entity>>,
     players: { Alex: { username: "Alex", uuid: target.uuid, entity: target } },
     inventory: { slots: [{ name: "stone", count: 1, nbt: { tag: "old" } }] },
@@ -35,41 +36,42 @@ describe("observed world model", () => {
     Object.assign(live, { heldItem: { name: "book", count: 1, nbt: { pages: ["huge"] } } });
     Object.assign(live.entity, { equipment: [{ name: "helmet", count: 1, nbt: { enchantments: ["huge"] } }] });
     const first = world.frame(live, ready);
-    expect(first.projection.detail).toBe("compact");
+    expect(first.type).toBe("full");
+    expect(first.projection).toEqual({ included: 1, omitted: 0 });
     expect(first.entities[0]).toEqual({ trackId: expect.any(String), status: "loaded", type: "minecraft:player", name: "player", username: "Alex", position: { x: 5, y: 64, z: 0 }, distance: 5 });
-    expect(first.inventory).toEqual({ ready: true, known: true, slotCount: 46, slots: [{ name: "stone", count: 1, slot: 36 }] });
+    expect(first.inventory).toEqual({ known: true, slotCount: 46, slots: [{ name: "stone", count: 1, slot: 36 }] });
     expect(first.window).toMatchObject({ inventoryStart: 27, inventoryEnd: 63, slotCount: 3, slots: [{ name: "dirt", count: 2, slot: 1 }] });
     expect(first.self.heldItem).toEqual({ name: "book", count: 1 });
-    expect(first.self.equipment).toEqual([{ name: "helmet", count: 1 }]);
+    expect(first.self.equipment).toEqual({ "0": { name: "helmet", count: 1 } });
     live.inventory.slots[36].nbt.tag = "new";
     live.entities[1].velocity.x = 2;
     const delta = world.frame(live, ready, { since: first.frame });
-    expect(delta.stateRevision).toBeGreaterThan(first.stateRevision);
+    expect(delta).not.toHaveProperty("stateRevision");
     expect(delta.delta.changed).toEqual({ entities: [] });
     expect(delta.context).toBe(first.context);
     const full = world.frame(live, ready, { detail: "full" });
     expect(full.entities[0].velocity.x).toBe(2);
-    expect(full.inventory[36].nbt.tag).toBe("new");
-    expect(full.window.slots[1].nbt).toEqual({ huge: "raw" });
-    expect(full.self.heldItem.nbt.pages).toEqual(["huge"]);
+    expect(full.inventory.slots).toEqual([{ name: "stone", count: 1, slot: 36 }]);
+    expect(full.window.slots[0]).toEqual({ name: "dirt", count: 2, slot: 1 });
+    expect(full.self.heldItem).toEqual({ name: "book", count: 1 });
     live.entities[1].position.x = 9;
     live.inventory.slots[36] = null as any;
     const cleared = world.frame(live, ready, { since: first.frame });
-    expect(cleared.delta.changed.inventory).toEqual({ ready: true, known: true, slotCount: 46, slots: [] });
+    expect(cleared.delta.changed.inventory).toEqual({ known: true, slotCount: 46, slots: [] });
     expect(first.inventory.slots[0].count).toBe(1);
     expect(first.entities[0].position.x).toBe(5);
-    code(() => world.frame(live, ready, { since: first.frame, detail: "full" }), "FRAME_RESET_REQUIRED");
+    expect(world.frame(live, ready, { since: first.frame, detail: "full" })).toMatchObject({ type: "full", reset: { reason: "PROJECTION_CHANGED" } });
   });
 
   it("distinguishes unavailable and observed-empty slots without inventing fallback indices", () => {
     const world = new WorldModel(new EventStore()); const live = bot();
     live.inventory.slots = [];
-    expect(world.frame(live, ready).inventory).toEqual({ ready: true, known: true, slotCount: 0, slots: [] });
-    expect(world.frame({ ...live, inventory: undefined }, ready).inventory).toEqual({ ready: true, known: false, slotCount: null, slots: [] });
-    expect(world.frame(live, { connected: false, spawned: false }).inventory).toEqual({ ready: false, known: false, slotCount: null, slots: [] });
+    expect(world.frame(live, ready).inventory).toEqual({ known: true, slotCount: 0, slots: [] });
+    expect(world.frame({ ...live, inventory: undefined }, ready).inventory).toEqual({ known: false });
+    expect(world.frame(live, { connected: false, spawned: false }).inventory).toEqual({ known: false });
     const fallback = world.frame({ ...live, inventory: { items: () => [{ name: "apple", count: 1, slot: 37 }] }, currentWindow: { id: 2, items: () => [{ name: "stone" }] } }, ready);
-    expect(fallback.inventory).toEqual({ ready: true, known: true, slotCount: null, slots: [{ name: "apple", count: 1, slot: 37 }] });
-    expect(fallback.window).toMatchObject({ known: false, slotCount: null, slots: [] });
+    expect(fallback.inventory).toEqual({ known: true, slots: [{ name: "apple", count: 1, slot: 37 }] });
+    expect(fallback.window).toMatchObject({ known: false });
   });
 
   it("searches omitted loaded tracks without consuming baselines or mixing online identities", () => {
@@ -121,16 +123,16 @@ describe("observed world model", () => {
     const first = world.frame(live, ready, { detail: "full" });
     const cursor = first.eventCursor;
     live.entities[1].position.x = 6; live.entities[1].velocity.x = 0.75;
-    live.inventory.slots[0].nbt.tag = "new"; live.currentWindow.slots[0].count = 9;
+    live.inventory.slots[0].count = 3; live.currentWindow.slots[0].count = 9;
     const second = world.frame(live, ready, { detail: "full" });
-    expect(first.entities[0].position.x).toBe(5); expect(first.inventory[0].nbt.tag).toBe("old");
+    expect(first.entities[0].position.x).toBe(5); expect(first.inventory.slots[0].count).toBe(1);
     expect(first.window.slots[0].count).toBe(2);
-    expect(second.entities[0].velocity.x).toBe(0.75); expect(second.inventory[0].nbt.tag).toBe("new");
+    expect(second.entities[0].velocity.x).toBe(0.75); expect(second.inventory.slots[0].count).toBe(3);
     expect(second.eventCursor).toBe(cursor); expect(second.stateRevision).toBeGreaterThan(first.stateRevision);
     const third = world.frame(live, ready, { detail: "full" }); expect(third.stateRevision).toBe(second.stateRevision);
-    first.inventory[0].count = 999;
+    first.inventory.slots[0].count = 999;
     const delta = world.frame(live, ready, { detail: "full", since: first.frame });
-    expect(delta.delta.changed.inventory[0].count).toBe(1);
+    expect(delta.delta.changed.inventory.slots[0].count).toBe(3);
   });
 
   it("does not reconnect reused numeric IDs or proximity without UUID identity", () => {
@@ -175,7 +177,7 @@ describe("observed world model", () => {
   it("keeps unloaded online player identity separate from visible positions", () => {
     const world = new WorldModel(new EventStore()); const live = bot(entity(1, 5, UUID));
     const first = world.frame(live, ready); live.entities = {};
-    const frame = world.frame(live, ready);
+    const frame = world.frame(live, ready, { detail: "full" });
     expect(frame.players[0]).toMatchObject({ username: "Alex", online: true });
     expect(frame.players[0].trackId).toBeUndefined(); expect(frame.players[0].position).toBeUndefined();
     expect(world.playerIdentity(UUID)).toMatchObject({ username: "Alex" });
@@ -190,9 +192,9 @@ describe("observed world model", () => {
     world.reset("disconnect");
     code(() => world.resolveTrack(first.entities[0].trackId), "WORLD_CHANGED");
     const disconnected = world.frame(live, { connected: false, spawned: false });
-    expect(disconnected.entities).toEqual([]); expect(disconnected.window).toBeNull(); expect(disconnected.self.position).toBeUndefined();
+    expect(disconnected.entities).toEqual([]); expect(disconnected.window).toBeUndefined(); expect(disconnected.self.position).toBeUndefined();
     expect(world.frame(live, ready).entities).toEqual([]);
-    code(() => world.frame(live, ready, { since: first.frame }), "FRAME_RESET_REQUIRED");
+    expect(world.frame(live, ready, { since: first.frame })).toMatchObject({ type: "full", reset: { reason: "WORLD_CHANGED" } });
     expect(reset).toHaveBeenCalledWith("disconnect");
   });
 
@@ -200,8 +202,8 @@ describe("observed world model", () => {
     const world = new WorldModel(new EventStore()); const live = bot(); const first = world.frame(live, ready);
     live.game.dimension = "the_nether";
     const next = world.frame(live, ready);
-    expect(next.worldEpoch).toBe(first.worldEpoch + 1); expect(next.dimension).toBe("the_nether"); expect(next.entities).toEqual([]);
-    expect(next.connection.ready).toBe(false); expect(next.self.position).toBeUndefined(); expect(next.window).toBeNull();
+    expect(decodeActionContext(next.context).worldEpoch).toBe(decodeActionContext(first.context).worldEpoch + 1); expect(next.dimension).toBe("the_nether"); expect(next.entities).toEqual([]);
+    expect(next.connection.ready).toBe(false); expect(next.self.position).toBeUndefined(); expect(next.window).toBeUndefined();
   });
 
   it("evaluates proximity from self motion using hysteresis and cooldown", () => {
@@ -225,27 +227,27 @@ describe("observed world model", () => {
     const chosen = all.entities.find((item: any) => item.minecraftEntityId === 3).trackId;
     const projected = world.frame(live, { ...ready, actions: [{ target: far, state: "running" }] }, { maxEntities: 0, radius: 0, tracks: [chosen] });
     expect(projected.entities.map((item: any) => item.trackId).sort()).toEqual([far, chosen].sort());
-    expect(projected.projection).toMatchObject({ omitted: 1, truncated: true, aggregates: { player: 1 } });
+    expect(projected.projection).toMatchObject({ included: 2, omitted: 1, aggregates: { player: 1 } });
   });
 
   it("projects follow goals to compact track references and detects only public navigation changes", () => {
     const world = new WorldModel(new EventStore());
     const target = Object.assign(entity(), { equipment: [{ name: "written_book", nbt: { pages: Array(100).fill("x".repeat(1024)) } }], metadata: { secret: "raw" }, passengers: [{ id: 99 }] });
     const live = Object.assign(bot(target), { pathfinder: { goal: new goals.GoalFollow(target as never, 2), isMoving: () => true } });
-    const first = world.frame(live, ready, { maxEntities: 0 });
+    const first = world.frame(live, ready, { maxEntities: 0, detail: "full" });
     const track = world.trackFor(target);
     expect(first.entities).toEqual([]);
     expect(first.navigation).toEqual({ moving: true, goal: { kind: "GoalFollow", parameters: { x: 5, y: 64, z: 0, rangeSq: 4 }, target: track } });
     expect(JSON.stringify(first.navigation).length).toBeLessThan(300);
     target.equipment[0].nbt.pages[0] = "new raw NBT";
-    const unchanged = world.frame(live, ready, { maxEntities: 0, since: first.frame });
+    const unchanged = world.frame(live, ready, { maxEntities: 0, since: first.frame, detail: "full" });
     expect(unchanged.delta.changed).not.toHaveProperty("navigation");
     expect(unchanged.stateRevision).toBe(first.stateRevision);
     live.pathfinder.goal.rangeSq = 9;
-    const changed = world.frame(live, ready, { maxEntities: 0, since: first.frame });
+    const changed = world.frame(live, ready, { maxEntities: 0, since: first.frame, detail: "full" });
     expect(changed.delta.changed.navigation.goal.parameters.rangeSq).toBe(9);
     expect(first.navigation.goal.parameters.rangeSq).toBe(4);
-    const near = world.frame({ ...live, pathfinder: { goal: new goals.GoalNear(10, 65, 3, 1) } }, ready, { maxEntities: 0 });
+    const near = world.frame({ ...live, pathfinder: { goal: new goals.GoalNear(10, 65, 3, 1) } }, ready, { maxEntities: 0, detail: "full" });
     expect(near.navigation.goal).toEqual({ kind: "GoalNear", parameters: { x: 10, y: 65, z: 3, rangeSq: 1 } });
   });
 
@@ -264,10 +266,10 @@ describe("observed world model", () => {
 
   it("bounds baseline retention and rejects expired or incompatible projection baselines", () => {
     const world = new WorldModel(new EventStore()); const live = bot(); const first = world.frame(live, ready);
-    code(() => world.frame(live, ready, { since: first.frame, radius: 20 }), "FRAME_RESET_REQUIRED");
+    expect(world.frame(live, ready, { since: first.frame, radius: 20 })).toMatchObject({ type: "full", reset: { reason: "PROJECTION_CHANGED" } });
     for (let n = 0; n < 33; n++) world.frame(live, ready);
-    code(() => world.frame(live, ready, { since: first.frame }), "FRAME_RESET_REQUIRED");
-    code(() => world.frame(live, ready, { since: "foreign:f1" }), "RUNTIME_MISMATCH");
+    expect(world.frame(live, ready, { since: first.frame })).toMatchObject({ type: "full", reset: { reason: "BASELINE_EXPIRED" } });
+    code(() => world.frame(live, ready, { since: encodeHandle("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "f", 1) }), "RUNTIME_MISMATCH");
   });
 
   it("captures authoritative action failures at the same observation boundary", () => {
@@ -285,8 +287,8 @@ describe("observed world model", () => {
     world.onWorldReset = () => { spawned = false; };
     live.game.dimension = "the_end";
     const frame = world.frame(live, { ...ready, getReadiness: () => ({ connected: true, spawned }) });
-    expect(frame.connection).toEqual({ connected: true, spawned: false, ready: false });
-    expect(frame.self.position).toBeUndefined(); expect(frame.inventory).toEqual({ ready: false, known: false, slotCount: null, slots: [] }); expect(frame.window).toBeNull();
+    expect(frame.connection).toEqual({ state: "connecting", ready: false });
+    expect(frame.self.position).toBeUndefined(); expect(frame.inventory).toEqual({ known: false }); expect(frame.window).toBeUndefined();
   });
 
   it("accepts the first respawn in a new dimension without resetting that fresh spawn", () => {
@@ -294,16 +296,16 @@ describe("observed world model", () => {
     world.reset("respawn"); live.game.dimension = "the_nether";
     live.entities = { "2": entity(2, 7) };
     const frame = world.frame(live, ready);
-    expect(frame.worldEpoch).toBe(2); expect(frame.connection.ready).toBe(true);
+    expect(decodeActionContext(frame.context).worldEpoch).toBe(2); expect(frame.connection.ready).toBe(true);
     expect(frame.entities).toHaveLength(1); expect(frame.self.position).toEqual(live.entity.position);
   });
 
   it("detaches fallback window item methods when slots are unavailable", () => {
     const world = new WorldModel(new EventStore()); const live = bot();
-    const items = [{ name: "apple", count: 3 }];
+    const items = [{ name: "apple", count: 3, slot: 2 }];
     const frame = world.frame({ ...live, currentWindow: { id: 2, items: () => items } }, ready, { detail: "full" });
     items[0].count = 9;
-    expect(frame.window.slots).toEqual([{ name: "apple", count: 3 }]);
+    expect(frame.window.slots).toEqual([{ name: "apple", count: 3, slot: 2 }]);
   });
 
   it("reports reset reasons and retains only bounded, unusable prior-world baselines", () => {
@@ -311,8 +313,7 @@ describe("observed world model", () => {
     const first = world.frame(live, ready);
     world.reset("respawn");
     expect(events.list(0, 100).find((event) => event.type === "world.reset")).toMatchObject({ reason: "respawn", worldEpoch: 2 });
-    try { world.frame(live, ready, { since: first.frame }); throw new Error("Expected error"); }
-    catch (error) { expect(error).toMatchObject({ code: "FRAME_RESET_REQUIRED", details: { resetRequired: true, reason: "WORLD_CHANGED" } }); }
+    expect(world.frame(live, ready, { since: first.frame })).toMatchObject({ type: "full", reset: { reason: "WORLD_CHANGED" } });
   });
 
   it("bounds lost-track retention and never reuses an evicted handle", () => {
@@ -326,7 +327,7 @@ describe("observed world model", () => {
     const world = new WorldModel(new EventStore()); const live = bot();
     code(() => world.frame(live, ready, { maxEntities: -1 }), "BAD_INPUT");
     code(() => world.frame(live, ready, { radius: Infinity }), "BAD_INPUT");
-    code(() => world.resolveTrack(`${world.runtimeId}:e999`), "TRACK_UNKNOWN");
+    code(() => world.resolveTrack(encodeHandle(world.runtimeId, "e", 999)), "TRACK_UNKNOWN");
   });
   it("ignores delayed callbacks from a retired object after UUID reacquisition", () => {
     const world = new WorldModel(new EventStore()), original = entity(1, 5, UUID), live = bot(original);
@@ -349,14 +350,14 @@ describe("observed world model", () => {
     live.entities[122] = { id: 122, type: "object", name: "item", position: { x: 50, y: 64, z: 0 } };
     const frame = world.frame(live, ready);
     expect(frame.entities).toHaveLength(12);
-    expect(frame.projection).toMatchObject({ maxEntities: 12, loaded: 122, included: 12, omitted: 110 });
+    expect(frame.projection).toMatchObject({ included: 12, omitted: 110 });
     expect(frame.entities.filter((e: any) => e.type === "minecraft:player").map((e: any) => e.username)).toEqual(["Player101", "Player102"]);
     expect(frame.entities.filter((e: any) => e.type === "minecraft:item")).toHaveLength(2);
     expect(frame.entities.filter((e: any) => e.type === "minecraft:cod")).toHaveLength(8);
     const far = world.trackFor(live.entities[121])!;
     const kept = world.frame(live, { ...ready, actions: [{ state: "running", target: far }] });
     expect(kept.entities).toHaveLength(13);
-    expect(kept.projection).toMatchObject({ totalLimit: 13, preservedTracks: [far] });
+    expect(kept.projection).toMatchObject({ included: 13, omitted: 109 });
     expect(world.frame(live, ready, { maxEntities: 1 }).entities).toHaveLength(1);
     expect(world.frame(live, ready, { maxEntities: 0 }).entities).toEqual([]);
     expect(world.frame(live, ready, { radius: 2 }).entities.every((e: any) => e.type === "minecraft:cod")).toBe(true);
@@ -371,7 +372,7 @@ describe("observed world model", () => {
     live.entities[1].position.x = 5; world.updateEntity(live, ready, live.entities[1]);
     expect(world.searchLoaded(live, ready).entities[0].position).toEqual(live.entities[1].position);
     const second = world.frame(live, ready, { since: first.frame });
-    expect(second.stateRevision).toBe(first.stateRevision);
+    expect(second).not.toHaveProperty("stateRevision");
     expect(second.eventCursor).not.toBe(first.eventCursor);
     expect(events.list(0, 20)).toEqual(expect.arrayContaining([expect.objectContaining({ type: "self.damaged", health: 5, amount: 15 })]));
   });

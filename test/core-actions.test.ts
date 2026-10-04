@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { ActionManager } from "../src/core/actions.js";
+import { ActionManager, projectAction } from "../src/core/actions.js";
 import { EventStore } from "../src/core/events.js";
 import { CliError } from "../src/output/errors.js";
 
@@ -17,6 +17,36 @@ function setup(history = 256) {
 }
 
 describe("runtime action ownership", () => {
+  it("projects public action fields explicitly and keeps frame summaries bounded", async () => {
+    const { actions, events } = setup();
+    const work = deferred<{ completionReason: string; finalPosition: { x: number; y: number; z: number } }>();
+    const record = actions.start("navigate.goto", 1, ["movement"], { target: `${events.runtimeTag}:e1`, run: () => work.promise });
+    expect(projectAction(record)).toEqual({ action: record.action, kind: "navigate.goto", state: "running", target: `${events.runtimeTag}:e1` });
+    expect(record.action).toBe(`${events.runtimeTag}:a1`);
+    work.resolve({ completionReason: "within_range", finalPosition: { x: 1, y: 2, z: 3 } });
+    const result = await actions.wait(record.action, 1000);
+    expect(projectAction(result)).toEqual({ action: record.action, kind: "navigate.goto", state: "completed", target: record.target,
+      timedOut: false, result: { completionReason: "within_range", finalPosition: { x: 1, y: 2, z: 3 } } });
+    expect(actions.observation()).toEqual([{ action: record.action, kind: "navigate.goto", state: "completed", target: record.target }]);
+    expect(events.query().events.at(-1)?.result).toEqual(result.result);
+    expect(projectAction(result, { detail: "full" })).toMatchObject({ runtimeId: events.runtimeId, worldEpoch: 1, startedAt: result.startedAt, finishedAt: result.finishedAt });
+    const failure = actions.start("entity.attack", 1, ["item"], { run: () => { throw new CliError("DAEMON_ERROR", "account@example.com at private.example:25565", "retry", 1, { runtimeId: events.runtimeId, bindingGeneration: 4, connection: { username: "secret" }, outcomeUnknown: true }); } });
+    const publicFailure = projectAction(failure);
+    expect(publicFailure.error).toMatchObject({ code: "DAEMON_ERROR", details: { outcomeUnknown: true } });
+    expect(JSON.stringify(publicFailure)).not.toMatch(/private|account|bindingGeneration|runtimeId|startedAt|secret/);
+    expect(actions.observation().at(-1)?.error).toEqual({ code: "DAEMON_ERROR" });
+    const timedOut = await actions.wait(actions.start("follow", 1, [], { continuous: true }).action, 0);
+    expect(projectAction(timedOut).timedOut).toBe(true);
+  });
+
+  it("rejects malformed action handles before lookup", () => {
+    const { actions, events } = setup();
+    for (const id of ["another:a1", `${events.runtimeTag}:a01`, `${events.runtimeTag}:a0`, `${events.runtimeTag}:a1\n`, `${events.runtimeTag}:s1`, `${events.runtimeId}:a1`]) {
+      expect(() => actions.get(id)).toThrow(expect.objectContaining({ code: "BAD_INPUT" }));
+    }
+    expect(() => actions.get(`${events.runtimeTag}:a1`)).toThrow(expect.objectContaining({ code: "ACTION_UNKNOWN" }));
+  });
+
   it("waits for settlement and returns detached results", async () => {
     const { actions } = setup();
     const work = deferred<{ value: number }>();
@@ -68,7 +98,7 @@ describe("runtime action ownership", () => {
     await rejection;
     expect(actions.get(action.action).state).toBe("running");
     for (const timeout of [-1, NaN, 30001, 0.5]) expect(() => actions.wait(action.action, timeout)).toThrow(expect.objectContaining({ code: "BAD_INPUT" }));
-    expect(() => actions.wait("another:a1")).toThrow(expect.objectContaining({ code: "RUNTIME_MISMATCH" }));
+    expect(() => actions.wait(setup().actions.start("foreign", 1, [], { continuous: true }).action)).toThrow(expect.objectContaining({ code: "RUNTIME_MISMATCH" }));
     actions.cancel(action.action);
   });
   it("returns promptly then reports detached completion results", async () => {

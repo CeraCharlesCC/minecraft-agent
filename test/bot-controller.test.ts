@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import { Vec3 } from "vec3";
 import { describe, expect, it, vi } from "vitest";
 import { EventStore } from "../src/core/events.js";
+import { projectAction } from "../src/core/actions.js";
 import { BotController } from "../src/daemon/bot.js";
 
 class FakeBot extends EventEmitter {
@@ -134,7 +135,8 @@ describe("BotController", () => {
     bot.emit("spawn");
     const found = subject.findEntities({ radius: 16 });
     expect(found.entities.map((item: any) => item.type)).toEqual(["minecraft:cow", "minecraft:player", "minecraft:sniffer"]);
-    expect(found).toMatchObject({ runtimeId: subject.world.runtimeId, worldEpoch: subject.world.worldEpoch, context: expect.stringMatching(/^mcctx1\./), observedAt: expect.any(String) });
+    expect(found).toMatchObject({ context: expect.stringMatching(/^c2\./) });
+    expect(found).not.toHaveProperty("runtimeId");
     const player = found.entities[1];
     subject.validateContext({ context: found.context });
     await subject.activateEntity(player.trackId);
@@ -147,6 +149,74 @@ describe("BotController", () => {
     bot.emit("end", "socketClosed");
     expect(subject.findEntities({}).entities).toEqual([]);
     expect(() => subject.validateContext({ context: found.context })).toThrow("World context has changed");
+    subject.stop();
+  });
+
+  it("publishes only a validated game username obtained after login", () => {
+    const bot = new FakeBot(); bot.username = "private-account@example.com";
+    const subject = new BotController({ host: "private.server.example", port: 25565, username: bot.username, auth: "microsoft" }, new EventStore(), () => bot);
+    subject.start();
+    expect(subject.status()).not.toHaveProperty("username");
+    expect(JSON.stringify(subject.status({ detail: "full" }))).not.toContain("private-account");
+    bot.username = "GameAgent"; bot.emit("login");
+    expect(subject.status()).toMatchObject({ username: "GameAgent", ready: false });
+    bot.emit("error", Object.assign(new Error("private-account@example.com at private.server.example"), { code: "private-account@example.com" }));
+    for (const response of [subject.status(), subject.diagnose()]) {
+      expect(JSON.stringify(response)).not.toContain("private-account");
+      expect(JSON.stringify(response)).not.toContain("private.server");
+    }
+    expect(subject.status().connection.cause?.code).toBe("CONNECTION_ERROR");
+    subject.stop();
+  });
+
+  it("preserves score values, display text, and team formatting through explicit query projections", () => {
+    const { subject, bot } = controller(); bot.emit("spawn");
+    const scoreboard = { name: "points", title: "Team points", items: [{ name: "Steve", value: 0, displayName: { toString: () => "[Red] Steve" }, nbt: "PRIVATE" }], raw: "PRIVATE" };
+    bot.scoreboards = { points: scoreboard } as any;
+    const positions = Object.create({ get sidebar(): unknown { return (this as any)[1]; } }); positions[1] = scoreboard;
+    bot.scoreboard = positions;
+    const team = { team: "red", name: { toString: () => "Red team" }, prefix: { text: "[Red] " }, suffix: { text: "!" }, color: "red", members: ["Steve"], raw: "PRIVATE" };
+    bot.teams = { red: team } as any; bot.teamMap = { Steve: team } as any;
+    expect(subject.scoreboards()).toMatchObject({ scoreboards: { points: { title: "Team points", items: [{ name: "Steve", value: 0, displayName: "[Red] Steve" }] } }, scoreboard: { sidebar: { name: "points" } } });
+    expect(subject.teams()).toMatchObject({ teams: { red: { name: "Red team", prefix: "[Red] ", suffix: "!", color: "red", members: ["Steve"] } }, teamMap: { Steve: "red" } });
+    expect(JSON.stringify([subject.scoreboards(), subject.teams()])).not.toContain("PRIVATE");
+    subject.stop();
+  });
+
+  it("distinguishes unavailable queries from a known empty or closed observation", () => {
+    const { subject, bot } = controller();
+    for (const query of [() => subject.position(), () => subject.inventory(), () => subject.controls(), () => subject.windowStatus(), () => subject.blockInfo(1, 2, 3)]) expect(query()).toEqual({ known: false });
+    bot.emit("spawn");
+    bot.currentWindow = null as any; bot.heldItem = null as any;
+    expect(subject.windowStatus()).toEqual({ known: true });
+    expect(subject.inventory()).toMatchObject({ known: true, items: expect.any(Array), quickBarSlot: 0 });
+    expect(subject.inventory()).not.toHaveProperty("heldItem");
+    delete (bot as any).currentWindow;
+    expect(subject.windowStatus()).toEqual({ known: false });
+    subject.stop();
+  });
+
+  it("keeps unacquired controls unknown in ready daemon frames", () => {
+    const { subject, bot } = controller(); bot.emit("spawn");
+    bot.controlState = undefined as any;
+    const frame = subject.frame();
+    expect(frame.connection.ready).toBe(true);
+    expect(frame.self).not.toHaveProperty("controls");
+    expect(frame.unknownFields).toContain("/self/controls");
+    expect(subject.controls()).toEqual({ known: false });
+    bot.controlState = { forward: false };
+    const known = subject.frame();
+    expect(known.self.controls).toEqual([]);
+    expect(known.unknownFields ?? []).not.toContain("/self/controls");
+    subject.stop();
+  });
+
+  it("explains a known game precondition in a public failed action", async () => {
+    const { subject, bot } = controller(); bot.emit("spawn");
+    const action = subject.runAction("item.equip", ["item"], () => subject.equip("diamond", "hand"));
+    const result = projectAction(await subject.actions.wait(action.action, 1000));
+    expect(result).toMatchObject({ state: "failed", error: { code: "COMMAND_BLOCKED", message: "Item 'diamond' is not in inventory." } });
+    expect(result).not.toHaveProperty("runtimeId");
     subject.stop();
   });
 
@@ -175,40 +245,40 @@ describe("BotController", () => {
 
   it("distinguishes connection startup from terminal disconnect and retains the kick reason in frames", () => {
     const { subject, bot } = controller();
-    expect(subject.status().connection).toMatchObject({ state: "connecting", remediation: expect.stringContaining("device login") });
+    expect(subject.status().connection).toMatchObject({ state: "connecting", ready: false, recovery: { state: "disabled" } });
     bot.emit("spawn");
     expect(subject.frame().connection).toMatchObject({ state: "ready", ready: true });
     bot.emit("kicked", { text: "Server maintenance" });
     bot.emit("end", "socketClosed");
     const frame = subject.frame();
     expect(frame.connection).toMatchObject({
-      state: "disconnected", connected: false, spawned: false, ready: false,
-      reason: 'KICKED: {"text":"Server maintenance"}',
-      remediation: expect.stringContaining("restart the session explicitly"),
+      state: "disconnected", ready: false,
+      cause: { code: "SERVER_REJECTED" }, recovery: { state: "intervention_required" },
     });
-    expect(subject.status().connection).toMatchObject({ state: "disconnected", reason: frame.connection.reason });
-    expect(() => subject.validateContext({ runtimeId: frame.runtimeId, worldEpoch: frame.worldEpoch })).toThrow(expect.objectContaining({
-      code: "NOT_READY", details: expect.objectContaining({ state: "disconnected" }), remediation: expect.stringContaining("session stop"),
+    expect(subject.status().connection).toMatchObject({ state: "disconnected", cause: frame.connection.cause });
+    expect(() => subject.validateContext({ context: frame.context })).toThrow(expect.objectContaining({
+      code: "NOT_READY", details: expect.objectContaining({ state: "disconnected" }), remediation: expect.stringContaining("connection is ready"),
     }));
     bot.emit("login");
-    expect(subject.status().connection).toMatchObject({ state: "disconnected", reason: frame.connection.reason });
+    expect(subject.status().connection).toMatchObject({ state: "disconnected", cause: frame.connection.cause });
     bot.emit("spawn");
-    expect(subject.frame().connection).toMatchObject({ state: "disconnected", ready: false, reason: frame.connection.reason });
+    expect(subject.frame().connection).toMatchObject({ state: "disconnected", ready: false, cause: frame.connection.cause });
   });
 
-  it("preserves nested protocol kick reasons instead of reducing them to object strings", () => {
+  it("projects nested protocol kick reasons without exposing raw protocol data", () => {
     const { subject, bot } = controller();
     const reason = { type: "compound", value: { translate: { type: "string", value: "multiplayer.disconnect.kicked" } } };
     bot.emit("kicked", reason);
     bot.emit("end", "socketClosed");
-    expect(subject.status().connection.reason).toBe(`KICKED: ${JSON.stringify(reason)}`);
-    expect(subject.frame().connection.reason).toBe(`KICKED: ${JSON.stringify(reason)}`);
+    expect(subject.status().connection.cause?.code).toBe("SERVER_REJECTED");
+    expect(subject.frame().connection.cause.code).toBe("SERVER_REJECTED");
+    expect(JSON.stringify(subject.status())).not.toContain("multiplayer.disconnect.kicked");
   });
 
   it("records lifecycle and message events", () => {
     const { subject, bot, events } = controller();
     bot.emit("spawn");
-    expect(subject.status()).toMatchObject({ connected: true, spawned: true });
+    expect(subject.status()).toMatchObject({ ready: true });
     bot.emit("whisper", "Alex", "secret", undefined, { text: "secret" });
     bot.emit("message", { toString: () => "server says hi" }, "system", "Server");
     bot.emit("death");
@@ -221,7 +291,7 @@ describe("BotController", () => {
     bot.emit("end");
 
     subject.flushChat();
-    expect(subject.status()).toMatchObject({ connected: false, spawned: false, lastError: "bad" });
+    expect(subject.status()).toMatchObject({ ready: false, connection: { cause: { code: "SERVER_REJECTED" } } });
     expect(events.list(0, 50)).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: "connection.ready" }),
       expect.objectContaining({ type: "chat.unverified", candidateSender: "Alex", claimedChannel: "whisper", text: "secret" }),
@@ -261,13 +331,14 @@ describe("BotController", () => {
     subject.flushChat();
     bot.emit("error", "plain-error");
 
-    expect(subject.status()).toMatchObject({ username: "FallbackBot", lastError: "plain-error" });
+    expect(subject.status()).not.toHaveProperty("username");
+    expect(JSON.stringify(subject.status())).not.toContain("FallbackBot");
     bot.entity = undefined as unknown as FakeBot["entity"];
     bot.game = undefined as unknown as FakeBot["game"];
     bot.inventory = undefined as unknown as FakeBot["inventory"];
     bot.heldItem = null as unknown as FakeBot["heldItem"];
-    expect(subject.position()).toEqual({ position: undefined, dimension: undefined });
-    expect(subject.inventory()).toMatchObject({ items: [] });
+    expect(subject.position()).toEqual({ known: false });
+    expect(subject.inventory()).toEqual({ known: false });
     subject.flushChat();
     expect(events.list(0, 10)).toEqual(
       expect.arrayContaining([
@@ -280,23 +351,23 @@ describe("BotController", () => {
   it("exposes world observations and pathfinding state", async () => {
     const { subject, bot } = controller();
 
+    bot.emit("spawn");
     expect(subject.players()).toMatchObject({
-      players: [expect.objectContaining({ username: "Steve", entityId: 11, distance: 3 })],
+      players: [expect.objectContaining({ username: "Steve", distance: 3 })],
     });
     expect(subject.entities(10, 5)).toMatchObject({
-      entities: expect.arrayContaining([expect.objectContaining({ id: 10, name: "cow", distance: 2 })]),
+      entities: expect.arrayContaining([expect.objectContaining({ name: "cow", distance: 2, trackId: expect.any(String) })]),
     });
     expect(subject.tablist()).toMatchObject({ tablist: { header: "Welcome" } });
     expect(subject.scoreboards()).toMatchObject({ scoreboards: { main: { name: "main" } } });
     expect(subject.teams()).toMatchObject({ teams: { red: { name: "red" } } });
-    expect(subject.controls()).toEqual({ controlState: { forward: false } });
+    expect(subject.controls()).toEqual({ known: true, controls: [] });
     expect(subject.blockAt(4, 5, 6)).toMatchObject({ block: { name: "dirt", position: { x: 4, y: 5, z: 6 } } });
     expect(subject.blockInfo(4, 5, 6)).toMatchObject({ canDig: true, digTimeMs: 250 });
     expect(subject.blockInSight(256, 5)).toMatchObject({ block: { name: "dirt", position: { x: 2, y: 2, z: 2 } } });
     expect(subject.blockAtCursor(5)).toMatchObject({ block: { name: "dirt", position: { x: 3, y: 3, z: 3 } } });
     expect(subject.findBlocks("dirt", 16, 3)).toMatchObject({ blocks: [{ name: "dirt", position: { x: 1, y: 2, z: 3 } }] });
 
-    bot.emit("spawn");
     bot.pathfinder.goto.mockImplementation(async (...args: unknown[]) => {
       const goal = args[0] as { x: number; y: number; z: number };
       bot.entity.position = { x: goal.x, y: goal.y, z: goal.z };
@@ -318,23 +389,24 @@ describe("BotController", () => {
     movements.maxDropDown = 4;
     await subject.goto(12, 64, -2, 1);
     expect(bot.pathfinder.movements).toMatchObject({ canDig: false, allowSprinting: false, maxDropDown: 2 });
-    await expect(subject.collectItem(10, 1)).resolves.toMatchObject({ collectedTarget: { id: 10 } });
+    await expect(subject.collectItem(10, 1)).resolves.toMatchObject({ collectedTarget: { name: "cow", trackId: expect.any(String) } });
     expect(subject.stopNavigation()).toEqual({ stopped: true });
     expect(bot.pathfinder.stop).toHaveBeenCalled();
   });
 
   it("equips items and interacts with blocks", async () => {
     const { subject, bot } = controller();
+    bot.emit("spawn");
 
     subject.sendWhisper("Steve", "hi");
     expect(bot.whisper).toHaveBeenCalledWith("Steve", "hi");
     await expect(subject.tabComplete("/gi", true, false, 1000)).resolves.toEqual({ matches: ["hello"] });
     subject.setControl("forward", true);
     expect(bot.setControlState).toHaveBeenCalledWith("forward", true);
-    expect(subject.controls()).toEqual({ controlState: { forward: true } });
+    expect(subject.controls()).toEqual({ known: true, controls: ["forward"] });
     expect(subject.clearControls()).toEqual({ cleared: true });
     expect(bot.clearControlStates).toHaveBeenCalled();
-    expect(subject.controls()).toEqual({ controlState: { forward: false } });
+    expect(subject.controls()).toEqual({ known: true, controls: [] });
     await subject.look(1, 0.5, true);
     expect(bot.look).toHaveBeenCalledWith(1, 0.5, true);
 
@@ -368,7 +440,6 @@ describe("BotController", () => {
     await expect(subject.craft("stick", 1, undefined, 0)).resolves.toMatchObject({ recipeIndex: 0 });
     await expect(subject.craft("stick", 1, undefined, undefined, "recipe")).resolves.toMatchObject({ recipeId: "recipe" });
 
-    bot.emit("spawn");
     const dug = subject.runAction("world.dig", ["movement", "look", "item"], () => subject.dig(1, 2, 3));
     expect(await subject.actions.wait(dug.action, 1000)).toMatchObject({ state: "completed", result: { dug: true, block: { name: "dirt" } } });
     expect(bot.digCalls).toHaveBeenCalledWith(expect.objectContaining({ name: "dirt" }), true);
@@ -377,7 +448,7 @@ describe("BotController", () => {
     const placed = subject.runAction("world.place", ["look", "item"], () => subject.place(1, 2, 3, "east", "dirt"));
     expect(await subject.actions.wait(placed.action, 1000)).toMatchObject({ state: "completed", result: { placed: true, face: "east" } });
     expect(bot.placeBlockCalls).toHaveBeenCalledWith(expect.objectContaining({ name: "dirt" }), expect.objectContaining({ x: 1, y: 0, z: 0 }));
-    await expect(subject.placeEntity(1, 2, 3, "up", "dirt")).resolves.toMatchObject({ placed: true, entity: { id: 12 } });
+    await expect(subject.placeEntity(1, 2, 3, "up", "dirt")).resolves.toMatchObject({ placed: true, entity: { name: "boat" } });
     await expect(subject.activate(1, 2, 3)).resolves.toMatchObject({ activated: true, block: { name: "dirt" } });
     expect(bot.activateBlockCalls).toHaveBeenCalledWith(expect.objectContaining({ name: "dirt" }));
     expect(subject.updateSign(1, 2, 3, "hello", false)).toMatchObject({ updated: true });
@@ -385,24 +456,24 @@ describe("BotController", () => {
     await expect(subject.wake()).resolves.toEqual({ awake: true });
     await expect(subject.elytraFly()).resolves.toEqual({ flying: true });
 
-    await expect(subject.openWindowAt(1, 2, 3)).resolves.toMatchObject({ opened: true, window: { id: 1, items: [{ name: "dirt" }] } });
-    await expect(subject.openEntityWindow(10)).resolves.toMatchObject({ opened: true, entity: { id: 10 }, window: { id: 1 } });
-    expect(subject.windowStatus()).toMatchObject({ window: { id: 1, type: "minecraft:chest" } });
+    await expect(subject.openWindowAt(1, 2, 3)).resolves.toMatchObject({ opened: true, window: { type: "minecraft:chest", slots: [{ name: "dirt" }] } });
+    await expect(subject.openEntityWindow(10)).resolves.toMatchObject({ opened: true, entity: { name: "cow" }, window: { type: "minecraft:chest" } });
+    expect(subject.windowStatus()).toMatchObject({ window: { type: "minecraft:chest" } });
     await expect(subject.windowDeposit("dirt", 1)).resolves.toMatchObject({ deposited: "dirt", count: 1 });
     await expect(subject.windowWithdraw("dirt", 1)).resolves.toMatchObject({ withdrew: "dirt", count: 1 });
-    await expect(subject.windowClick(5, 0, 0)).resolves.toMatchObject({ clicked: true, slot: 5, window: { id: 1 } });
+    await expect(subject.windowClick(5, 0, 0)).resolves.toMatchObject({ clicked: true, slot: 5, window: { type: "minecraft:chest" } });
     expect(bot.clickWindow).toHaveBeenCalledWith(5, 0, 0);
     expect(subject.closeWindow()).toEqual({ closed: true });
 
-    await expect(subject.activateEntity(10)).resolves.toMatchObject({ activated: true, entity: { id: 10 } });
-    expect(subject.useOnEntity(10)).toMatchObject({ usedOn: true, entity: { id: 10 } });
+    await expect(subject.activateEntity(10)).resolves.toMatchObject({ activated: true, entity: { name: "cow" } });
+    expect(subject.useOnEntity(10)).toMatchObject({ usedOn: true, entity: { name: "cow" } });
     expect(subject.findEntities({ name: "cow", radius: 16, limit: 5, includePassive: true })).toMatchObject({ entities: [expect.objectContaining({ trackId: expect.any(String), type: "minecraft:cow", status: "loaded" })] });
     expect(() => subject.attackEntity(10)).toThrow("Refusing to attack a passive mob");
-    expect(subject.attackEntity(10, { allowPassive: true })).toMatchObject({ attacked: true, entity: { id: 10 } });
+    expect(subject.attackEntity(10, { allowPassive: true })).toMatchObject({ attacked: true, entity: { name: "cow" } });
     expect(subject.findEntities({ name: "sniffer", radius: 16, limit: 5 })).toMatchObject({ entities: [expect.objectContaining({ type: "minecraft:sniffer", status: "loaded" })] });
     expect(() => subject.attackEntity(12)).toThrow("Refusing to attack a passive mob");
     expect(subject.swingArm("right", true)).toEqual({ swung: true, hand: "right", showHand: true });
-    expect(subject.mountEntity(10)).toMatchObject({ mounted: true, entity: { id: 10 } });
+    expect(subject.mountEntity(10)).toMatchObject({ mounted: true, entity: { name: "cow" } });
     expect(subject.dismount()).toEqual({ dismounted: true });
     expect(subject.moveVehicle(0.5, 1)).toEqual({ moved: true, left: 0.5, forward: 1 });
   });

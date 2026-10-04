@@ -32,6 +32,7 @@ async function setup() {
     const response = await fetch(`http://127.0.0.1:${port}${path}`, { method: body === undefined ? "GET" : "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}) });
+    expect(response.headers.get("X-MC-Agent-API")).toBe("3");
     return { status: response.status, body: await response.json() as any };
   };
   const cleanup = async () => {
@@ -51,7 +52,7 @@ describe("daemon lifecycle routes", () => {
       expect(initial.body).toMatchObject({ daemonResponsive: true, ready: false, connection: { authentication: { state: "unknown" } } });
       const recovery = request("/ensure-ready", { timeout: 500, maxAttempts: 1, backoff: 0 });
       bot.emit("login");
-      expect((await request("/status")).body).toMatchObject({ spawned: false, connected: true });
+      expect((await request("/status")).body).toMatchObject({ ready: false, connection: { state: "waiting_for_spawn" } });
       bot.emit("spawn");
       expect((await recovery).body).toMatchObject({ ready: true, timedOut: false });
       expect(create).toHaveBeenCalledOnce();
@@ -66,7 +67,7 @@ describe("daemon lifecycle routes", () => {
     const log = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       const stop = await request("/stop", {});
-      expect(stop.body).toMatchObject({ stopping: true, stopped: false, persistenceError: { code: "ENOSPC", message: "disk full" } });
+      expect(stop.body).toMatchObject({ stopping: true, stopped: false, persistenceError: { code: "ENOSPC" } });
       expect(bot.quit).toHaveBeenCalledOnce();
       for (let i = 0; i < 400 && await readSession("lifecycle", dir); i++) await new Promise((resolve) => setTimeout(resolve, 5));
       expect(await readSession("lifecycle", dir)).toBeUndefined();
@@ -77,12 +78,11 @@ describe("daemon lifecycle routes", () => {
   it("accepts truthful stop, aborts recovery, closes daemon and releases matching record", async () => {
     const { request, cleanup, dir } = await setup();
     try {
-      const before = await readSession("lifecycle", dir);
       const recovery = request("/ensure-ready", { timeout: 120_000, maxAttempts: 1 });
       await new Promise((resolve) => setTimeout(resolve, 10));
       const stops = await Promise.all([request("/stop", {}), request("/stop", {})]);
       for (const stop of stops)
-        expect(stop.body).toMatchObject({ stopping: true, stopped: false, runtimeId: before!.runtimeId, pid: process.pid });
+        expect(stop.body).toEqual({ stopping: true, stopped: false });
       expect((await recovery).body).toMatchObject({ ready: false, connection: { state: "stopping" } });
       for (let i = 0; i < 400 && await readSession("lifecycle", dir); i++) await new Promise((resolve) => setTimeout(resolve, 5));
       expect(await readSession("lifecycle", dir)).toBeUndefined();

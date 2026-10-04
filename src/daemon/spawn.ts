@@ -41,7 +41,8 @@ async function waitForDaemon(session: string, timeoutMs: number): Promise<void> 
       try {
         await daemonRequest(record, "/status");
         return;
-      } catch {
+      } catch (error) {
+        if (error instanceof CliError && error.code === "DAEMON_INCOMPATIBLE") throw error;
         // Keep polling until the daemon finishes binding and accepting requests.
       }
     }

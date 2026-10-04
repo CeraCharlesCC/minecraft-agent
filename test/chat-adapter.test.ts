@@ -16,7 +16,7 @@ function adapter() {
   require("mineflayer/lib/plugins/chat.js")(bot, {});
   const events = new EventStore();
   const chat = new CanonicalChat(events, (username, uuid) => {
-    if (uuid === ALEX_UUID || username === "Alex") return { username: "Alex", uuid: ALEX_UUID, trackId: `${events.runtimeId}:p1` };
+    if (uuid === ALEX_UUID || username === "Alex") return { username: "Alex", uuid: ALEX_UUID, trackId: `${events.runtimeTag}:p1` };
     if (uuid === SELF_UUID || username === "AgentBot") return { username: "AgentBot", uuid: SELF_UUID };
     return undefined;
   });
@@ -79,7 +79,7 @@ describe("installed Mineflayer chat adapter", () => {
     expect(events.query().events).toEqual([
       expect.objectContaining({ type: "chat.whisper", text: "secret", direction: "outgoing", sender: "AgentBot",
         senderIdentity: { username: "AgentBot", uuid: SELF_UUID },
-        recipientIdentity: { username: "Alex", uuid: ALEX_UUID, trackId: `${events.runtimeId}:p1` }, attribution: "structured" }),
+        recipientIdentity: { username: "Alex", uuid: ALEX_UUID, trackId: `${events.runtimeTag}:p1` }, attribution: "structured" }),
       expect.objectContaining({ type: "chat.whisper", text: "secret", direction: "incoming", sender: "Alex", attribution: "structured" }),
       expect.objectContaining({ type: "chat.whisper", text: "secret", direction: "incoming", sender: "Alex", attribution: "structured" }),
     ]);
@@ -97,7 +97,7 @@ describe("installed Mineflayer chat adapter", () => {
     expect(events.query().events).toEqual([expect.objectContaining({
       type: "chat.player", sender: "Alex", text: "bring stone", team: "Builders",
       direction: translation.endsWith("sent") ? "outgoing" : "incoming", attribution: "verified", verified: true,
-      senderIdentity: { username: "Alex", uuid: ALEX_UUID, trackId: `${events.runtimeId}:p1` },
+      senderIdentity: { username: "Alex", uuid: ALEX_UUID, trackId: `${events.runtimeTag}:p1` },
     })]);
   });
 

@@ -1,8 +1,9 @@
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { BotOptions, BotController, CreateBotFn } from "./bot.js";
-import { CliError, badInput } from "../output/errors.js";
-import { ActionResource } from "../core/actions.js";
-import { EventStore, eventMatchesFilter, resolveEventFilter } from "../core/events.js";
+import { CliError, badInput, publicError } from "../output/errors.js";
+import { API_VERSION, API_VERSION_HEADER } from "./client.js";
+import { ActionResource, projectAction } from "../core/actions.js";
+import { EventStore, projectEvent, eventMatchesFilter, resolveEventFilter } from "../core/events.js";
 import { readSession, removeSession, SessionRecord, writeSession } from "../session/store.js";
 
 export interface DaemonOptions extends BotOptions {
@@ -40,7 +41,7 @@ function boundedStream(response: ServerResponse) {
     if (closed) return;
     closed = true;
     queue.length = 0;
-    response.end(`${JSON.stringify({ type: "stream.overflow", code: "STREAM_OVERFLOW", remediation: "Reconnect using the last received event cursor; inspect replay gaps." })}\n`);
+    response.end(`${JSON.stringify({ type: "stream.overflow", code: "STREAM_OVERFLOW", message: "Event stream overflowed; reconnect using the last received cursor." })}\n`);
   };
   response.on("close", () => { closed = true; queue.length = 0; });
   response.on("drain", () => {
@@ -99,28 +100,12 @@ function isNavigationFailure(message: string): boolean {
 }
 
 function daemonErrorResponse(error: unknown) {
-  if (error instanceof CliError) return { statusCode: error.code === "BAD_INPUT" ? 400 : 409,
-    body: { error: error.message, code: error.code, remediation: error.remediation, ...(error.details ? { details: error.details } : {}) } };
-  if (error instanceof SyntaxError) return { statusCode: 400, body: { error: "Invalid JSON body.", code: "BAD_INPUT", remediation: "Send a JSON object." } };
-  const message = errorMessage(error);
-  if (isNavigationFailure(message)) {
-    return {
-      statusCode: 409,
-      body: {
-        error: message,
-        code: "NAVIGATION_FAILED",
-        remediation: "Inspect bot position, nearby blocks, and navigate status; then try a closer reachable goal or adjust pathfinder configuration.",
-      },
-    };
-  }
-  return {
-    statusCode: 500,
-    body: {
-      error: message,
-      code: "DAEMON_ERROR",
-      remediation: "Inspect session status and the daemon log; restart the session daemon only if it is unhealthy.",
-    },
-  };
+  if (error instanceof CliError) return { statusCode: error.code === "BAD_INPUT" || error.code === "CONTEXT_REQUIRED" ? 400 : 409,
+    body: publicError(error) };
+  if (error instanceof SyntaxError) return { statusCode: 400, body: publicError(badInput("Invalid JSON body.")) };
+  const code = isNavigationFailure(errorMessage(error)) ? "NAVIGATION_FAILED" : "DAEMON_ERROR";
+  return { statusCode: code === "NAVIGATION_FAILED" ? 409 : 500,
+    body: publicError(new CliError(code, "Daemon operation failed.", "Inspect daemon diagnostics.")) };
 }
 
 export async function runDaemon(options: DaemonOptions): Promise<void> {
@@ -140,9 +125,10 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
   let stopPersistenceError: { code: string; message: string } | undefined;
   let record: SessionRecord;
   const server = createServer(async (request, response) => {
+    response.setHeader(API_VERSION_HEADER, API_VERSION);
     try {
       if (!isAuthorized(request, options.token)) {
-        sendJson(response, 401, { error: "unauthorized" });
+        sendJson(response, 401, { code: "DAEMON_ERROR", message: "Unauthorized daemon request." });
         return;
       }
 
@@ -150,7 +136,7 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
       const url = new URL(request.url ?? "/", "http://127.0.0.1");
 
       if (request.method === "GET" && url.pathname === "/status") {
-        sendJson(response, 200, controller.status());
+        sendJson(response, 200, controller.status({ detail: url.searchParams.get("detail") === "full" ? "full" : "compact" }));
         return;
       }
 
@@ -176,7 +162,7 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
           }
         })();
         await stopAcceptance;
-        sendJson(response, 200, { stopping: true, stopped: false, runtimeId: controller.world.runtimeId, pid: process.pid, ...(stopPersistenceError ? { persistenceError: stopPersistenceError } : {}) });
+        sendJson(response, 200, { stopping: true, stopped: false, ...(stopPersistenceError ? { persistenceError: { code: stopPersistenceError.code } } : {}) });
         shutdown ??= (async () => {
           if (!response.writableFinished && !response.destroyed) await new Promise<void>((resolve) => {
             const done = () => { response.off("finish", done); response.off("close", done); resolve(); };
@@ -245,8 +231,8 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
         const unsubscribe = events.subscribe((event) => {
           if (!eventMatchesFilter(event, filter)) return;
           if (stream.closed) { unsubscribe(); return; }
-          if (!starting) stream.write(event);
-          else if (live.length < 128) live.push(event);
+          if (!starting) stream.write(projectEvent(event));
+          else if (live.length < 128) live.push(projectEvent(event));
           else { stream.overflow(); unsubscribe(); }
         });
         response.on("close", unsubscribe);
@@ -297,7 +283,7 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
         response.on("close", close);
         try {
           const result = await controller.actions.wait(decodeURIComponent(actionWaitRoute[1]), Number(url.searchParams.get("timeout") ?? "5000"), abort.signal);
-          if (!response.destroyed) sendJson(response, 200, result);
+          if (!response.destroyed) sendJson(response, 200, { ...projectAction(result), timedOut: result.timedOut });
         } finally { response.off("close", close); }
         return;
       }
@@ -305,7 +291,7 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
       if (actionRoute && ((request.method === "GET" && !actionRoute[2]) || (request.method === "POST" && actionRoute[2]))) {
         const action = decodeURIComponent(actionRoute[1]);
         if (request.method === "POST") controller.validateContext((await readJson(request)) as never, false);
-        sendJson(response, 200, request.method === "GET" ? controller.actions.get(action) : controller.actions.cancel(action));
+        sendJson(response, 200, projectAction(request.method === "GET" ? controller.actions.get(action) : controller.actions.cancel(action)));
         return;
       }
       if (request.method === "POST" && physicalRoutes.has(url.pathname)) {
@@ -340,10 +326,10 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
           return value;
         };
         if (path === "/navigate/follow") {
-          sendJson(response, 200, controller.followTrack(track(), range(2))); return;
+          sendJson(response, 200, projectAction(controller.followTrack(track(), range(2)))); return;
         }
         if (path === "/look/track") {
-          sendJson(response, 200, controller.trackLook(track())); return;
+          sendJson(response, 200, projectAction(controller.trackLook(track()))); return;
         }
         if (["/navigate/stop", "/control/clear"].includes(path)) {
           controller.actions.cancelResources(["movement", "look"], "STOPPED");
@@ -397,7 +383,7 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
           case "/entity/move-vehicle": { const left = num("left"), forward = num("forward"); if (Math.abs(left)>1 || Math.abs(forward)>1) throw badInput("Invalid vehicle controls."); resources = ["movement"]; run = () => controller.moveVehicle(left,forward); break; }
           default: throw badInput("Unknown action.");
         }
-        sendJson(response, 200, controller.runAction(path.slice(1).replaceAll("/","."), resources, run, target, continuous));
+        sendJson(response, 200, projectAction(controller.runAction(path.slice(1).replaceAll("/","."), resources, run, target, continuous)));
         return;
       }
 
@@ -573,9 +559,10 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
         return;
       }
 
-      sendJson(response, 404, { error: "not found" });
+      sendJson(response, 404, { code: "BAD_INPUT", message: "Unknown daemon route." });
     } catch (error) {
       if (response.destroyed || response.writableEnded) return;
+      if (!(error instanceof CliError) && !(error instanceof SyntaxError)) console.error("Daemon request failed:", error);
       const { statusCode, body } = daemonErrorResponse(error);
       sendJson(response, statusCode, body);
     }

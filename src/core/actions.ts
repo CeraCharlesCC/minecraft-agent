@@ -1,5 +1,6 @@
 import { detachData, EventStore } from "./events.js";
-import { badInput, CliError } from "../output/errors.js";
+import { badInput, CliError, publicError, type ErrorCode } from "../output/errors.js";
+import { decodeHandle, encodeHandle } from "./handles.js";
 
 export type ActionResource = "movement" | "look" | "item" | "window";
 export interface RuntimeAction {
@@ -13,10 +14,42 @@ export interface RuntimeAction {
   startedAt: string;
   finishedAt?: string;
   result?: unknown;
-  error?: { code: string; message: string; details?: Record<string, unknown> };
+  error?: { code: ErrorCode; message: string; details?: Record<string, unknown> };
 }
 
 export type ActionWaitResult = RuntimeAction & { timedOut: boolean };
+
+export interface PublicAction {
+  action: string;
+  kind: string;
+  state: RuntimeAction["state"];
+  target?: string;
+  reason?: string;
+  result?: unknown;
+  error?: { code: ErrorCode; message?: string; details?: Record<string, unknown> };
+  timedOut?: boolean;
+  runtimeId?: string;
+  worldEpoch?: number;
+  startedAt?: string;
+  finishedAt?: string;
+}
+
+/** Public records are authored explicitly; internal ownership and time stay diagnostic. */
+export function projectAction(record: RuntimeAction | ActionWaitResult, options: { summary?: boolean; detail?: "compact" | "full" } = {}): PublicAction {
+  const error = record.error && (options.summary ? { code: record.error.code } :
+    publicError(new CliError(record.error.code, record.error.message, "Observe current actions.", 1, record.error.details)));
+  const reason = record.reason && (["CANCELLED", "REPLACED", "STOPPED", "TRACK_LOST", "WORLD_CHANGED"].includes(record.reason) || record.reason === record.error?.code) ? record.reason : undefined;
+  return detachData({
+    action: record.action, kind: record.kind, state: record.state,
+    ...(record.target === undefined ? {} : { target: record.target }),
+    ...(reason === undefined ? {} : { reason }),
+    ...(!options.summary && record.result !== undefined ? { result: record.result } : {}),
+    ...(error ? { error } : {}),
+    ...("timedOut" in record ? { timedOut: record.timedOut } : {}),
+    ...(options.detail === "full" ? { runtimeId: record.runtimeId, worldEpoch: record.worldEpoch,
+      startedAt: record.startedAt, ...(record.finishedAt ? { finishedAt: record.finishedAt } : {}) } : {}),
+  });
+}
 
 /** Owns physical resources until settlement; terminal records are never resurrected. */
 export class ActionManager {
@@ -36,7 +69,7 @@ export class ActionManager {
   } = {}): RuntimeAction {
     this.cancelResources(resources, "REPLACED");
     const record: RuntimeAction = {
-      action: `${this.events.runtimeId}:a${this.nextId++}`, runtimeId: this.events.runtimeId,
+      action: encodeHandle(this.events.runtimeId, "a", this.nextId++), runtimeId: this.events.runtimeId,
       worldEpoch, kind, target: options.target, state: "running", startedAt: new Date().toISOString(),
     };
     this.records.set(record.action, record);
@@ -61,9 +94,9 @@ export class ActionManager {
   }
 
   get(id: string): RuntimeAction {
-    if (!id.startsWith(`${this.events.runtimeId}:`)) {
+    if (decodeHandle(id, "a").runtimeId !== this.events.runtimeId) {
       throw new CliError("RUNTIME_MISMATCH", "Action belongs to another runtime.", "Observe a fresh frame.", 1,
-        { runtimeId: this.events.runtimeId, action: id });
+        { action: id });
     }
     const record = this.records.get(id);
     if (!record) throw new CliError("ACTION_UNKNOWN", "Action is unknown or expired.", "Observe current actions.", 1, { action: id });
@@ -111,13 +144,11 @@ export class ActionManager {
   }
 
   /** Frames retain all running targets and only the eight latest settlements. */
-  observation(): (Omit<RuntimeAction, "result" | "error"> & { error?: { code: string } })[] {
+  observation(): PublicAction[] {
     const recent = new Set(this.terminalOrder.slice(-8));
     return [...this.records.values()]
       .filter((record) => record.state === "running" || recent.has(record.action))
-      .map(({ result: _result, error, ...summary }) => detachData({
-        ...summary, ...(error ? { error: { code: error.code } } : {}),
-      }));
+      .map(record => projectAction(record, { summary: true }));
   }
 
   owner(resource: ActionResource): string | undefined { return this.owners.get(resource); }
@@ -175,7 +206,8 @@ export class ActionManager {
     if (state !== "completed") {
       try { stop?.(); } catch { /* Preserve authoritative termination even if transport has gone. */ }
     }
-    this.events.add({ type: `action.${state}`, action: id, kind: record.kind, target: record.target, reason, error: record.error });
+    this.events.add({ type: `action.${state}`, action: id, kind: record.kind, target: record.target, reason, error: record.error,
+      ...(record.result === undefined ? {} : { result: record.result }) });
     for (const waiter of [...(this.waiters.get(id) ?? [])]) waiter(record);
     this.terminalOrder.push(id);
     this.prune();

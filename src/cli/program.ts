@@ -2,9 +2,10 @@ import { Writable } from "node:stream";
 import { Command } from "commander";
 import { z } from "zod";
 import { getSkillContent } from "../core/skills.js";
-import { badInput, commandBlocked, normalizeError } from "../output/errors.js";
+import { badInput, commandBlocked, contextRequired, normalizeError, publicError } from "../output/errors.js";
 import { failure, formatDefaultText, resolveOutputMode, success, writeJson, writeText } from "../output/response.js";
 import { decodeActionContext } from "../core/context.js";
+import { isHandle } from "../core/handles.js";
 import { CliHandlers } from "./handlers.js";
 
 export interface CliIo {
@@ -40,6 +41,7 @@ function normalizeEventTypes(value: unknown): string[] {
 const eventTypesSchema = z.preprocess(normalizeEventTypes, z.array(z.string().min(1)));
 
 const startSchema = sessionSchema.extend({
+  detail: z.enum(["compact", "full"]).optional(),
   host: z.string().min(1).default("localhost"),
   port: z.coerce.number().int().positive().max(65535).default(25565),
   username: z.string().min(1).default("AgentBot"),
@@ -50,20 +52,21 @@ const startSchema = sessionSchema.extend({
   reconnectBackoff: z.coerce.number().int().min(0).max(30000).optional(),
 });
 
-const eventCursorSchema = z.union([z.literal("0"), z.literal(0), z.string().regex(/^[^:]+:s\d+$/, "Expected a runtime-scoped event cursor or 0")]).default(0).transform(value => value === "0" ? 0 as const : value);
-const trackSchema = z.string().regex(/^[^:]+:[pe]\d+$/, "Expected a runtime-scoped track");
+const scopedHandle = (kinds: string, message: string) => z.string().refine(value => [...kinds].some(kind => isHandle(value, kind as "p" | "e" | "a" | "f" | "s" | "m")), message);
+const eventCursorSchema = z.union([z.literal("0"), z.literal(0), scopedHandle("s", "Expected a runtime-scoped event cursor or 0")]).default(0).transform(value => value === "0" ? 0 as const : value);
+const trackSchema = scopedHandle("pe", "Expected a runtime-scoped track");
 const frameSchema = sessionSchema.extend({
-  since: z.string().regex(/^[^:]+:f\d+$/, "Expected a runtime-scoped frame").optional(),
+  since: scopedHandle("f", "Expected a runtime-scoped frame").optional(),
   detail: z.enum(["compact", "full"]).default("compact"),
   maxEntities: z.coerce.number().int().min(0).max(200).default(12),
   radius: z.coerce.number().positive().max(256).default(64),
   track: z.preprocess(normalizeEventTypes, z.array(trackSchema)),
 }).transform(({ track, ...input }) => ({ ...input, tracks: track }));
 const actionSchema = sessionSchema.extend({
-  action: z.string().regex(/^[^:]+:a\d+$/, "Expected a runtime-scoped action"),
+  action: scopedHandle("a", "Expected a runtime-scoped action"),
 });
 const debugEventsSchema = sessionSchema.extend({
-  id: z.string().regex(/^[^:]+:[ms]\d+$/, "Expected a scoped message ID or semantic cursor").optional(),
+  id: scopedHandle("ms", "Expected a scoped message ID or semantic cursor").optional(),
 });
 
 const eventsSchema = sessionSchema.extend({
@@ -302,6 +305,7 @@ function commandRunner<T>(
       const opts = command.opts();
       let waitTimeout: number | undefined;
       if (handlers) {
+        if (opts.context === undefined && opts.runtimeId === undefined && opts.worldEpoch === undefined) throw contextRequired();
         if (opts.context !== undefined) {
           const decoded = decodeActionContext(opts.context);
           if ((opts.runtimeId !== undefined && opts.runtimeId !== decoded.runtimeId) ||
@@ -330,7 +334,8 @@ function commandRunner<T>(
       if (errorMode === "json") {
         writeJson(io.stdout, failure(normalized));
       } else {
-        writeText(io.stderr, `${normalized.code}: ${normalized.message}\n${normalized.remediation}`);
+        const projected = publicError(normalized);
+        writeText(io.stderr, `${projected.code}: ${projected.message}`);
       }
       throw normalized;
     }
@@ -349,7 +354,8 @@ function streamingCommandRunner(command: Command, io: CliIo, action: () => Promi
       if (errorMode === "json") {
         writeJson(io.stdout, failure(normalized));
       } else {
-        writeText(io.stderr, `${normalized.code}: ${normalized.message}\n${normalized.remediation}`);
+        const projected = publicError(normalized);
+        writeText(io.stderr, `${projected.code}: ${projected.message}`);
       }
       throw normalized;
     }
@@ -378,6 +384,8 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .option("--auth <mode>", "mineflayer auth mode", "offline")
     .option("--minecraft-version <version>", "Minecraft protocol version")
     .option("--auto-reconnect", "automatically reconnect after an unexpected disconnect")
+    .option("--no-auto-reconnect", "disable automatic reconnect")
+    .option("--detail <detail>", "session output: compact or full operational detail")
     .option("--reconnect-max-attempts <count>", "maximum automatic reconnect attempts (default 3)")
     .option("--reconnect-backoff <ms>", "automatic reconnect backoff in milliseconds (default 250)")
     .action((opts, cmd) =>
@@ -393,12 +401,14 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .command("status")
     .description("Show a Minecraft bot session status")
     .option("--session <name>", "session name", "default")
-    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.sessionStatus(sessionSchema.parse(opts)))());
+    .option("--detail <detail>", "session output: compact or full operational detail")
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.sessionStatus(sessionSchema.extend({ detail: z.enum(["compact", "full"]).optional() }).parse(opts)))());
 
   session
     .command("list")
     .description("List known local Minecraft bot sessions")
-    .action((_opts, cmd) => commandRunner(cmd, io, () => handlers.listSessions())());
+    .option("--detail <detail>", "session output: compact or full operational detail")
+    .action((opts, cmd) => commandRunner(cmd, io, () => opts.detail === undefined ? handlers.listSessions() : handlers.listSessions(z.object({ detail: z.enum(["compact", "full"]) }).parse(opts)))());
 
   session
     .command("stop")
@@ -1045,6 +1055,7 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .option("--auth <mode>", "mineflayer auth mode", "offline")
     .option("--minecraft-version <version>", "Minecraft protocol version")
     .option("--auto-reconnect", "automatically reconnect after an unexpected disconnect")
+    .option("--no-auto-reconnect", "disable automatic reconnect")
     .option("--reconnect-max-attempts <count>", "maximum automatic reconnect attempts (default 3)")
     .option("--reconnect-backoff <ms>", "automatic reconnect backoff in milliseconds (default 250)")
     .action((opts, cmd) => commandRunner(cmd, io, () => handlers.daemonRun(daemonRunSchema.parse({ ...opts, version: opts.minecraftVersion })))());

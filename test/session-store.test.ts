@@ -59,6 +59,11 @@ describe("session store", () => {
     expect(publicRecord).not.toHaveProperty("token");
     expect(JSON.stringify(publicRecord)).not.toContain(saved.token);
     expect(publicRecord.alive).toBe(true);
+    expect(publicRecord).toEqual({ session: "default", alive: true });
+    const privateRecord = record({ username: "account@example.com", token: "private-token", runtimeId: "private-runtime" });
+    const operational = toPublicSession(privateRecord, "full");
+    expect(operational).toMatchObject({ pid: process.pid, host: "localhost", controlPort: 30123 });
+    for (const key of ["username", "token", "runtimeId"]) expect(operational).not.toHaveProperty(key);
 
     await removeSession("default", dir);
     expect(await readSession("default", dir)).toBeUndefined();
