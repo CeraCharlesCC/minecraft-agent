@@ -8,6 +8,15 @@ mc-agent session start --host localhost --username AgentBot --auth offline --aut
 mc-agent --output json observe frame
 ```
 
+`session start` keeps its CLI process open and streams new incoming player chat,
+whispers, and unverified player/whisper candidates. In JSON mode, stdout is NDJSON:
+one startup result, subscription metadata, then chat events. Run other commands
+in another terminal/tool call while retaining this process handle. Self echoes
+and outgoing whispers are excluded. Stopping the listener leaves the bot daemon
+running. Use `session start --no-listen` for a single startup result, or
+`chat listen --session <name>` to attach to an existing session. Attachments start
+at `now` and skip disconnected history; `--include-self` includes bot echoes.
+
 Copy the observation's `data.context` into physical commands. Use `entity find` to obtain a loaded `trackId` for entity targets; pass handles unchanged.
 
 ```sh

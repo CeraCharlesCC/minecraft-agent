@@ -27,6 +27,7 @@ export interface EventsInput extends SessionInput {
 }
 
 export interface WatchInput extends SessionInput {
+  excludeSelf?: boolean;
   profile?: "all" | "agent";
   since: 0 | string;
   types: string[];

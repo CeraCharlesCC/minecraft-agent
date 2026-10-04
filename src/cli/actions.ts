@@ -153,6 +153,7 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const params = new URLSearchParams({ since: String(input.since) });
       if (input.profile) params.set("profile", input.profile);
       appendEventTypes(params, input.types);
+      if (input.excludeSelf) params.set("excludeSelf", "true");
       const endpoint = input.track ? "/sample" : "/watch";
       if (input.track) {
         params.delete("since");

@@ -53,7 +53,7 @@ const startSchema = sessionSchema.extend({
 });
 
 const scopedHandle = (kinds: string, message: string) => z.string().refine(value => [...kinds].some(kind => isHandle(value, kind as "p" | "e" | "a" | "f" | "s" | "m")), message);
-const eventCursorSchema = z.union([z.literal("0"), z.literal(0), scopedHandle("s", "Expected a runtime-scoped event cursor or 0")]).default(0).transform(value => value === "0" ? 0 as const : value);
+const eventCursorSchema = z.union([z.literal("0"), z.literal(0), z.literal("now"), scopedHandle("s", "Expected a runtime-scoped event cursor, 0, or now")]).default(0).transform(value => value === "0" ? 0 as const : value);
 const trackSchema = scopedHandle("pe", "Expected a runtime-scoped track");
 const frameSchema = sessionSchema.extend({
   since: scopedHandle("f", "Expected a runtime-scoped frame").optional(),
@@ -77,6 +77,7 @@ const eventsSchema = sessionSchema.extend({
 }).transform(({ type, ...input }) => ({ ...input, types: type }));
 
 const watchSchema = sessionSchema.extend({
+  excludeSelf: z.boolean().optional(),
   profile: z.enum(["all", "agent"]).default("all"),
   since: eventCursorSchema,
   type: eventTypesSchema,
@@ -84,7 +85,7 @@ const watchSchema = sessionSchema.extend({
   fields: z.preprocess(value => value === undefined ? undefined : normalizeEventTypes(value), z.array(z.enum(["position", "velocity", "status"])).min(1).optional()),
   rate: z.coerce.number().min(0.1).max(10).optional(),
 }).superRefine((input, context) => {
-  if (input.track && (input.type.length || input.since !== 0 || input.profile !== "all")) {
+  if (input.track && (input.type.length || input.since !== 0 || input.profile !== "all" || input.excludeSelf)) {
     context.addIssue({ code: "custom", message: "Target samples cannot use event cursors or type filters" });
   }
   if (!input.track && (input.fields || input.rate !== undefined)) {
@@ -383,19 +384,26 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .option("--username <name>", "bot username", "AgentBot")
     .option("--auth <mode>", "mineflayer auth mode", "offline")
     .option("--minecraft-version <version>", "Minecraft protocol version")
+    .option("--listen", "stream new incoming chat after starting", true)
+    .option("--no-listen", "return after startup without streaming chat")
     .option("--auto-reconnect", "automatically reconnect after an unexpected disconnect")
     .option("--no-auto-reconnect", "disable automatic reconnect")
     .option("--detail <detail>", "session output: compact or full operational detail")
     .option("--reconnect-max-attempts <count>", "maximum automatic reconnect attempts (default 3)")
     .option("--reconnect-backoff <ms>", "automatic reconnect backoff in milliseconds (default 250)")
-    .action((opts, cmd) =>
-      commandRunner(
-        cmd,
-        io,
+    .action(async (opts, cmd) => {
+      await commandRunner(
+        cmd, io,
         () => handlers.startSession(startSchema.parse({ ...opts, version: opts.minecraftVersion })),
         (data) => `Started session ${(data as { session?: string }).session ?? "default"}`,
-      )(),
-    );
+      )();
+      if (opts.listen) {
+        await streamingCommandRunner(cmd, io, () => handlers.observeWatch({
+          session: opts.session, since: "now", profile: "agent",
+          types: ["chat.player", "chat.whisper", "chat.unverified"], excludeSelf: true,
+        }))();
+      }
+    });
 
   session
     .command("status")
@@ -445,7 +453,7 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .command("events")
     .description("Replay retained semantic events with scoped cursors and gap detection")
     .option("--session <name>", "session name", "default")
-    .option("--since <cursor>", "runtime-scoped semantic cursor, or 0 from beginning", "0")
+    .option("--since <cursor>", "runtime-scoped cursor, 0 from beginning, or now for new events only", "0")
     .option("--profile <profile>", "event profile: all or agent", "all")
     .option("--limit <count>", "maximum events to return", "50")
     .option("--type <eventType>", "include only this event type; repeat or comma-separate for multiple types", collectEventType, [])
@@ -454,8 +462,9 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
   observe
     .command("watch")
     .description("Watch semantic events or sample a target as newline-delimited JSON")
+    .option("--exclude-self", "exclude the bot's own chat and outgoing whispers")
     .option("--session <name>", "session name", "default")
-    .option("--since <cursor>", "runtime-scoped semantic cursor, or 0 from beginning", "0")
+    .option("--since <cursor>", "runtime-scoped cursor, 0 from beginning, or now for new events only", "0")
     .option("--profile <profile>", "event profile: all or agent", "all")
     .option("--type <eventType>", "include only this event type; repeat or comma-separate for multiple types", collectEventType, [])
     .option("--track <track>", "sample a runtime-scoped entity track")
@@ -463,7 +472,17 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .option("--rate <hz>", "sample rate 0.1-10 Hz; default 2")
     .action((opts, cmd) => streamingCommandRunner(cmd, io, () => handlers.observeWatch(watchSchema.parse(opts)))());
 
-  const chat = program.command("chat").description("Send Minecraft chat");
+  const chat = program.command("chat").description("Send or receive Minecraft chat");
+
+  chat
+    .command("listen")
+    .description("Stream new incoming chat as NDJSON; no history or self echoes by default")
+    .option("--session <name>", "session name", "default")
+    .option("--since <cursor>", "runtime-scoped cursor, 0 from beginning, or now for new events only", "now")
+    .option("--include-self", "include the bot's own chat and outgoing whispers")
+    .action((opts, cmd) => streamingCommandRunner(cmd, io, () => handlers.observeWatch(watchSchema.parse({
+      ...opts, profile: "agent", type: ["chat.player", "chat.whisper", "chat.unverified"], excludeSelf: !opts.includeSelf,
+    })))());
 
   chat
     .command("send")

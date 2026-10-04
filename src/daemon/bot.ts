@@ -619,6 +619,17 @@ export class BotController {
 
   flushChat() { this.chatReceiver?.flush(); }
 
+  isOwnChat(event: { type: string; [field: string]: unknown }): boolean {
+    if (!event.type.startsWith("chat.")) return false;
+    if (event.direction === "outgoing") return true;
+    const identity = event.senderIdentity ?? event.candidateSenderIdentity;
+    const senderUuid = identity && typeof identity === "object" ? (identity as { uuid?: unknown }).uuid : undefined;
+    if (typeof senderUuid === "string" && senderUuid === this.bot?.entity?.uuid) return true;
+    const sender = event.sender ?? event.candidateSender;
+    return typeof sender === "string" && typeof this.bot?.username === "string"
+      && sender.toLowerCase() === this.bot.username.toLowerCase();
+  }
+
   sample(track: string, fields: string[]) {
     this.checkWorld();
     const entity = this.world.resolveTrack(track) as MineflayerEntity;

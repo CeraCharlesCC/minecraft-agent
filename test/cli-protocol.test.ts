@@ -117,11 +117,21 @@ describe("CLI protocol", () => {
     ["entity", "find", "--types", "cow"],
     ["observe", "events", "--profile", "future"],
     ["observe", "watch", "--track", `${runtimeTag}:p1`, "--profile", "agent"],
+    ["observe", "watch", "--track", `${runtimeTag}:p1`, "--since", "now"],
+    ["observe", "watch", "--track", `${runtimeTag}:p1`, "--exclude-self"],
     ["observe", "frame", "--detail", "raw"],
     ["session", "ensure-ready", "--max-attempts", "0"],
   ])("rejects invalid context and new protocol inputs %j", async (...args) => {
     const { program } = makeProgram();
     await expect(program.parseAsync(["node", "mc-agent", ...args])).rejects.toMatchObject({ code: "BAD_INPUT" });
+  });
+
+  it("accepts now as a live starting point for event queries and watches", async () => {
+    const { program, handlers } = makeProgram();
+    await program.parseAsync(["node", "mc-agent", "observe", "events", "--since", "now", "--type", "chat.player,chat.whisper"]);
+    expect(handlers.observeEvents).toHaveBeenCalledWith({ session: "default", since: "now", profile: "all", limit: 50, types: ["chat.player", "chat.whisper"] });
+    await program.parseAsync(["node", "mc-agent", "observe", "watch", "--since", "now", "--type", "chat.player"]);
+    expect(handlers.observeWatch).toHaveBeenCalledWith({ session: "default", since: "now", profile: "all", types: ["chat.player"] });
   });
 
   it("parses full frames, inclusive species search, agent profiles, recovery and action waiting", async () => {
@@ -188,6 +198,56 @@ describe("CLI protocol", () => {
       auth: "offline",
     });
     expect(JSON.parse(stdout.value)).toEqual({ ok: true, data: { session: "default" } });
+    expect(handlers.observeWatch).toHaveBeenCalledExactlyOnceWith({
+      session: "default", since: "now", profile: "agent",
+      types: ["chat.player", "chat.whisper", "chat.unverified"], excludeSelf: true,
+    });
+  });
+
+  it("writes startup before the chat stream and supports opting out", async () => {
+    const { program, handlers, stdout } = makeProgram();
+    vi.mocked(handlers.startSession).mockResolvedValue({ session: "named" });
+    vi.mocked(handlers.observeWatch).mockImplementation(async () => {
+      expect(JSON.parse(stdout.value)).toEqual({ ok: true, data: { session: "named" } });
+      stdout.write('{"type":"chat.player","sender":"Alex","text":"hello"}\n');
+    });
+    await program.parseAsync(["node", "mc-agent", "session", "start", "--session", "named"]);
+    expect(stdout.value.trim().split("\n").map(line => JSON.parse(line))).toEqual([
+      { ok: true, data: { session: "named" } },
+      { type: "chat.player", sender: "Alex", text: "hello" },
+    ]);
+    expect(handlers.observeWatch).toHaveBeenCalledWith(expect.objectContaining({ session: "named" }));
+    const detached = makeProgram();
+    await detached.program.parseAsync(["node", "mc-agent", "session", "start", "--no-listen"]);
+    expect(detached.handlers.startSession).toHaveBeenCalledOnce();
+    expect(detached.handlers.observeWatch).not.toHaveBeenCalled();
+  });
+
+  it("does not subscribe after failed startup and preserves stream startup errors", async () => {
+    const failed = makeProgram();
+    vi.mocked(failed.handlers.startSession).mockRejectedValue(sessionNotFound("missing"));
+    await expect(failed.program.parseAsync(["node", "mc-agent", "session", "start"])).rejects.toMatchObject({ code: "SESSION_NOT_FOUND" });
+    expect(failed.handlers.observeWatch).not.toHaveBeenCalled();
+    const broken = makeProgram();
+    vi.mocked(broken.handlers.observeWatch).mockRejectedValue(sessionNotFound("missing"));
+    await expect(broken.program.parseAsync(["node", "mc-agent", "session", "start"])).rejects.toMatchObject({ code: "SESSION_NOT_FOUND" });
+    const lines = broken.stdout.value.trim().split("\n").map(line => JSON.parse(line));
+    expect(lines[0].ok).toBe(true);
+    expect(lines[1]).toMatchObject({ ok: false, error: { code: "SESSION_NOT_FOUND" } });
+  });
+
+  it("attaches chat listen at now, retaining attribution and optionally self echoes", async () => {
+    const { program, handlers } = makeProgram();
+    await program.parseAsync(["node", "mc-agent", "chat", "listen", "--session", "named"]);
+    expect(handlers.observeWatch).toHaveBeenLastCalledWith({
+      session: "named", since: "now", profile: "agent",
+      types: ["chat.player", "chat.whisper", "chat.unverified"], excludeSelf: true,
+    });
+    await program.parseAsync(["node", "mc-agent", "chat", "listen", "--since", `${runtimeTag}:s2`, "--include-self"]);
+    expect(handlers.observeWatch).toHaveBeenLastCalledWith({
+      session: "default", since: `${runtimeTag}:s2`, profile: "agent",
+      types: ["chat.player", "chat.whisper", "chat.unverified"], excludeSelf: false,
+    });
   });
 
   it.each(["compact", "full"])("forwards explicit session %s detail", async detail => {

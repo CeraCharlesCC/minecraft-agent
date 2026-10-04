@@ -210,26 +210,33 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
         return;
       }
       controller.flushChat();
+      const since = url.searchParams.get("since") ?? "0";
+      const eventSince = since === "now" ? events.getCursor() : since;
       if (request.method === "GET" && url.pathname === "/events") {
-        sendJson(response, 200, events.query(url.searchParams.get("since") ?? "0",
+        sendJson(response, 200, events.query(eventSince,
           Number(url.searchParams.get("limit") ?? "50"), eventTypesFromSearch(url), url.searchParams.get("profile") ?? "all"));
         return;
       }
       if (request.method === "GET" && url.pathname === "/watch") {
         const types = eventTypesFromSearch(url);
         const filter = resolveEventFilter(url.searchParams.get("profile") ?? "all", types);
-        let replay = events.query(url.searchParams.get("since") ?? "0", 1000, types, filter.profile);
+        let replay = events.query(eventSince, 1000, types, filter.profile);
+        const excludeSelfValue = url.searchParams.get("excludeSelf");
+        if (excludeSelfValue !== null && !["true", "false"].includes(excludeSelfValue)) throw badInput("excludeSelf must be true or false.");
+        const excludeSelf = excludeSelfValue === "true";
+        const include = (event: { type: string; [field: string]: unknown }) =>
+          eventMatchesFilter(event, filter) && (!excludeSelf || !controller.isOwnChat(event));
         const initialReplay = replay;
-        const backlog = [...replay.events];
+        const backlog = replay.events.filter(include);
         while (replay.nextCursor !== replay.latestCursor) {
           replay = events.query(replay.nextCursor, 1000, types, filter.profile);
-          backlog.push(...replay.events);
+          backlog.push(...replay.events.filter(include));
         }
         const stream = boundedStream(response);
         let starting = true;
         const live: typeof backlog = [];
         const unsubscribe = events.subscribe((event) => {
-          if (!eventMatchesFilter(event, filter)) return;
+          if (!include(event)) return;
           if (stream.closed) { unsubscribe(); return; }
           if (!starting) stream.write(projectEvent(event));
           else if (live.length < 128) live.push(projectEvent(event));
@@ -238,7 +245,7 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
         response.on("close", unsubscribe);
         response.writeHead(200, { "Content-Type": "application/x-ndjson" });
         response.flushHeaders();
-        stream.write({ type: "events.replay", ...initialReplay, events: undefined });
+        stream.write({ type: "events.replay", ...initialReplay, events: undefined, ...(excludeSelf ? { excludeSelf: true } : {}) });
         for (const event of backlog) {
           if (stream.closed) break;
           stream.write(event);

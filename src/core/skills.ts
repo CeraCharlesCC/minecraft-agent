@@ -9,6 +9,8 @@ const CORE_SKILL = `# mc-agent core
 
 Use \`mc-agent <group> <command> --help\` for flags and \`--output json\` for parsed output.
 
+\`session start\` streams new chat; keep its process handle. \`--no-listen\` exits after startup; \`chat listen\` attaches from now.
+
 Normal loop: frame/find → action/wait → observation. Read \`observe frame\` or \`entity find\`. Copy the opaque \`c2\` context as \`--context\`; entity targets require a loaded \`--track\`. Do not decode or construct handles.
 
 Before dependent work, use \`--wait 10000\` or \`action wait\`. Only \`completed\` means success; \`ok: true\` means processed. \`timedOut: true\` leaves work running; inspect \`action status\`. Continuous follow/look stays running until stopped.
@@ -27,7 +29,7 @@ const FULL_REFERENCE = `## Events
 
 Read \`observe events --profile agent --since 0\`, then reuse each processed page's \`nextCursor\`. Keep a cursor per fixed filter. Changing filters needs a new starting cursor. A frame cursor or \`latestCursor\` does not acknowledge unread events. On gaps, refresh the frame; expired chat remains unavailable.
 
-\`observe watch --profile agent --since <nextCursor>\` streams the subscription. Replay after overflow/disconnection and preserve gap notices. \`chat.player\`, \`chat.unverified\` (candidate sender), and \`server.message\` retain their provenance; server/plugin notices remain visible. Legitimate repeated chat is not deduplicated.
+\`observe watch --profile agent --since <nextCursor>\` streams the subscription. \`session start\` automatically streams new incoming chat after its startup result (NDJSON in JSON mode). Keep the listener process handle; use \`--no-listen\` for a single startup response. \`chat listen\` attaches to an existing session from now, excludes self/outgoing echoes, and retains unverified attribution; \`--include-self\` includes echoes. Ending the listener leaves the daemon running. Replay after overflow/disconnection and preserve gap notices. Use \`--since now\` for new events only; resolve the starting cursor on the daemon. Reconnecting with now intentionally skips disconnected history. \`chat.player\`, \`chat.unverified\` (candidate sender), and \`server.message\` retain their provenance; server/plugin notices remain visible. Legitimate repeated chat is not deduplicated.
 
 ## Frames
 

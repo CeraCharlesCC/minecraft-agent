@@ -493,6 +493,13 @@ describe("CLI actions", () => {
     await expect(handlers.observeWatch({ session: "default", since: 0, types: [] })).rejects.toMatchObject({ code: "DAEMON_ERROR" });
   });
 
+  it("passes now and self filtering directly to the daemon", async () => {
+    const { handlers } = await loadActionsWithMocks();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { headers: { "X-MC-Agent-API": "3" } })));
+    await expect(handlers.observeWatch({ session: "default", since: "now", profile: "agent", types: ["chat.player", "chat.whisper", "chat.unverified"], excludeSelf: true })).rejects.toMatchObject({ code: "DAEMON_ERROR" });
+    expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:3000/watch?since=now&profile=agent&type=chat.player&type=chat.whisper&type=chat.unverified&excludeSelf=true", expect.anything());
+  });
+
   it("keeps a watch alive beyond startup timeout and releases it when stdout fails", async () => {
     const { handlers, mocks } = await loadActionsWithMocks();
     mocks.loadSessionForClient.mockResolvedValue({ session: "default", token: "secret", controlPort: 3000 });

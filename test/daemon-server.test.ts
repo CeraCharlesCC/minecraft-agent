@@ -310,6 +310,85 @@ describe("daemon server", () => {
     await fetch(`http://127.0.0.1:${port}/stop`, { method: "POST", headers: { Authorization: `Bearer ${TOKEN_B}` } });
   });
 
+  it("starts now on the daemon, skipping history while retaining future events", async () => {
+    process.env.MC_AGENT_STATE_DIR = await makeTempDir();
+    const fakeBot = new FakeBot(), port = 46180 + Math.floor(Math.random() * 1000);
+    await runDaemon({ session: "watch-now", controlPort: port, token: TOKEN_C, host: "localhost", port: 25565, username: "AgentBot", auth: "offline", createBotFn: () => fakeBot, exitOnStop: false });
+    const headers = { Authorization: `Bearer ${TOKEN_C}` };
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    try {
+      // Overflow old chat to verify now doesn't report a historical gap either.
+      for (let i = 0; i < 1100; i++) fakeBot.emit("chat", "Alex", `old ${i}`, undefined, { text: `old ${i}` });
+      const page = await (await fetch(`http://127.0.0.1:${port}/events?since=now&profile=agent`, { headers })).json() as any;
+      expect(page).toMatchObject({ events: [], gap: false, expiredTypes: [] });
+      expect(page.nextCursor).toBe(page.latestCursor);
+      const response = await fetch(`http://127.0.0.1:${port}/watch?since=now&profile=agent&type=chat.unverified`, { headers });
+      reader = response.body!.getReader();
+      const metadata = JSON.parse(Buffer.from((await reader.read()).value!).toString("utf8").trim());
+      expect(metadata).toMatchObject({ type: "events.replay", gap: false, expiredTypes: [] });
+      fakeBot.emit("chat", "Alex", "new", undefined, { text: "new" });
+      const event = JSON.parse(Buffer.from((await reader.read()).value!).toString("utf8").trim());
+      expect(event).toMatchObject({ type: "chat.unverified", candidateSender: "Alex", text: "new" });
+      const next = await (await fetch(`http://127.0.0.1:${port}/events?since=${encodeURIComponent(page.nextCursor)}&profile=agent`, { headers })).json() as any;
+      expect(next.events).toEqual([event]);
+      await reader.cancel(); reader = undefined;
+      expect(fakeBot.quit).not.toHaveBeenCalled();
+      fakeBot.emit("chat", "Alex", "while disconnected", undefined, { text: "while disconnected" });
+      const reattached = await fetch(`http://127.0.0.1:${port}/watch?since=now&profile=agent&type=chat.unverified`, { headers });
+      reader = reattached.body!.getReader();
+      expect(JSON.parse(Buffer.from((await reader.read()).value!).toString("utf8").trim())).toMatchObject({ type: "events.replay", gap: false });
+      fakeBot.emit("chat", "Alex", "after reconnect", undefined, { text: "after reconnect" });
+      expect(JSON.parse(Buffer.from((await reader.read()).value!).toString("utf8").trim())).toMatchObject({ type: "chat.unverified", text: "after reconnect" });
+    } finally {
+      await reader?.cancel();
+      await fetch(`http://127.0.0.1:${port}/stop`, { method: "POST", headers });
+    }
+  });
+
+  it("filters bot echoes from replay and live chat without dropping repeated player messages", async () => {
+    process.env.MC_AGENT_STATE_DIR = await makeTempDir();
+    const fakeBot = new FakeBot(), port = 47180 + Math.floor(Math.random() * 1000);
+    await runDaemon({ session: "chat-self", controlPort: port, token: TOKEN_C, host: "localhost", port: 25565, username: "private-account@example.com", auth: "offline", createBotFn: () => fakeBot, exitOnStop: false });
+    const headers = { Authorization: `Bearer ${TOKEN_C}` };
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    try {
+      fakeBot.emit("chat", "AgentBot", "self replay", undefined, { text: "self replay" });
+      fakeBot.emit("chat", "Alex", "player replay", undefined, { text: "player replay" });
+      const response = await fetch(`http://127.0.0.1:${port}/watch?since=0&profile=agent&type=chat.player&type=chat.whisper&type=chat.unverified&excludeSelf=true`, { headers });
+      reader = response.body!.getReader();
+      let buffer = "";
+      const nextEvent = async () => {
+        while (!buffer.includes("\n")) {
+          const chunk = await reader!.read();
+          if (chunk.done) throw new Error("Unexpected stream end");
+          buffer += Buffer.from(chunk.value!).toString("utf8");
+        }
+        const end = buffer.indexOf("\n"), line = buffer.slice(0, end);
+        buffer = buffer.slice(end + 1);
+        return JSON.parse(line);
+      };
+      expect(await nextEvent()).toMatchObject({ type: "events.replay", excludeSelf: true });
+      expect(await nextEvent()).toMatchObject({ type: "chat.unverified", candidateSender: "Alex", text: "player replay" });
+      fakeBot.emit("chat", "agentbot", "self live", undefined, { text: "self live" });
+      fakeBot.emit("whisper", "AgentBot", "self whisper", undefined, { text: "self whisper" });
+      fakeBot.emit("message", { text: "server notice" }, "system");
+      fakeBot.emit("chat", "Alex", "repeat", undefined, { text: "repeat" });
+      fakeBot.emit("chat", "Alex", "repeat", undefined, { text: "repeat" });
+      for (let i = 0; i < 2; i++) {
+        expect(await nextEvent()).toMatchObject({ type: "chat.unverified", candidateSender: "Alex", text: "repeat" });
+      }
+      await reader.cancel(); reader = undefined;
+      // Ordinary event queries still retain self chat for callers that want it.
+      const page = await (await fetch(`http://127.0.0.1:${port}/events?since=0&profile=agent`, { headers })).json() as any;
+      expect(page.events.map((event: any) => event.text)).toContain("self live");
+      const invalid = await fetch(`http://127.0.0.1:${port}/watch?excludeSelf=typo`, { headers });
+      expect(invalid.status).toBe(400);
+    } finally {
+      await reader?.cancel();
+      await fetch(`http://127.0.0.1:${port}/stop`, { method: "POST", headers });
+    }
+  });
+
   it("returns structured navigation failures", async () => {
     const dir = await makeTempDir();
     process.env.MC_AGENT_STATE_DIR = dir;
