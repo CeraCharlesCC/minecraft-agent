@@ -92,12 +92,12 @@ describe("daemon server", () => {
 
     const unauthorized = await fetch(`http://127.0.0.1:${port}/status`);
     expect(unauthorized.status).toBe(401);
-    expect(unauthorized.headers.get("X-MC-Agent-API")).toBe("3");
+    expect(unauthorized.headers.get("X-MC-Agent-API")).toBe("3.1");
     expect(await unauthorized.json()).toEqual({ code: "DAEMON_ERROR", message: "Unauthorized daemon request." });
 
     const missing = await fetch(`http://127.0.0.1:${port}/missing`, { headers: { Authorization: `Bearer ${TOKEN_A}` } });
     expect(missing.status).toBe(404);
-    expect(missing.headers.get("X-MC-Agent-API")).toBe("3");
+    expect(missing.headers.get("X-MC-Agent-API")).toBe("3.1");
     expect(await missing.json()).toEqual({ code: "BAD_INPUT", message: "Unknown daemon route." });
 
     fakeBot.emit("spawn");
@@ -190,7 +190,7 @@ describe("daemon server", () => {
 
     const status = await fetch(`http://127.0.0.1:${port}/status`, { headers: { Authorization: `Bearer ${TOKEN_A}` } });
     expect(status.ok).toBe(true);
-    expect(status.headers.get("X-MC-Agent-API")).toBe("3");
+    expect(status.headers.get("X-MC-Agent-API")).toBe("3.1");
     const compact = await status.json();
     expect(compact).toMatchObject({ ready: false, username: "AgentBot", connection: { state: "waiting_for_spawn" } });
     expect(compact).not.toHaveProperty("runtimeId");
@@ -607,7 +607,7 @@ describe("daemon server", () => {
       const invalid = await fetch(`http://127.0.0.1:${port}/sample?track=${track}&rate=100`,{headers});
       expect(invalid.status).toBe(400); expect(await invalid.json()).toMatchObject({code:"BAD_INPUT"});
       const response = await fetch(`http://127.0.0.1:${port}/sample?track=${track}&fields=position,velocity,status&rate=10`,{headers});
-      expect(response.headers.get("X-MC-Agent-API")).toBe("3");
+      expect(response.headers.get("X-MC-Agent-API")).toBe("3.1");
       const reader = response.body!.getReader();
       const first = JSON.parse(Buffer.from((await reader.read()).value!).toString("utf8").trim());
       expect(first).toMatchObject({type:"track.sample",trackId:track,values:{status:"loaded",position:{x:3,y:2,z:3}}});

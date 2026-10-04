@@ -1,7 +1,8 @@
 import { CliError, type ErrorCode, daemonIncompatible, sessionNotFound } from "../output/errors.js";
 import { readSession, SessionRecord } from "../session/store.js";
+import { API_VERSION } from "../core/protocol.js";
 
-export const API_VERSION = "3";
+export { API_VERSION };
 export const API_VERSION_HEADER = "X-MC-Agent-API";
 
 /** Verify the boundary before decoding a response using the current schema. */

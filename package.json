@@ -1,6 +1,6 @@
 {
   "name": "minecraft-agent",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "description": "Stateful Minecraft agent perception and action runtime powered by Mineflayer.",
   "keywords": [
     "minecraft",
@@ -53,7 +53,8 @@
     "commander": "^15.0.0",
     "mineflayer": "^4.37.1",
     "mineflayer-pathfinder": "^2.4.5",
-    "zod": "^4.4.3"
+    "zod": "^4.4.3",
+    "prismarine-world": "^3.7.0"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",

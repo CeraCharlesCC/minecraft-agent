@@ -7,7 +7,9 @@ import { BotController } from "../src/daemon/bot.js";
 
 class FakeBot extends EventEmitter {
   username: string | undefined = "AgentBot";
-  entity = { position: { x: 1, y: 2, z: 3 } };
+  entity = { position: { x: 1, y: 2, z: 3 }, yaw: 0, pitch: 0, height: 1.8 };
+  world = { getBlock: (position: Vec3) => ({ name: "dirt", displayName: "Dirt", type: 3, position,
+    shapes: [[0, 0, 0, 1, 1, 1]] as [number, number, number, number, number, number][] }) };
   entities = {
     "10": { id: 10, name: "cow", type: "mob", position: { x: 3, y: 2, z: 3 } },
     "12": { id: 12, name: "sniffer", type: "mob", position: { x: 5, y: 2, z: 3 } },
@@ -37,7 +39,7 @@ class FakeBot extends EventEmitter {
   registry = {
     blocksByName: { dirt: { id: 3 }, wheat: { id: 59 } },
     itemsByName: { dirt: { id: 3 }, stick: { id: 280 }, coal: { id: 263 }, lapis_lazuli: { id: 351 }, iron_sword: { id: 267 } },
-    entitiesByName: { sniffer: { category: "Passive mobs" } },
+    entitiesByName: { cow: { category: "Passive mobs" }, sniffer: { category: "Passive mobs" } },
   };
   currentWindow = {
     id: 1,
@@ -364,8 +366,8 @@ describe("BotController", () => {
     expect(subject.controls()).toEqual({ known: true, controls: [] });
     expect(subject.blockAt(4, 5, 6)).toMatchObject({ block: { name: "dirt", position: { x: 4, y: 5, z: 6 } } });
     expect(subject.blockInfo(4, 5, 6)).toMatchObject({ canDig: true, digTimeMs: 250 });
-    expect(subject.blockInSight(256, 5)).toMatchObject({ block: { name: "dirt", position: { x: 2, y: 2, z: 2 } } });
-    expect(subject.blockAtCursor(5)).toMatchObject({ block: { name: "dirt", position: { x: 3, y: 3, z: 3 } } });
+    expect(subject.blockInSight(256, 5)).toMatchObject({ known: true, block: { name: "dirt", position: { x: 1, y: 3, z: 3 } } });
+    expect(subject.blockAtCursor(5)).toMatchObject({ known: true, block: { name: "dirt", position: { x: 1, y: 3, z: 3 } } });
     expect(subject.findBlocks("dirt", 16, 3)).toMatchObject({ blocks: [{ name: "dirt", position: { x: 1, y: 2, z: 3 } }] });
 
     bot.pathfinder.goto.mockImplementation(async (...args: unknown[]) => {

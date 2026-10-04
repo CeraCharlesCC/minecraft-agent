@@ -143,12 +143,12 @@ export class ActionManager {
     return [...this.records.values()].map((record) => detachData(record));
   }
 
-  /** Frames retain all running targets and only the eight latest settlements. */
+  /** Frames describe current work and the latest settlement, without consuming history. */
   observation(): PublicAction[] {
-    const recent = new Set(this.terminalOrder.slice(-8));
-    return [...this.records.values()]
-      .filter((record) => record.state === "running" || recent.has(record.action))
-      .map(record => projectAction(record, { summary: true }));
+    const running = [...this.records.values()].filter((record) => record.state === "running");
+    const latestId = this.terminalOrder.at(-1);
+    const latest = latestId === undefined ? undefined : this.records.get(latestId);
+    return [...running, ...(latest ? [latest] : [])].map(record => projectAction(record, { summary: true }));
   }
 
   owner(resource: ActionResource): string | undefined { return this.owners.get(resource); }
@@ -199,6 +199,9 @@ export class ActionManager {
     record.reason = reason;
     record.finishedAt = new Date().toISOString();
     if (result !== undefined) record.result = detachedResult;
+    // Commit settlement order before cleanup/events can re-enter observation or
+    // settle another action. Reading a frame never consumes this ordering.
+    this.terminalOrder.push(id);
     const stop = this.cleanup.get(id);
     this.cleanup.delete(id);
     // Release before cleanup because stop() may synchronously emit callbacks.
@@ -209,7 +212,6 @@ export class ActionManager {
     this.events.add({ type: `action.${state}`, action: id, kind: record.kind, target: record.target, reason, error: record.error,
       ...(record.result === undefined ? {} : { result: record.result }) });
     for (const waiter of [...(this.waiters.get(id) ?? [])]) waiter(record);
-    this.terminalOrder.push(id);
     this.prune();
   }
 

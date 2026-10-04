@@ -56,6 +56,8 @@ describe("navigation safety and observation context", () => {
     expect(settlement).toMatchObject({ state: "completed", timedOut: false, result: {
       completionReason: "within_range", goal: { x: 6, y: 64, z: 0, range: 1 },
       finalPosition: { x: 5.5, y: 64, z: 0.5 }, distanceToGoal: Math.sqrt(0.5),
+      goalSatisfied: true, goalMetric: "block_node_euclidean", goalMetricDistance: 1,
+      distanceMetric: "euclidean_to_requested_position", goalNode: { x: 5, y: 64, z: 0 }, effectiveGoal: { x: 6, y: 64, z: 0 },
     } });
     bot.entity.position.x = 100;
     expect(controller.actions.get(action.action).result).toEqual(settlement.result);
@@ -72,6 +74,7 @@ describe("navigation safety and observation context", () => {
     expect(settlement).toMatchObject({ state: "completed", result: {
       completionReason: "already_within_range", goal: { x: 0, y: 64, z: 0, range: 0 },
       finalPosition: { x: 0.9, y: 64, z: 0.9 }, distanceToGoal: Math.sqrt(1.62),
+      goalSatisfied: true, goalMetricDistance: 0, goalNode: { x: 0, y: 64, z: 0 },
     } });
     expect(bot.pathfinder.goto).not.toHaveBeenCalled();
     controller.stop();
@@ -82,8 +85,30 @@ describe("navigation safety and observation context", () => {
     Object.assign(bot.entity, { position: { x: 0, y: 64.5, z: 0 }, onGround: true });
     Object.assign(bot, { blockAt: () => ({ type: 1 }) });
     const settlement = await controller.goto(0, 65, 0, 0);
-    expect(settlement).toMatchObject({ completionReason: "already_within_range", finalPosition: { y: 64.5 }, distanceToGoal: 0.5 });
+    expect(settlement).toMatchObject({ completionReason: "already_within_range", finalPosition: { y: 64.5 }, distanceToGoal: 0.5,
+      goalSatisfied: true, goalMetricDistance: 0, goalNode: { x: 0, y: 65, z: 0 } });
     expect(bot.pathfinder.goto).not.toHaveBeenCalled();
+    controller.stop();
+  });
+
+  it("exposes the floored fractional goal and vertical node distance from the arrival evaluation", async () => {
+    const { bot, controller } = runtime();
+    bot.pathfinder.goto.mockImplementation(async () => { bot.entity.position = { x: 10.9, y: 66, z: 5.9 }; });
+    const settlement = await controller.goto(10.2, 65.2, 5.2, 1);
+    expect(settlement).toMatchObject({ completionReason: "within_range", goalSatisfied: true,
+      goal: { x: 10.2, y: 65.2, z: 5.2, range: 1 }, effectiveGoal: { x: 10, y: 65, z: 5 },
+      goalNode: { x: 10, y: 66, z: 5 }, goalMetricDistance: 1 });
+    expect(settlement.distanceToGoal).toBeGreaterThan(1);
+    controller.stop();
+  });
+
+  it.each(["noPath", "timeout"])("rejects terminal %s even when the final node is in range", async status => {
+    const { bot, controller } = runtime();
+    bot.pathfinder.goto.mockImplementation(async () => {
+      bot.entity.position = { x: 6, y: 64, z: 0 };
+      bot.emit("path_update", { status, path: [] });
+    });
+    await expect(controller.goto(6, 64, 0, 0)).rejects.toMatchObject({ code: "NAVIGATION_FAILED" });
     controller.stop();
   });
 

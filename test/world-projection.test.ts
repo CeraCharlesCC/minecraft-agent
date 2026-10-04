@@ -155,14 +155,17 @@ describe("v3 public world projection", () => {
     expect(() => world.frame(bot, ready, { since: encodeHandle("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "f", 1) })).toThrow(expect.objectContaining({ code: "RUNTIME_MISMATCH" }));
   });
 
-  it("keeps running and eight recent settlements without repeating action result or diagnostics", () => {
+  it("projects the action manager's selection without repeating action results or diagnostics", () => {
     const world = new WorldModel(new EventStore()), bot = fixture();
     const actions = Array.from({ length: 12 }, (_, index) => ({ action: encodeHandle(world.runtimeId, "a", index + 1), kind: "navigate.goto", state: "completed", result: { completionReason: "within_range" }, runtimeId: world.runtimeId, startedAt: "private", error: { code: "NAVIGATION_FAILED", message: "private" } }));
     actions.push({ ...actions[0], state: "running" });
-    const frame = world.frame(bot, { ...ready, actions });
-    expect(frame.actions).toHaveLength(9);
+    const selection = [actions[12], actions[11]];
+    const frame = world.frame(bot, { ...ready, actions: selection });
+    expect(frame.actions).toHaveLength(2);
     expect(frame.actions[0].state).toBe("running");
     expect(JSON.stringify(frame.actions)).not.toContain("private");
     expect(JSON.stringify(frame.actions)).not.toContain("completionReason");
+    // WorldModel owns public fields, not a second action history policy.
+    expect(world.frame(bot, { ...ready, actions }).actions).toHaveLength(13);
   });
 });

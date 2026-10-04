@@ -69,7 +69,10 @@ try {
   const oldBase = oldWorld.frame(bot, ready), newBase = newWorld.frame(bot, ready);
   bot.entity.position.x = 1;
   record("position_delta", oldWorld.frame(bot, ready, { since: oldBase.frame }), newWorld.frame(bot, ready, { since: newBase.frame }));
-  const result = { completionReason: "within_range", goal: { x: 10, y: 64, z: 5, range: 1 }, finalPosition: { x: 9.5, y: 64, z: 5.5 }, distanceToGoal: Math.SQRT1_2 };
+  const result = { completionReason: "within_range", goal: { x: 10, y: 64, z: 5, range: 1 }, finalPosition: { x: 9.5, y: 64, z: 5.5 },
+    goalSatisfied: true, effectiveGoal: { x: 10, y: 64, z: 5 }, goalNode: { x: 9, y: 64, z: 5 },
+    goalMetric: "block_node_euclidean", goalMetricDistance: 1,
+    distanceMetric: "euclidean_to_requested_position", distanceToGoal: Math.SQRT1_2 };
   // v2 goto settled with void: its smaller output did not contain arrival evidence.
   const action = { action: `${runtime}:a1`, runtimeId: runtime, worldEpoch: 1, kind: "navigate.goto", state: "completed" as const,
     startedAt: "2026-10-04T00:00:00.000Z", finishedAt: "2026-10-04T00:00:01.000Z", timedOut: false };

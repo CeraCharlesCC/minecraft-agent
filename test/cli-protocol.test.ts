@@ -114,7 +114,8 @@ describe("CLI protocol", () => {
     ["world", "wake", "--context", encodeActionContext(runtimeId, 2), "--wait", "30001"],
     ["action", "wait", "--action", `${runtimeTag}:a1`, "--timeout", "-1"],
     ["entity", "find", "--type", "mob", "--types", "minecraft:cow"],
-    ["entity", "find", "--types", "cow"],
+    ["entity", "find", "--types", "example:cow"],
+    ["entity", "find", "--types", "minecraft:Cow"],
     ["observe", "events", "--profile", "future"],
     ["observe", "watch", "--track", `${runtimeTag}:p1`, "--profile", "agent"],
     ["observe", "watch", "--track", `${runtimeTag}:p1`, "--since", "now"],
@@ -132,6 +133,15 @@ describe("CLI protocol", () => {
     expect(handlers.observeEvents).toHaveBeenCalledWith({ session: "default", since: "now", profile: "all", limit: 50, types: ["chat.player", "chat.whisper"] });
     await program.parseAsync(["node", "mc-agent", "observe", "watch", "--since", "now", "--type", "chat.player"]);
     expect(handlers.observeWatch).toHaveBeenCalledWith({ session: "default", since: "now", profile: "all", types: ["chat.player"] });
+  });
+
+  it("canonicalizes bare and namespaced species to the same query", async () => {
+    const { program, handlers } = makeProgram();
+    for (const name of ["cow", "minecraft:cow"]) {
+      await program.parseAsync(["node", "mc-agent", "entity", "find", "--types", name]);
+      expect(handlers.entityFind).toHaveBeenLastCalledWith({ session: "default", types: ["minecraft:cow"],
+        radius: 32, limit: 50, includePlayers: true, includePassive: true });
+    }
   });
 
   it("parses full frames, inclusive species search, agent profiles, recovery and action waiting", async () => {

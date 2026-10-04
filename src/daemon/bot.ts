@@ -4,11 +4,16 @@ import { createBot } from "mineflayer";
 import pathfinderPackage from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import { EventStore, detachData } from "../core/events.js";
-import { WorldModel, FrameOptions, projectItem, projectEntity } from "../core/world.js";
+import { WorldModel, FrameOptions, projectItem, projectEntity, entitySpecies } from "../core/world.js";
+import { installEntityObservation, observedEntityPosition, resetEntityObservation } from "../core/entity-observation.js";
+import { installSelfOxygen } from "./self-oxygen.js";
 import { CanonicalChat } from "../core/chat.js";
 import { ActionManager, ActionResource } from "../core/actions.js";
 import { decodeActionContext } from "../core/context.js";
 import { CliError, commandBlocked, contextRequired } from "../output/errors.js";
+import { normalizeRegistryName } from "../core/registry.js";
+import { API_VERSION } from "../core/protocol.js";
+import { queryBlockRay } from "./ray-query.js";
 
 const { goals, Movements, pathfinder } = pathfinderPackage;
 
@@ -79,9 +84,9 @@ type MineflayerBot = EventEmitter & {
   clearControlStates?(): void;
   lookAt(position: Vec3): Promise<void> | void;
   look?(yaw: number, pitch: number, force?: boolean): Promise<void>;
-  blockAt?(position: Vec3): MineflayerBlock | null;
-  blockInSight?(maxSteps: number, vectorLength: number): MineflayerBlock | null;
-  blockAtCursor?(maxDistance?: number): MineflayerBlock | null;
+  blockAt?(position: Vec3): MineflayerBlock | null | undefined;
+  blockInSight?(maxSteps: number, vectorLength: number): MineflayerBlock | null | undefined;
+  blockAtCursor?(maxDistance?: number): MineflayerBlock | null | undefined;
   findBlock?(options: { matching: number | number[] | ((block: MineflayerBlock) => boolean); maxDistance: number }): MineflayerBlock | null;
   findBlocks?(options: { matching: number | number[] | ((block: MineflayerBlock) => boolean); maxDistance: number; count: number }): Vec3[];
   canDigBlock?(block: MineflayerBlock): boolean;
@@ -134,6 +139,7 @@ export type CreateBotFn = (options: Record<string, unknown>) => MineflayerBot;
 
 type MineflayerItem = { name: string; count: number; slot: number; displayName?: string };
 type MineflayerBlock = {
+  shapes?: [number, number, number, number, number, number][];
   name: string;
   displayName?: string;
   type: number;
@@ -142,7 +148,7 @@ type MineflayerBlock = {
   position: Vec3;
   getProperties?(): Record<string, unknown>;
 };
-type MineflayerEntity = { uuid?: string; velocity?: { x: number; y: number; z: number }; onGround?: boolean; id?: number; username?: string; name?: string; type?: string; position?: { x: number; y: number; z: number } };
+type MineflayerEntity = { yaw?: number; pitch?: number; height?: number; uuid?: string; velocity?: { x: number; y: number; z: number }; onGround?: boolean; id?: number; username?: string; name?: string; type?: string; position?: { x: number; y: number; z: number } };
 type MineflayerWindow = {
   slots?: Array<MineflayerItem | null>;
   id?: number;
@@ -340,6 +346,8 @@ export class BotController {
   readonly world: WorldModel;
   readonly actions: ActionManager;
   private chatReceiver?: CanonicalChat;
+  private disposeEntityObservation?: () => void;
+  private selfOxygen?: ReturnType<typeof installSelfOxygen>;
   private lookTracking?: { track: string; action: string };
   private lookBusy = false;
   private lifecycleReset = false;
@@ -388,6 +396,8 @@ export class BotController {
       },
     });
     this.bot = bot;
+    this.disposeEntityObservation = installEntityObservation(bot);
+    this.selfOxygen = installSelfOxygen(bot);
     const on = (event: string, listener: (...args: any[]) => void, prepend = false) => {
       const guarded = (...args: any[]) => { if (current()) listener(...args); };
       this.botListeners.push({ bot, event, listener: guarded });
@@ -495,6 +505,10 @@ export class BotController {
     ++this.generation;
     this.chatReceiver?.dispose();
     this.chatReceiver = undefined;
+    this.disposeEntityObservation?.();
+    this.disposeEntityObservation = undefined;
+    this.selfOxygen?.dispose();
+    this.selfOxygen = undefined;
     for (const { bot: source, event, listener } of this.botListeners.splice(0)) source.off(event, listener);
     // A retired protocol adapter can still deliver an error while quit drains.
     // This listener has no controller/world access and avoids unhandled errors.
@@ -515,6 +529,7 @@ export class BotController {
     // the operation after its owner has already terminated.
     const originalLookAt = bot.lookAt.bind(bot);
     bot.lookAt = (position) => {
+      this.requireObservedSelfPosition();
       const verify = this.continuationGuard(["look"]);
       const result = originalLookAt(position);
       if (result && typeof result.then === "function") {
@@ -634,10 +649,15 @@ export class BotController {
     this.checkWorld();
     const entity = this.world.resolveTrack(track) as MineflayerEntity;
     const values: Record<string, unknown> = {};
-    if (fields.includes("position")) values.position = serializePosition(entity.position);
-    if (fields.includes("velocity")) values.velocity = serializePosition(entity.velocity);
+    const position = observedEntityPosition(entity), unknownFields: string[] = [];
+    if (fields.includes("position")) {
+      if (position) values.position = position; else unknownFields.push("position");
+    }
+    if (fields.includes("velocity")) {
+      if (position && entity.velocity) values.velocity = serializePosition(entity.velocity); else unknownFields.push("velocity");
+    }
     if (fields.includes("status")) values.status = "loaded";
-    return { type: "track.sample", trackId: track, values };
+    return { type: "track.sample", trackId: track, values, ...(unknownFields.length ? { unknownFields } : {}) };
   }
 
   validateContext(input: { runtimeId?: unknown; worldEpoch?: unknown; context?: unknown }, requireReady = true) {
@@ -764,7 +784,7 @@ export class BotController {
   }
 
   diagnose() {
-    return { apiVersion: 3, daemonResponsive: true,
+    return { apiVersion: API_VERSION, daemonResponsive: true,
       ready: this.connectionStatus().ready, connection: this.connectionDetails(),
       ...(this.lastConnectionError ? { lastError: { ...this.lastConnectionError, code: this.publicConnectionCode(), message: "The game connection is unavailable." } } : {}),
       transitions: this.transitions.map(({ state, at, generation, reason }) => ({ state, at, generation, ...(reason ? { reason: this.safeDisconnectReason() } : {}) })),
@@ -925,12 +945,14 @@ export class BotController {
     for (const owner of owners) {
       const action = this.actions.get(owner);
       if (!action.target) continue;
-      try { this.world.resolveTrack(action.target); }
+      try { this.getRequiredEntity(action.target); }
       catch (error) { this.actions.fail(owner, error); }
     }
   }
 
   private invalidateWorld(reason: string) {
+    this.selfOxygen?.reset();
+    resetEntityObservation(this.bot);
     if (reason === "dimension_changed") { this.leaveReady(); this.spawned = false; }
     this.actions.failAll(reason);
     this.stopResources(["movement", "look", "item", "window"]);
@@ -991,7 +1013,7 @@ export class BotController {
             this.actions.fail(context.action, new CliError("WORLD_CHANGED", "World changed before packet submission.", "Observe a fresh frame."));
             return;
           }
-          if (context.target && this.world.resolveTrack(context.target) !== context.binding) {
+          if (context.target && this.getRequiredEntity(context.target) !== context.binding) {
             this.actions.fail(context.action, new CliError("TRACK_LOST", "Target binding changed before packet submission.", "Observe a fresh frame."));
             return;
           }
@@ -1006,11 +1028,11 @@ export class BotController {
     if (!tracking || this.lookBusy) return;
     try {
       this.checkWorld();
-      const entity = this.world.resolveTrack(tracking.track) as MineflayerEntity;
-      if (!entity.position) throw new CliError("TRACK_LOST", "Target has no current position.", "Observe a fresh frame.");
+      const entity = this.getRequiredEntity(tracking.track);
+      const position = observedEntityPosition(entity)!;
       this.lookBusy = true;
       const generation = this.generation;
-      Promise.resolve(this.requireBot().lookAt(new Vec3(entity.position.x, entity.position.y, entity.position.z)))
+      Promise.resolve(this.requireBot().lookAt(new Vec3(position.x, position.y, position.z)))
         .catch((error) => this.actions.fail(tracking.action, error))
         .finally(() => { if (generation === this.generation) this.lookBusy = false; });
     } catch (error) { this.actions.fail(tracking.action, error); }
@@ -1034,7 +1056,7 @@ export class BotController {
   position() {
     if (!this.connectionStatus().ready) return { known: false };
     const bot = this.requireBot();
-    const position = serializePosition(bot.entity?.position);
+    const position = observedEntityPosition(bot.entity);
     return { known: position !== undefined, ...(position ? { position } : {}),
       ...(bot.game?.dimension !== undefined ? { dimension: bot.game.dimension } : {}) };
   }
@@ -1056,11 +1078,11 @@ export class BotController {
     if (!this.connectionStatus().ready) return { known: false };
     const bot = this.requireBot();
     if (!bot.players) return { known: false };
-    const origin = bot.entity?.position;
+    const origin = observedEntityPosition(bot.entity);
     return { known: true,
       players: Object.entries(bot.players).map(([username, player]) => ({
         username: player.username ?? username,
-        ...(player.entity?.position ? { position: serializePosition(player.entity.position), distance: distance(origin, player.entity.position) } : {}),
+        ...(observedEntityPosition(player.entity) ? { position: observedEntityPosition(player.entity), distance: distance(origin, observedEntityPosition(player.entity)) } : {}),
       })),
     };
   }
@@ -1121,24 +1143,27 @@ export class BotController {
   blockAt(x: number, y: number, z: number) {
     if (!this.connectionStatus().ready) return { known: false };
     const block = this.requireMethod("blockAt").call(this.requireBot(), new Vec3(x, y, z)) as MineflayerBlock | null;
-    return { known: block !== null, block: serializeBlock(block) };
+    return block == null ? { known: false } : { known: true, block: serializeBlock(block) };
   }
 
   blockInSight(maxSteps: number, vectorLength: number) {
-    if (!this.connectionStatus().ready) return { known: false };
-    const block = this.requireMethod("blockInSight").call(this.requireBot(), maxSteps, vectorLength) as MineflayerBlock | null;
-    return { known: block !== null, block: serializeBlock(block) };
+    return this.blockAtCursor(maxSteps * vectorLength);
   }
 
   blockAtCursor(maxDistance: number) {
     if (!this.connectionStatus().ready) return { known: false };
-    const block = this.requireMethod("blockAtCursor").call(this.requireBot(), maxDistance) as MineflayerBlock | null;
-    return { known: block !== null, block: serializeBlock(block) };
+    const bot = this.requireBot();
+    const position = observedEntityPosition(bot.entity);
+    if (!position) return { known: false };
+    const result = queryBlockRay(bot.world as { getBlock(position: Vec3): MineflayerBlock | null | undefined } | undefined,
+      { position, yaw: bot.entity?.yaw, pitch: bot.entity?.pitch, height: bot.entity?.height }, maxDistance);
+    return result.known ? { known: true, block: result.block === null ? null : serializeBlock(result.block) } : { known: false };
   }
 
   findBlocks(name: string, radius: number, count: number) {
     if (!this.connectionStatus().ready) return { known: false };
     const bot = this.requireBot();
+    name = normalizeRegistryName(name);
     const blockType = this.blockType(name);
     const positions = this.requireMethod("findBlocks").call(bot, { matching: blockType, maxDistance: radius, count }) as Vec3[];
     return {
@@ -1212,27 +1237,31 @@ export class BotController {
     const onUpdate = (result: { status?: unknown }) => {
       if (typeof result?.status === "string") pathStatus = result.status;
     };
-    const atGoal = () => {
-      const position = bot.entity?.position;
-      if (!position || ![position.x, position.y, position.z].every(Number.isFinite)) return false;
+    const evaluateGoal = () => {
+      const position = observedEntityPosition(bot.entity);
+      if (!position || ![position.x, position.y, position.z].every(Number.isFinite)) return undefined;
+      const finalPosition = serializePosition(position)!;
       const node = new Vec3(Math.floor(position.x), Math.floor(position.y), Math.floor(position.z));
       // Match pathfinder's node height when standing on a partial solid block.
       const block = bot.blockAt?.(node);
       if (position.y - node.y > 0.001 && bot.entity?.onGround && block && movements && !movements.emptyBlocks.has(block.type)) node.y += 1;
       // GoalNear only reads coordinates; supply the declared Move shape as well.
-      return goal.isEnd(Object.assign(node, { remainingBlocks: 0, cost: 0, toBreak: [], toPlace: [], parkour: false, hash: `${node.x},${node.y},${node.z}` }));
+      const goalSatisfied = goal.isEnd(Object.assign(node, { remainingBlocks: 0, cost: 0, toBreak: [], toPlace: [], parkour: false, hash: `${node.x},${node.y},${node.z}` }));
+      return { goalSatisfied, finalPosition, goalNode: serializePosition(node)!, effectiveGoal: { x: goal.x, y: goal.y, z: goal.z },
+        goalMetric: "block_node_euclidean" as const, goalMetricDistance: distance(node, goal)!,
+        distanceMetric: "euclidean_to_requested_position" as const, distanceToGoal: distance(finalPosition, { x, y, z })! };
     };
     const details = (reason: string) => ({ reason, pathStatus,
       goal: { x: goal.x, y: goal.y, z: goal.z, range },
       position: serializePosition(bot.entity?.position),
       policy: { canDig: this.navigationMovementConfig.canDig === true, canPlace: this.navigationMovementConfig.canPlace === true },
       searchRadius: pathfinder.searchRadius, thinkTimeout: pathfinder.thinkTimeout });
-    const result = (completionReason: "within_range" | "already_within_range") => ({
-      completionReason, goal: { x, y, z, range },
-      finalPosition: serializePosition(bot.entity?.position)!,
-      distanceToGoal: distance(bot.entity?.position, { x, y, z })!,
+    const result = (completionReason: "within_range" | "already_within_range", evaluation: NonNullable<ReturnType<typeof evaluateGoal>>) => ({
+      completionReason, goal: { x, y, z, range }, ...evaluation,
     });
-    if (atGoal()) { verify(); this.validateContext(expected); return result("already_within_range"); }
+    const initialEvaluation = evaluateGoal();
+    if (!initialEvaluation) throw commandBlocked("Bot's absolute position is not yet observed.", "Observe a fresh position before navigating.");
+    if (initialEvaluation?.goalSatisfied) { verify(); this.validateContext(expected); return result("already_within_range", initialEvaluation); }
     bot.on("path_update", onUpdate);
     try {
       try { await pathfinder.goto(goal); }
@@ -1249,24 +1278,27 @@ export class BotController {
       }
       verify();
       this.validateContext(expected);
-      if (pathStatus === "noPath" || pathStatus === "timeout" || !atGoal()) {
+      const finalEvaluation = evaluateGoal();
+      if (pathStatus === "noPath" || pathStatus === "timeout" || !finalEvaluation?.goalSatisfied) {
         const reason = pathStatus === "noPath" ? "NO_PATH" : pathStatus === "timeout" ? "TIMEOUT" : "GOAL_NOT_REACHED";
         throw new CliError("NAVIGATION_FAILED", "Pathfinder stopped without reaching the goal.",
           "Observe the current position and nearby terrain; no digging or placement permission is granted automatically.", 1, details(reason));
       }
-      return result("within_range");
+      return result("within_range", finalEvaluation);
     } finally { bot.off("path_update", onUpdate); }
   }
 
   follow(player: string, range: number): { following: string; range: number; targetPosition?: { x: number; y: number; z: number } } {
     const bot = this.requireBot();
+    this.requireObservedSelfPosition();
     const target = bot.players?.[player]?.entity;
     if (!target) {
       throw new CliError("COMMAND_BLOCKED", `Player '${player}' is not visible.`, "Observe the current game state and choose a valid operation.");
     }
+    if (!observedEntityPosition(target)) throw commandBlocked("Player's absolute position is not yet observed.", "Observe a fresh frame before following.");
     this.configurePathfinderMovements();
     this.requirePathfinder().setGoal(new goals.GoalFollow(target as never, range), true);
-    return { following: player, range, targetPosition: serializePosition(target.position) };
+    return { following: player, range, targetPosition: observedEntityPosition(target) };
   }
 
   stopNavigation() {
@@ -1327,7 +1359,7 @@ export class BotController {
 
   async collectItem(id: number | string, range: number) {
     const entity = this.getRequiredEntity(id);
-    const position = entity.position;
+    const position = observedEntityPosition(entity);
     if (!position) {
       throw new CliError("COMMAND_BLOCKED", `Entity '${id}' has no position.`, "Observe the current game state and choose a valid operation.");
     }
@@ -1337,10 +1369,7 @@ export class BotController {
 
   async equip(itemName: string, destination: string): Promise<{ equipped: string; destination: string; heldItem?: { name: string; displayName?: string } }> {
     const bot = this.requireBot();
-    const item = bot.inventory?.items().find((candidate) => candidate.name === itemName || candidate.displayName === itemName);
-    if (!item) {
-      throw new CliError("COMMAND_BLOCKED", `Item '${itemName}' is not in inventory.`, "Observe the current game state and choose a valid operation.");
-    }
+    const item = this.findInventoryItem(itemName);
     await this.requireMethod("equip").call(bot, item, destination);
     return { equipped: item.name, destination, heldItem: bot.heldItem ? { name: bot.heldItem.name, displayName: bot.heldItem.displayName } : undefined };
   }
@@ -1356,6 +1385,7 @@ export class BotController {
   }
 
   async toss(itemName: string, count: number): Promise<{ tossed: string; count: number }> {
+    itemName = normalizeRegistryName(itemName);
     const itemType = this.itemType(itemName);
     await this.requireMethod("toss").call(this.requireBot(), itemType, null, count);
     return { tossed: itemName, count };
@@ -1390,6 +1420,7 @@ export class BotController {
   }
 
   recipes(itemName: string, count: number, table?: { x: number; y: number; z: number }) {
+    itemName = normalizeRegistryName(itemName);
     const itemType = this.itemType(itemName);
     const craftingTable = table ? this.getRequiredBlock(table.x, table.y, table.z) : null;
     const recipes = this.requireMethod("recipesFor").call(this.requireBot(), itemType, null, count, craftingTable) as unknown[];
@@ -1428,6 +1459,7 @@ export class BotController {
     recipeIndex: number;
     recipeId?: string;
   }> {
+    itemName = normalizeRegistryName(itemName);
     const itemType = this.itemType(itemName);
     const craftingTable = table ? this.getRequiredBlock(table.x, table.y, table.z) : undefined;
     const recipes = this.requireMethod("recipesFor").call(this.requireBot(), itemType, null, count, craftingTable ?? null) as unknown[];
@@ -1535,6 +1567,7 @@ export class BotController {
   }
 
   async windowDeposit(itemName: string, count: number) {
+    itemName = normalizeRegistryName(itemName);
     const window = this.requireWindow();
     if (!window.deposit) {
       throw new CliError("COMMAND_BLOCKED", "Current window does not support deposit.", "Observe the current game state and choose a valid operation.");
@@ -1544,6 +1577,7 @@ export class BotController {
   }
 
   async windowWithdraw(itemName: string, count: number) {
+    itemName = normalizeRegistryName(itemName);
     const window = this.requireWindow();
     if (!window.withdraw) {
       throw new CliError("COMMAND_BLOCKED", "Current window does not support withdraw.", "Observe the current game state and choose a valid operation.");
@@ -1626,11 +1660,11 @@ export class BotController {
   }
 
   private publicEntity(entity: MineflayerEntity) {
-    const name = entity.type === "player" || entity.username ? "player" : entity.name?.replace(/^minecraft:/, "");
+    const type = entitySpecies(entity, this.bot?.registry), position = observedEntityPosition(entity);
     return projectEntity({ trackId: this.world.trackFor(entity), status: "loaded",
-      type: name && /^[a-z][a-z0-9_]*$/.test(name) ? `minecraft:${name}` : undefined,
-      name: entity.name, username: entity.username, position: entity.position,
-      distance: distance(this.bot?.entity?.position, entity.position),
+      type: type ?? null, name: entity.name, username: entity.username, position,
+      distance: distance(observedEntityPosition(this.bot?.entity), position),
+      ...(!type || !position ? { unknownFields: [...(!type ? ["type"] : []), ...(!position ? ["position"] : [])] } : {}),
     });
   }
 
@@ -1690,25 +1724,29 @@ export class BotController {
   }
 
   private blockType(name: string): number {
+    name = normalizeRegistryName(name);
     const block = this.requireBot().registry?.blocksByName?.[name];
-    if (!block) {
+    if (!block || !Number.isInteger(block.id)) {
       throw new CliError("BAD_INPUT", `Unknown block '${name}' for this Minecraft version.`, "Observe the current game state and choose a valid operation.");
     }
     return block.id;
   }
 
   private itemType(name: string): number {
+    name = normalizeRegistryName(name);
     const item = this.requireBot().registry?.itemsByName?.[name];
-    if (!item) {
+    if (!item || !Number.isInteger(item.id)) {
       throw new CliError("BAD_INPUT", `Unknown item '${name}' for this Minecraft version.`, "Observe the current game state and choose a valid operation.");
     }
     return item.id;
   }
 
   private findInventoryItem(name: string, excludeSlot?: number): MineflayerItem {
+    // Retain existing exact display-name selection; namespaced inputs are always registry identifiers.
+    const registryName = name.includes(":") || /^[a-z0-9_./-]+$/.test(name) ? normalizeRegistryName(name) : undefined;
     const item = this.requireBot()
       .inventory?.items()
-      .find((candidate) => candidate.slot !== excludeSlot && (candidate.name === name || candidate.displayName === name));
+      .find((candidate) => candidate.slot !== excludeSlot && (candidate.name === registryName || candidate.displayName === name));
     if (!item) {
       throw new CliError("COMMAND_BLOCKED", `Item '${name}' is not in inventory.`, "Observe the current game state and choose a valid operation.");
     }
@@ -1716,15 +1754,25 @@ export class BotController {
   }
 
   private getRequiredEntity(id: number | string): MineflayerEntity {
+    let entity: MineflayerEntity | undefined;
     if (typeof id === "string") {
       this.checkWorld();
-      return this.world.resolveTrack(id) as MineflayerEntity;
-    }
-    const entity = this.requireBot().entities?.[String(id)];
+      entity = this.world.resolveTrack(id) as MineflayerEntity;
+    } else entity = this.requireBot().entities?.[String(id)];
     if (!entity) {
       throw new CliError("COMMAND_BLOCKED", `Entity '${id}' is not visible.`, "Observe the current game state and choose a valid operation.");
     }
+    if (!observedEntityPosition(entity)) {
+      throw commandBlocked("Target's absolute position is not yet observed.", "Observe a fresh frame before acting on this target.");
+    }
+    this.requireObservedSelfPosition();
     return entity;
+  }
+
+  private requireObservedSelfPosition(): { x: number; y: number; z: number } {
+    const position = observedEntityPosition(this.requireBot().entity);
+    if (!position) throw commandBlocked("Bot's absolute position is not yet observed.", "Observe a fresh frame before performing a spatial operation.");
+    return position;
   }
 
   private requireWindow(): MineflayerWindow {
@@ -1790,6 +1838,9 @@ export class BotController {
   }
 
   private assertAttackAllowed(entity: MineflayerEntity, options: { allowPlayers?: boolean; allowPassive?: boolean }): void {
+    if (!entitySpecies(entity, this.requireBot().registry)) {
+      throw commandBlocked("Target species is not yet observed; attack permissions cannot be checked.", "Observe a known species before attacking.");
+    }
     if (this.isPlayerEntity(entity) && !options.allowPlayers) {
       throw commandBlocked("Refusing to attack a player without allowPlayers.", "Only pass --allow-players when authorized.");
     }

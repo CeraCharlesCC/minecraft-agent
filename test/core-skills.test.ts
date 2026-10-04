@@ -35,7 +35,7 @@ describe("core skill content", () => {
     expect(full).toContain("does not repair event gaps");
     expect(full).toContain("`chat.player`, `chat.unverified`");
     expect(full).toContain("does not acknowledge unread events");
-    expect(full).toContain("`X-MC-Agent-API: 3`");
+    expect(full).toContain("`X-MC-Agent-API: 3.1`");
     expect(full).toContain("`DAEMON_INCOMPATIBLE`");
   });
 

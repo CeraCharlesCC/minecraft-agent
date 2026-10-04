@@ -47,6 +47,39 @@ describe("runtime action ownership", () => {
     expect(() => actions.get(`${events.runtimeTag}:a1`)).toThrow(expect.objectContaining({ code: "ACTION_UNKNOWN" }));
   });
 
+  it("shows every running action and only the latest terminal action in settlement order", async () => {
+    const { actions, events } = setup();
+    const oldWork = deferred<string>();
+    const old = actions.start("old", 1, [], { run: () => oldWork.promise });
+    const running = actions.start("follow", 1, ["movement"], { continuous: true, target: `${events.runtimeTag}:e1` });
+    const newer = actions.start("newer", 1, []);
+    await tick();
+    expect(actions.observation().map(record => record.action)).toEqual([old.action, running.action, newer.action]);
+    oldWork.resolve("settled last");
+    await tick();
+    const expected = [
+      { action: running.action, kind: "follow", state: "running", target: `${events.runtimeTag}:e1` },
+      { action: old.action, kind: "old", state: "completed" },
+    ];
+    expect(actions.observation()).toEqual(expected);
+    expect(actions.observation()).toEqual(expected);
+    expect(actions.get(newer.action).state).toBe("completed");
+    actions.fail(running.action, new CliError("TRACK_LOST", "Lost", "Observe."));
+    expect(actions.observation()).toEqual([{ action: running.action, kind: "follow", state: "failed",
+      target: running.target, reason: "TRACK_LOST", error: { code: "TRACK_LOST" } }]);
+    expect(actions.list()).toHaveLength(3);
+    expect(events.query().events.filter(event => event.type === "action.completed")).toHaveLength(2);
+  });
+
+  it("exposes a committed settlement to synchronous event observers", async () => {
+    const { actions, events } = setup();
+    const snapshots: unknown[] = [];
+    events.subscribe(event => { if (event.type === "action.completed") snapshots.push(actions.observation()); });
+    const action = actions.start("look.at", 1, []);
+    await tick();
+    expect(snapshots).toEqual([[{ action: action.action, kind: "look.at", state: "completed" }]]);
+  });
+
   it("waits for settlement and returns detached results", async () => {
     const { actions } = setup();
     const work = deferred<{ value: number }>();

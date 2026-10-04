@@ -1,4 +1,5 @@
 import { ZodError } from "zod";
+import { API_VERSION } from "../core/protocol.js";
 
 export type ErrorCode =
   | "BAD_INPUT"
@@ -56,10 +57,10 @@ export function sessionNotFound(session: string): CliError {
 export function daemonIncompatible(session: string, details: Record<string, unknown> = {}): CliError {
   return new CliError(
     "DAEMON_INCOMPATIBLE",
-    `Session '${session}' is running a daemon incompatible with API v3.`,
-    `Stop it with 'mc-agent session stop --session ${session}', then start it again with the current CLI and the same connection options. Existing daemons keep their old code after an upgrade; retrying the observation will not fix this.`,
+    `Session '${session}' is running a daemon incompatible with API v${API_VERSION}.`,
+    `Use the CLI version matching this daemon to run 'mc-agent session stop --session ${session}' and confirm it stopped, then start it with the current CLI and the same connection options. Existing daemons keep their old code after an upgrade; retrying the observation will not fix this.`,
     1,
-    { session, expectedApiVersion: 3, ...details },
+    { session, expectedApiVersion: API_VERSION, ...details },
   );
 }
 

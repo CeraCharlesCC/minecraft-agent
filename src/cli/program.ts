@@ -6,6 +6,7 @@ import { badInput, commandBlocked, contextRequired, normalizeError, publicError 
 import { failure, formatDefaultText, resolveOutputMode, success, writeJson, writeText } from "../output/response.js";
 import { decodeActionContext } from "../core/context.js";
 import { isHandle } from "../core/handles.js";
+import { normalizeRegistryName } from "../core/registry.js";
 import { CliHandlers } from "./handlers.js";
 
 export interface CliIo {
@@ -265,7 +266,8 @@ const entityFindSchema = sessionSchema.extend({
   type: z.string().min(1).optional(),
   radius: z.coerce.number().positive().max(256).default(32),
   limit: z.coerce.number().int().min(1).max(200).default(50),
-  types: z.preprocess(value => value === undefined ? undefined : normalizeEventTypes(value), z.array(z.string().regex(/^minecraft:[a-z][a-z0-9_]*$/)).min(1).optional()),
+  types: z.preprocess(value => value === undefined ? undefined : normalizeEventTypes(value),
+    z.array(z.string().transform(name => `minecraft:${normalizeRegistryName(name)}`)).min(1).max(512).optional()),
   includePlayers: z.boolean().default(true),
   includePassive: z.boolean().default(true),
 });
@@ -822,7 +824,7 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
   world
     .command("find-blocks")
     .description("Find nearby loaded blocks by registry name")
-    .requiredOption("--name <name>", "block name, for example farmland or oak_log")
+    .requiredOption("--name <name>", "block registry name, for example stone or minecraft:stone")
     .option("--radius <blocks>", "search radius", "32")
     .option("--count <count>", "maximum blocks to return", "10")
     .option("--session <name>", "session name", "default")
@@ -968,7 +970,7 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .description("Find visible entities with filters")
     .option("--name <name>", "entity name or username")
     .option("--type <type>", "deprecated legacy Mineflayer entity category")
-    .option("--types <species>", "canonical species names; repeat or comma-separate", collectEventType)
+    .option("--types <species>", "species such as cow or minecraft:cow; repeat or comma-separate", collectEventType)
     .option("--radius <blocks>", "search radius", "32")
     .option("--limit <count>", "maximum entities to return", "50")
     .option("--include-players", "deprecated: players are already included", true)

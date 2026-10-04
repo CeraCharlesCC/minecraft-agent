@@ -246,7 +246,7 @@ describe("runtime integration", () => {
       await Promise.resolve(); await Promise.resolve();
     }
     const frame = controller.frame({ maxEntities: 0, radius: 0 });
-    expect(frame.actions).toHaveLength(9);
+    expect(frame.actions).toHaveLength(2);
     expect(frame.actions.some((a: any) => a.action === running.action)).toBe(true);
     expect(frame.entities.map((e: any) => e.trackId)).toContain(track);
     expect(frame.actions.every((a: any) => !("result" in a))).toBe(true);
@@ -256,7 +256,7 @@ describe("runtime integration", () => {
     const next = controller.runAction("inventory.quickbar", ["item"], () => ({ pages: "y".repeat(10000) }));
     await Promise.resolve(); await Promise.resolve();
     const delta = controller.frame({ maxEntities: 0, radius: 0, since: frame.frame });
-    expect(delta.delta.changed.actions).toHaveLength(9);
+    expect(delta.delta.changed.actions).toHaveLength(2);
     expect(delta.delta.changed.actions.at(-1).action).toBe(next.action);
     expect(controller.actions.get(next.action).result).toEqual({ pages: "y".repeat(10000) });
     expect(JSON.stringify(delta).length).toBeLessThan(5000);

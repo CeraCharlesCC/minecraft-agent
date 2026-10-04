@@ -102,7 +102,8 @@ describe("observed world model", () => {
     expect(world.searchLoaded(live, ready, { types: ["minecraft:cow"] }).entities[0]).toMatchObject({ type: "minecraft:cow" });
     expect(world.searchLoaded(live, ready, { type: "mob" }).entities).toHaveLength(1);
     code(() => world.searchLoaded(live, ready, { types: ["minecraft:unknown"] }), "BAD_INPUT");
-    code(() => world.searchLoaded(live, ready, { types: ["cow"] }), "BAD_INPUT");
+    expect(world.searchLoaded(live, ready, { types: ["cow"] }).entities).toEqual(world.searchLoaded(live, ready, { types: ["minecraft:cow"] }).entities);
+    code(() => world.searchLoaded(live, ready, { types: ["mod:cow"] }), "BAD_INPUT");
     code(() => world.searchLoaded(live, ready, { type: "mob", types: ["minecraft:cow"] }), "BAD_INPUT");
   });
 
@@ -227,7 +228,7 @@ describe("observed world model", () => {
     const chosen = all.entities.find((item: any) => item.minecraftEntityId === 3).trackId;
     const projected = world.frame(live, { ...ready, actions: [{ target: far, state: "running" }] }, { maxEntities: 0, radius: 0, tracks: [chosen] });
     expect(projected.entities.map((item: any) => item.trackId).sort()).toEqual([far, chosen].sort());
-    expect(projected.projection).toMatchObject({ included: 2, omitted: 1, aggregates: { player: 1 } });
+    expect(projected.projection).toMatchObject({ included: 2, omitted: 1, aggregates: { "minecraft:player": 1 } });
   });
 
   it("projects follow goals to compact track references and detects only public navigation changes", () => {
