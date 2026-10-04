@@ -32,7 +32,6 @@ describe("coverage-aware block ray query with installed world and block shapes",
     expect(controller.blockAtCursor(2)).toMatchObject({ known: true, block: { name: "stone", position: { x: 0, y: 65, z: 1 } } });
     expect(controller.blockAtCursor(2).block).not.toHaveProperty("shapes");
     expect(controller.blockAtCursor(2).block).not.toHaveProperty("intersect");
-    expect(controller.blockInSight(4, 0.5)).toEqual(controller.blockAtCursor(2));
     controller.stop();
     expect(controller.blockAtCursor(2)).toEqual({ known: false });
   });

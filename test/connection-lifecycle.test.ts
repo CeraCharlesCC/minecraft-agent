@@ -268,8 +268,6 @@ describe("connection lifecycle", () => {
     await vi.advanceTimersByTimeAsync(1);
     expect(await recovery).toMatchObject({ ready: false, attemptLimitReached: true });
     expect(subject.frame()).toMatchObject({ connection: { ready: false }, self: {}, inventory: { known: false } });
-    expect(subject.position()).toEqual({ known: false });
-    expect(subject.inventory()).toEqual({ known: false });
     expect(subject.findEntities({})).toMatchObject({ entities: [] });
   });
 

@@ -60,6 +60,8 @@ export interface ActionInput extends SessionInput {
   action: string;
 }
 
+export interface ActionStopInput extends SessionInput { resources?: ("movement" | "look" | "item" | "window")[] }
+
 export interface ActionWaitInput extends ActionInput { timeout: number }
 
 export interface EnsureReadyInput extends SessionInput { timeout: number; maxAttempts: number; backoff: number }
@@ -103,11 +105,6 @@ export interface LookInput extends SessionInput {
   force: boolean;
 }
 
-export interface EntitiesInput extends SessionInput {
-  radius: number;
-  limit: number;
-}
-
 export interface BlockPositionInput extends SessionInput {
   x: number;
   y: number;
@@ -122,11 +119,6 @@ export interface FindBlocksInput extends SessionInput {
 
 export interface CursorBlockInput extends SessionInput {
   maxDistance: number;
-}
-
-export interface SightBlockInput extends SessionInput {
-  maxSteps: number;
-  vectorLength: number;
 }
 
 export interface NavigateGotoInput extends BlockPositionInput {
@@ -145,6 +137,9 @@ export interface NavigateConfigureInput extends SessionInput {
   allowParkour?: boolean;
   canOpenDoors?: boolean;
   maxDropDown?: number;
+}
+
+export interface NavigateTuningInput extends SessionInput {
   searchRadius?: number;
   thinkTimeout?: number;
   tickTimeout?: number;
@@ -212,17 +207,9 @@ export interface EntityAttackInput extends EntityInput {
 
 export interface EntityFindInput extends SessionInput {
   name?: string;
-  type?: string;
   types?: string[];
   radius: number;
   limit: number;
-  includePlayers: boolean;
-  includePassive: boolean;
-}
-
-export interface SwingArmInput extends SessionInput {
-  hand: "left" | "right";
-  showHand: boolean;
 }
 
 export interface MoveVehicleInput extends SessionInput {
@@ -249,10 +236,11 @@ export interface CliHandlers {
   observeFrame?(input: FrameInput): Promise<unknown>;
   observeSurroundings?(input: SurroundingsInput): Promise<unknown>;
   debugEvents?(input: DebugEventsInput): Promise<unknown>;
-  sessionDiagnose?(input: SessionInput): Promise<unknown>;
+  debugSession?(input: SessionInput): Promise<unknown>;
   sessionEnsureReady?(input: EnsureReadyInput): Promise<unknown>;
   actionWait?(input: ActionWaitInput): Promise<unknown>;
   actionStatus?(input: ActionInput): Promise<unknown>;
+  actionStop?(input: ActionStopInput): Promise<unknown>;
   actionCancel?(input: ActionInput): Promise<unknown>;
   lookTrack?(input: EntityInput): Promise<unknown>;
   startSession(input: StartSessionInput): Promise<unknown>;
@@ -264,29 +252,21 @@ export interface CliHandlers {
   sendChat(input: ChatInput): Promise<unknown>;
   sendWhisper(input: WhisperInput): Promise<unknown>;
   tabComplete(input: TabCompleteInput): Promise<unknown>;
-  botPosition(input: SessionInput): Promise<unknown>;
-  botInventory(input: SessionInput): Promise<unknown>;
   botPlayers(input: SessionInput): Promise<unknown>;
-  botEntities(input: EntitiesInput): Promise<unknown>;
   botTablist(input: SessionInput): Promise<unknown>;
   botScoreboards(input: SessionInput): Promise<unknown>;
   botTeams(input: SessionInput): Promise<unknown>;
-  botControls(input: SessionInput): Promise<unknown>;
   controlTap(input: ControlTapInput): Promise<unknown>;
   controlSet(input: ControlSetInput): Promise<unknown>;
-  controlClear(input: SessionInput): Promise<unknown>;
   lookAt(input: LookAtInput): Promise<unknown>;
   look(input: LookInput): Promise<unknown>;
   worldBlock(input: BlockPositionInput): Promise<unknown>;
-  worldBlockInfo(input: BlockPositionInput): Promise<unknown>;
-  worldBlockInSight(input: SightBlockInput): Promise<unknown>;
   worldBlockAtCursor(input: CursorBlockInput): Promise<unknown>;
   worldFindBlocks(input: FindBlocksInput): Promise<unknown>;
   navigateGoto(input: NavigateGotoInput): Promise<unknown>;
   navigateFollow(input: NavigateFollowInput): Promise<unknown>;
-  navigateStop(input: SessionInput): Promise<unknown>;
-  navigateStatus(input: SessionInput): Promise<unknown>;
   navigateConfigure(input: NavigateConfigureInput): Promise<unknown>;
+  navigateTune(input: NavigateTuningInput): Promise<unknown>;
   collectItem(input: CollectItemInput): Promise<unknown>;
   inventoryEquip(input: EquipInput): Promise<unknown>;
   inventoryUnequip(input: UnequipInput): Promise<unknown>;
@@ -295,11 +275,9 @@ export interface CliHandlers {
   inventoryConsume(input: SessionInput): Promise<unknown>;
   inventoryFish(input: SessionInput): Promise<unknown>;
   inventoryActivateItem(input: SessionInput & { offhand: boolean }): Promise<unknown>;
-  inventoryDeactivateItem(input: SessionInput): Promise<unknown>;
   inventoryRecipes(input: RecipesInput): Promise<unknown>;
   inventoryCraft(input: CraftInput): Promise<unknown>;
   worldDig(input: BlockPositionInput): Promise<unknown>;
-  worldStopDigging(input: SessionInput): Promise<unknown>;
   worldPlace(input: PlaceBlockInput): Promise<unknown>;
   worldPlaceEntity(input: PlaceBlockInput): Promise<unknown>;
   worldActivate(input: BlockPositionInput): Promise<unknown>;
@@ -309,17 +287,14 @@ export interface CliHandlers {
   worldElytraFly(input: SessionInput): Promise<unknown>;
   windowOpenBlock(input: BlockPositionInput): Promise<unknown>;
   windowOpenEntity(input: EntityInput): Promise<unknown>;
-  windowStatus(input: SessionInput): Promise<unknown>;
   windowDeposit(input: WindowItemInput): Promise<unknown>;
   windowWithdraw(input: WindowItemInput): Promise<unknown>;
   windowClick(input: WindowClickInput): Promise<unknown>;
   windowClose(input: SessionInput): Promise<unknown>;
   entityFind(input: EntityFindInput): Promise<unknown>;
   entityInspect(input: EntityInput): Promise<unknown>;
-  entityActivate(input: EntityInput): Promise<unknown>;
-  entityUseOn(input: EntityInput): Promise<unknown>;
+  entityInteract(input: EntityInput): Promise<unknown>;
   entityAttack(input: EntityAttackInput): Promise<unknown>;
-  entitySwingArm(input: SwingArmInput): Promise<unknown>;
   entityMount(input: EntityInput): Promise<unknown>;
   entityDismount(input: SessionInput): Promise<unknown>;
   entityMoveVehicle(input: MoveVehicleInput): Promise<unknown>;

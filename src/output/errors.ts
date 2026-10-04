@@ -12,6 +12,7 @@ export type ErrorCode =
   | "DAEMON_TIMEOUT"
   | "DAEMON_INCOMPATIBLE"
   | "NAVIGATION_FAILED"
+  | "MOUNT_UNCONFIRMED"
   | "TRACK_UNKNOWN"
   | "TRACK_LOST"
   | "WORLD_CHANGED"
@@ -101,6 +102,7 @@ export function publicError(error: CliError): { code: ErrorCode; message: string
     DAEMON_ERROR: "The operation failed. Inspect operational diagnostics for the cause.",
     UNKNOWN_ERROR: "The operation failed. Inspect operational diagnostics for the cause.",
     NAVIGATION_FAILED: "Navigation did not reach the goal.",
+    MOUNT_UNCONFIRMED: "Mounting was not confirmed.",
     NOT_READY: "Bot has no ready world context.",
     WORLD_CHANGED: "World context has changed. Observe a fresh frame.",
     RUNTIME_MISMATCH: "The handle belongs to another runtime.",

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { encodeHandle } from "../src/core/handles.js";
+import { API_VERSION } from "../src/core/protocol.js";
 import { runDaemon } from "../src/daemon/server.js";
 import { CliError } from "../src/output/errors.js";
 
@@ -31,10 +32,10 @@ async function server() {
   const port = (allocation.address() as { port: number }).port;
   await new Promise<void>(resolve => allocation.close(() => resolve()));
   const bot = new WaitBot();
-  const headers = { "X-MC-Agent-API": "3.3", Authorization: "Bearer wait-protocol-test-token-123456789", "Content-Type": "application/json" };
+  const headers = { "X-MC-Agent-API": API_VERSION, Authorization: "Bearer wait-protocol-test-token-123456789", "Content-Type": "application/json" };
   const request = async (path: string, init: RequestInit = {}) => {
     const response = await fetch(`http://127.0.0.1:${port}${path}`, { ...init, headers });
-    expect(response.headers.get("X-MC-Agent-API")).toBe("3.3");
+    expect(response.headers.get("X-MC-Agent-API")).toBe(API_VERSION);
     return response;
   };
   const get = async (path: string) => (await request(path)).json() as Promise<any>;
@@ -70,7 +71,7 @@ describe("authoritative action waits over HTTP", () => {
 
   it("returns terminal results and typed failure details, and validates wait inputs", async () => {
     const { bot, request, get, post, context } = await server();
-    const completed = await post("/look/yaw-pitch", { context, yaw: 1, pitch: 0, force: false });
+    const completed = await post("/advanced/look", { context, yaw: 1, pitch: 0, force: false });
     expect(await get(`/actions/${completed.action}/wait?timeout=1000`)).toMatchObject({ state: "completed", timedOut: false, result: { looked: true, yaw: 1, pitch: 0 } });
     bot.lookAtCalls.mockRejectedValue(new CliError("TRACK_LOST", "Target disappeared.", "Observe again.", 1, { trackId: "lost-target" }));
     const failed = await post("/look/at", { context, x: 2, y: 64, z: 0 });

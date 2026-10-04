@@ -55,7 +55,7 @@ describe("entity observation provenance and late identity", () => {
     expect(restored).toMatchObject({ trackId: first.entities[0].trackId, type: "minecraft:cow", name: "cow", position: { x: 3, y: 64, z: 0 }, distance: 3 });
     expect(restored.unknownFields).toEqual(["customName"]);
     expect(world.frame(bot, ready, { maxEntities: 0 }).projection.aggregates).toEqual({ "minecraft:cow": 1 });
-    expect(world.searchLoaded(bot, ready, { name: "cow", type: "animal", types: undefined }).entities).toHaveLength(1);
+    expect(world.searchLoaded(bot, ready, { name: "cow", types: ["minecraft:cow"] }).entities).toHaveLength(1);
     expect(world.searchLoaded(bot, ready, { types: ["cow"] }).entities).toEqual(world.searchLoaded(bot, ready, { types: ["minecraft:cow"] }).entities);
     const full = world.frame(bot, ready, { detail: "full" }).entities[0];
     expect(full).toMatchObject({ kind: "animal", uuid: UUID.replaceAll("-", "") });

@@ -127,7 +127,7 @@ describe("daemon client", () => {
     await expect(daemonRequest(record(), "/frame?maxEntities=50")).rejects.toMatchObject({
       code: "DAEMON_INCOMPATIBLE",
       remediation: expect.stringContaining("session stop --session default"),
-      details: { session: "default", expectedApiVersion: "3.3", path: "/frame", httpStatus: 404, actualApiVersion: null },
+      details: { session: "default", expectedApiVersion: API_VERSION, path: "/frame", httpStatus: 404, actualApiVersion: null },
     });
   });
 
@@ -136,7 +136,7 @@ describe("daemon client", () => {
       const response = new Response("not valid JSON", { headers: version ? { [API_VERSION_HEADER]: version } : {} });
       vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response));
       await expect(daemonRequest(record(), "/status")).rejects.toMatchObject({
-        code: "DAEMON_INCOMPATIBLE", details: { expectedApiVersion: "3.3", actualApiVersion: version ?? null },
+        code: "DAEMON_INCOMPATIBLE", details: { expectedApiVersion: API_VERSION, actualApiVersion: version ?? null },
       });
       expect(response.bodyUsed).toBe(true);
     }

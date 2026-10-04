@@ -23,7 +23,6 @@ describe("core skill content", () => {
     expect(compact).toContain("`MC_AGENT_CLIENT_ID`");
     expect(compact).toContain("`unknownFields`");
     expect(compact).toContain("old actions are not replayed");
-    expect(compact).not.toContain("`session diagnose`");
     expect(compact).not.toContain("`session ensure-ready");
   });
 

@@ -1,3 +1,4 @@
+import { API_VERSION } from "../src/core/protocol.js";
 import { EventEmitter } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:net";
@@ -30,9 +31,9 @@ async function setup() {
     controlPort: port, token, createBotFn: create, exitOnStop: false });
   const request = async (path: string, body?: unknown) => {
     const response = await fetch(`http://127.0.0.1:${port}${path}`, { method: body === undefined ? "GET" : "POST",
-      headers: { "X-MC-Agent-API": "3.3", Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      headers: { "X-MC-Agent-API": API_VERSION, Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}) });
-    expect(response.headers.get("X-MC-Agent-API")).toBe("3.3");
+    expect(response.headers.get("X-MC-Agent-API")).toBe(API_VERSION);
     return { status: response.status, body: await response.json() as any };
   };
   const cleanup = async () => {
@@ -48,7 +49,7 @@ describe("daemon lifecycle routes", () => {
   it("separates HTTP responsiveness, login, spawn, and bounded recovery", async () => {
     const { bot, create, request, cleanup } = await setup();
     try {
-      const initial = await request("/diagnose");
+      const initial = await request("/debug/session");
       expect(initial.body).toMatchObject({ daemonResponsive: true, ready: false, connection: { authentication: { state: "unknown" } } });
       const recovery = request("/ensure-ready", { timeout: 500, maxAttempts: 1, backoff: 0 });
       bot.emit("login");

@@ -68,9 +68,9 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       return { ...toPublicSession(record, input.detail), ...status };
     },
 
-    async sessionDiagnose(input) {
+    async debugSession(input) {
       const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/diagnose");
+      return daemonRequest(record, "/debug/session");
     },
 
     async sessionEnsureReady(input) {
@@ -139,6 +139,11 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, `/actions/${encodeURIComponent(input.action)}/wait?timeout=${input.timeout}${input.observe === false ? "&observe=false" : ""}`,
         { signal: AbortSignal.timeout(input.timeout + 1500) });
+    },
+
+    async actionStop(input) {
+      const record = await loadSessionForClient(input.session);
+      return daemonRequest(record, "/actions/stop", { method: "POST", body: JSON.stringify({ ...context(input), ...(input.resources ? { resources: input.resources } : {}) }) });
     },
 
     async actionCancel(input) {
@@ -223,24 +228,9 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       });
     },
 
-    async botPosition(input) {
-      const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/bot/position");
-    },
-
-    async botInventory(input) {
-      const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/bot/inventory");
-    },
-
     async botPlayers(input) {
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/bot/players");
-    },
-
-    async botEntities(input) {
-      const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, `/bot/entities?radius=${input.radius}&limit=${input.limit}`);
     },
 
     async botTablist(input) {
@@ -256,11 +246,6 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
     async botTeams(input) {
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/bot/teams");
-    },
-
-    async botControls(input) {
-      const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/bot/controls");
     },
 
     async controlTap(input) {
@@ -279,11 +264,6 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       });
     },
 
-    async controlClear(input) {
-      const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/control/clear", { method: "POST", body: JSON.stringify(context(input)) });
-    },
-
     async lookAt(input) {
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/look/at", {
@@ -294,7 +274,7 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
 
     async look(input) {
       const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/look/yaw-pitch", {
+      return daemonRequest(record, "/advanced/look", {
         method: "POST",
         body: JSON.stringify({ ...context(input), yaw: input.yaw, pitch: input.pitch, force: input.force }),
       });
@@ -303,16 +283,6 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
     async worldBlock(input) {
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, `/world/block?x=${input.x}&y=${input.y}&z=${input.z}`);
-    },
-
-    async worldBlockInfo(input) {
-      const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, `/world/block-info?x=${input.x}&y=${input.y}&z=${input.z}`);
-    },
-
-    async worldBlockInSight(input) {
-      const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, `/world/block-in-sight?maxSteps=${input.maxSteps}&vectorLength=${input.vectorLength}`);
     },
 
     async worldBlockAtCursor(input) {
@@ -344,16 +314,6 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       });
     },
 
-    async navigateStop(input) {
-      const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/navigate/stop", { method: "POST", body: JSON.stringify(context(input)) });
-    },
-
-    async navigateStatus(input) {
-      const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/navigate/status");
-    },
-
     async navigateConfigure(input) {
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/navigate/configure", {
@@ -365,6 +325,15 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
           allowParkour: input.allowParkour,
           canOpenDoors: input.canOpenDoors,
           maxDropDown: input.maxDropDown,
+        }),
+      });
+    },
+
+    async navigateTune(input) {
+      const record = await loadSessionForClient(input.session);
+      return daemonRequest(record, "/advanced/navigate-configure", {
+        method: "POST",
+        body: JSON.stringify({ ...context(input),
           searchRadius: input.searchRadius,
           thinkTimeout: input.thinkTimeout,
           tickTimeout: input.tickTimeout,
@@ -430,11 +399,6 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       });
     },
 
-    async inventoryDeactivateItem(input) {
-      const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/inventory/deactivate-item", { method: "POST", body: JSON.stringify(context(input)) });
-    },
-
     async inventoryRecipes(input) {
       const record = await loadSessionForClient(input.session);
       const table =
@@ -462,11 +426,6 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
         method: "POST",
         body: JSON.stringify({ ...context(input), x: input.x, y: input.y, z: input.z }),
       });
-    },
-
-    async worldStopDigging(input) {
-      const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/world/stop-digging", { method: "POST", body: JSON.stringify(context(input)) });
     },
 
     async worldPlace(input) {
@@ -535,11 +494,6 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       });
     },
 
-    async windowStatus(input) {
-      const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/window/status");
-    },
-
     async windowDeposit(input) {
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/window/deposit", {
@@ -558,7 +512,7 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
 
     async windowClick(input) {
       const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/window/click", {
+      return daemonRequest(record, "/advanced/window-click", {
         method: "POST",
         body: JSON.stringify({ ...context(input), slot: input.slot, mouseButton: input.mouseButton, mode: input.mode }),
       });
@@ -569,9 +523,9 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       return daemonRequest(record, "/window/close", { method: "POST", body: JSON.stringify(context(input)) });
     },
 
-    async entityActivate(input) {
+    async entityInteract(input) {
       const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/entity/activate", { method: "POST", body: JSON.stringify({ ...context(input), track: input.track }) });
+      return daemonRequest(record, "/entity/interact", { method: "POST", body: JSON.stringify({ ...context(input), track: input.track }) });
     },
 
     async entityFind(input) {
@@ -579,11 +533,8 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const params = new URLSearchParams({
         radius: String(input.radius),
         limit: String(input.limit),
-        includePlayers: String(input.includePlayers),
-        includePassive: String(input.includePassive),
       });
       if (input.name) params.set("name", input.name);
-      if (input.type) params.set("type", input.type);
       for (const species of input.types ?? []) params.append("types", species);
       return daemonRequest(record, `/entity/find?${params.toString()}`);
     },
@@ -594,24 +545,11 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       return daemonRequest(record, `/entity/inspect?${params}`);
     },
 
-    async entityUseOn(input) {
-      const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/entity/use-on", { method: "POST", body: JSON.stringify({ ...context(input), track: input.track }) });
-    },
-
     async entityAttack(input) {
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/entity/attack", {
         method: "POST",
         body: JSON.stringify({ ...context(input), track: input.track, allowPlayers: input.allowPlayers, allowPassive: input.allowPassive }),
-      });
-    },
-
-    async entitySwingArm(input) {
-      const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, "/entity/swing-arm", {
-        method: "POST",
-        body: JSON.stringify({ ...context(input), hand: input.hand, showHand: input.showHand }),
       });
     },
 

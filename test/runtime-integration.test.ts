@@ -159,7 +159,7 @@ describe("runtime integration", () => {
     });
     const controller = new BotController({host:"localhost",port:25565,username:"AgentBot",auth:"offline"},events,()=>bot);
     controller.start(); bot.emit("spawn"); const track = controller.world.trackFor(bot.entities["7"])!;
-    const action = controller.runAction("entity.activate", ["item", "look"], () => controller.activateEntity(track), track);
+    const action = controller.runAction("entity.interact", ["item", "look"], () => controller.interactEntity(track), track);
     bot.emit("entityGone", bot.entities["7"]); pending.resolve();
     await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
     expect(controller.actions.get(action.action)).toMatchObject({ state: "failed", reason: "TRACK_LOST" });
@@ -280,7 +280,7 @@ describe("runtime integration", () => {
     }
     expect(unrelatedPosition).not.toHaveBeenCalled();
     expect(events.list(cursor, 1024)).toEqual([]);
-    const action = controller.runAction("entity.activate", ["item", "look"], () => bot._client.write("use_entity", {}), track);
+    const action = controller.runAction("entity.interact", ["item", "look"], () => bot._client.write("use_entity", {}), track);
     await controller.actions.wait(action.action);
     expect(bot.packetWrites).toHaveBeenCalledWith("use_entity", {});
     expect(controller.findEntities({ radius: 200 }).entities).toHaveLength(2);
@@ -329,7 +329,7 @@ describe("runtime integration", () => {
     const { controller, bot, track } = runtime();
     const pending = deferred();
     bot.lookAtCalls.mockReturnValue(pending.promise);
-    const action = controller.runAction("entity.activate", ["item", "look"], async () => {
+    const action = controller.runAction("entity.interact", ["item", "look"], async () => {
       await bot.lookAt(bot.entities[7].position);
       bot._client.write("use_entity", {});
     }, track);

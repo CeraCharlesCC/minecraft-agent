@@ -13,7 +13,9 @@ mc-agent --output json navigate goto --x 10 --y 64 --z 5 --wait 10000
 
 Ready frame/surroundings/find/inspect saves context for that client/session. Without a client ID, or with `--strict-context`, pass `--context`. `--no-observe` omits the attached frame. Only `completed` means success; `timedOut: true` leaves the action running. After world changes, explicitly observe again.
 
-`session start` streams chat; retain its process handle. Use `--no-listen` to return once or `chat listen` to attach. Closing a listener leaves the daemon running; `session stop` disconnects. Stop old daemons with their matching CLI before upgrading to API 3.3.
+`session start` streams chat; retain its process handle. Use `--no-listen` to return once or `chat listen` to attach. Closing a listener leaves the daemon running; `session stop` disconnects.
+
+`observe frame` reports inventory, controls, the current window, and the observed vehicle. Use `entity interact` to right-click, `entity mount` for confirmed riding, and `action stop` to stop resource owners and clear controls.
 
 Arguments: `mc-agent <group> <command> --help`. Agent loop: [skill](skills/minecraft/SKILL.md) or `skills get core`. Contracts: [reference](skills/minecraft/references/playbooks.md) or `skills get core --full`.
 

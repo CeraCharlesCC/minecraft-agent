@@ -27,4 +27,15 @@ describe("mc-agent help", () => {
 
     expect(frame.helpInformation()).toMatch(/--max-entities <count>[\s\S]*?\(default:\s+"12"\)/);
   });
+
+  it("keeps advanced controls available through their own help", () => {
+    const program = buildProgram({} as CliHandlers, { stdout: process.stdout, stderr: process.stderr });
+    const advanced = program.commands.find(command => command.name() === "advanced")!;
+    expect(program.helpInformation()).not.toContain("advanced");
+    expect(advanced.commands.map(command => command.name())).toEqual(["look", "navigate-configure", "window-click"]);
+    expect(advanced.helpInformation()).toContain("window-click");
+    const stop = program.commands.find(command => command.name() === "action")!.commands.find(command => command.name() === "stop")!;
+    expect(stop.helpInformation()).toContain("--resource <resource>");
+    expect(stop.helpInformation()).not.toContain("--wait");
+  });
 });

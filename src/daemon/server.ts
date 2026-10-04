@@ -23,14 +23,14 @@ function sendJson(response: ServerResponse, statusCode: number, body: unknown): 
 
 const controlNames = new Set(["forward", "back", "left", "right", "jump", "sprint", "sneak"]);
 const physicalRoutes = new Set([
-  "/navigate/goto", "/navigate/follow", "/navigate/stop", "/collect/item",
-  "/control/tap", "/control/set", "/control/clear", "/look/at", "/look/yaw-pitch", "/look/track",
+  "/navigate/goto", "/navigate/follow", "/collect/item",
+  "/control/tap", "/control/set", "/look/at", "/advanced/look", "/look/track",
   "/inventory/equip", "/inventory/unequip", "/inventory/quickbar", "/inventory/toss", "/inventory/consume",
-  "/inventory/fish", "/inventory/activate-item", "/inventory/deactivate-item", "/inventory/craft",
-  "/world/dig", "/world/stop-digging", "/world/place", "/world/place-entity", "/world/activate", "/world/update-sign",
+  "/inventory/fish", "/inventory/activate-item", "/inventory/craft",
+  "/world/dig", "/world/place", "/world/place-entity", "/world/activate", "/world/update-sign",
   "/world/sleep", "/world/wake", "/world/elytra-fly", "/window/open-block", "/window/open-entity",
-  "/window/deposit", "/window/withdraw", "/window/click", "/window/close", "/entity/activate", "/entity/use-on",
-  "/entity/attack", "/entity/mount", "/entity/dismount", "/entity/swing-arm", "/entity/move-vehicle",
+  "/window/deposit", "/window/withdraw", "/advanced/window-click", "/window/close", "/entity/interact",
+  "/entity/attack", "/entity/mount", "/entity/dismount", "/entity/move-vehicle",
 ]);
 
 /** Bound both userland queue and Node's socket buffer for stalled consumers. */
@@ -174,7 +174,7 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
         return;
       }
 
-      if (request.method === "GET" && url.pathname === "/diagnose") {
+      if (request.method === "GET" && url.pathname === "/debug/session") {
         sendJson(response, 200, controller.diagnose());
         return;
       }
@@ -336,6 +336,20 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
         sendResult(projectAction(result));
         return;
       }
+      if (request.method === "POST" && url.pathname === "/actions/stop") {
+        const input = await readJson(request);
+        if (!input || typeof input !== "object" || Array.isArray(input)) throw badInput("Action body must be an object.");
+        const body = input as Record<string, unknown>;
+        responseOptions(body);
+        controller.validateContext(body, false);
+        const resources = body.resources === undefined ? ["movement", "look", "item", "window"] : body.resources;
+        if (!Array.isArray(resources) || resources.length === 0 ||
+            resources.some(resource => typeof resource !== "string" || !["movement", "look", "item", "window"].includes(resource))) {
+          throw badInput("Resources must be a nonempty array of movement, look, item, or window.");
+        }
+        sendResult(controller.stopActions([...new Set(resources)] as ActionResource[]));
+        return;
+      }
       const actionRoute = /^\/actions\/([^/]+)(\/cancel)?$/.exec(url.pathname);
       if (actionRoute && ((request.method === "GET" && !actionRoute[2]) || (request.method === "POST" && actionRoute[2]))) {
         const action = decodeURIComponent(actionRoute[1]);
@@ -386,16 +400,6 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
         if (path === "/look/track") {
           await sendAction(controller.trackLook(track()), wait, true); return;
         }
-        if (["/navigate/stop", "/control/clear"].includes(path)) {
-          controller.actions.cancelResources(["movement", "look"], "STOPPED");
-          sendResult(path === "/navigate/stop" ? controller.stopNavigation() : controller.clearControls()); return;
-        }
-        if (path === "/world/stop-digging") {
-          controller.actions.cancelResources(["item"], "STOPPED"); sendResult(controller.stopDigging()); return;
-        }
-        if (path === "/inventory/deactivate-item") {
-          controller.actions.cancelResources(["item"], "STOPPED"); sendResult(controller.deactivateItem()); return;
-        }
         let run: () => unknown | Promise<unknown>;
         let target: string | undefined;
         let resources: ActionResource[] = [];
@@ -406,7 +410,7 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
           case "/control/tap": { const state = text("state"), ms = integer("durationMs",1,30000,500); if (!controlNames.has(state) || ms < 1 || ms > 30000) throw badInput("Invalid control or duration."); resources = ["movement"]; run = () => controller.tap(state,ms); break; }
           case "/control/set": { const state = text("state"); if (!controlNames.has(state) || typeof body.value !== "boolean") throw badInput("Invalid control."); resources = ["movement"]; continuous = body.value; run = () => controller.setControl(state, body.value as boolean); break; }
           case "/look/at": { const [x,y,z] = coordinates(); resources = ["look"]; run = () => controller.lookAt(x,y,z); break; }
-          case "/look/yaw-pitch": { const yaw = num("yaw"), pitch = num("pitch"); resources = ["look"]; run = () => controller.look(yaw,pitch, Boolean(body.force)); break; }
+          case "/advanced/look": { const yaw = num("yaw"), pitch = num("pitch"); resources = ["look"]; run = () => controller.look(yaw,pitch, Boolean(body.force)); break; }
           case "/inventory/equip": { const item = text("item"), dest = text("destination","hand"); resources = ["item", "window"]; run = () => controller.equip(item,dest); break; }
           case "/inventory/unequip": { const dest = text("destination","hand"); resources = ["item", "window"]; run = () => controller.unequip(dest); break; }
           case "/inventory/quickbar": { const slot = num("slot"); if (!Number.isInteger(slot) || slot < 0 || slot > 8) throw badInput("Invalid quickbar slot."); resources = ["item"]; run = () => controller.setQuickBarSlot(slot); break; }
@@ -427,14 +431,12 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
           case "/window/open-entity": target = track(); resources = ["window", "look"]; run = () => controller.openEntityWindow(target!); break;
           case "/window/deposit": { const item = text("item"), count = integer("count",1,2304,1); resources = ["window", "item"]; run = () => controller.windowDeposit(item,count); break; }
           case "/window/withdraw": { const item = text("item"), count = integer("count",1,2304,1); resources = ["window", "item"]; run = () => controller.windowWithdraw(item,count); break; }
-          case "/window/click": { const slot = integer("slot",0,4096), button = integer("mouseButton",0,1,0), mode = integer("mode",0,6,0); resources = ["window", "item"]; run = () => controller.windowClick(slot,button,mode); break; }
+          case "/advanced/window-click": { const slot = integer("slot",0,4096), button = integer("mouseButton",0,1,0), mode = integer("mode",0,6,0); resources = ["window", "item"]; run = () => controller.windowClick(slot,button,mode); break; }
           case "/window/close": resources = ["window"]; run = () => controller.closeWindow(); break;
-          case "/entity/activate": target = track(); resources = ["look", "item"]; run = () => controller.activateEntity(target!); break;
-          case "/entity/use-on": target = track(); resources = ["look", "item"]; run = () => controller.useOnEntity(target!); break;
+          case "/entity/interact": target = track(); resources = ["look", "item"]; run = () => controller.interactEntity(target!); break;
           case "/entity/attack": target = track(); resources = ["look", "item"]; run = () => controller.attackEntity(target!, {allowPlayers: body.allowPlayers === true, allowPassive: body.allowPassive === true}); break;
-          case "/entity/mount": target = track(); resources = ["movement", "look"]; run = () => controller.mountEntity(target!); break;
+          case "/entity/mount": target = track(); resources = ["movement", "look", "item"]; run = () => controller.mountEntity(target!); break;
           case "/entity/dismount": resources = ["movement"]; run = () => controller.dismount(); break;
-          case "/entity/swing-arm": resources = ["item"]; run = () => controller.swingArm((body.hand ?? "right") as "left"|"right", Boolean(body.showHand ?? true)); break;
           case "/entity/move-vehicle": { const left = num("left"), forward = num("forward"); if (Math.abs(left)>1 || Math.abs(forward)>1) throw badInput("Invalid vehicle controls."); resources = ["movement"]; run = () => controller.moveVehicle(left,forward); break; }
           default: throw badInput("Unknown action.");
         }
@@ -471,25 +473,8 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
         return;
       }
 
-      if (request.method === "GET" && url.pathname === "/bot/position") {
-        sendJson(response, 200, controller.position());
-        return;
-      }
-
-      if (request.method === "GET" && url.pathname === "/bot/inventory") {
-        sendJson(response, 200, controller.inventory());
-        return;
-      }
-
       if (request.method === "GET" && url.pathname === "/bot/players") {
         sendJson(response, 200, controller.players());
-        return;
-      }
-
-      if (request.method === "GET" && url.pathname === "/bot/entities") {
-        const radius = Number(url.searchParams.get("radius") ?? "32");
-        const limit = Number(url.searchParams.get("limit") ?? "50");
-        sendJson(response, 200, controller.entities(radius, limit));
         return;
       }
 
@@ -508,31 +493,11 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
         return;
       }
 
-      if (request.method === "GET" && url.pathname === "/bot/controls") {
-        sendJson(response, 200, controller.controls());
-        return;
-      }
-
       if (request.method === "GET" && url.pathname === "/world/block") {
         const x = Number(url.searchParams.get("x"));
         const y = Number(url.searchParams.get("y"));
         const z = Number(url.searchParams.get("z"));
         sendJson(response, 200, controller.blockAt(x, y, z));
-        return;
-      }
-
-      if (request.method === "GET" && url.pathname === "/world/block-info") {
-        const x = Number(url.searchParams.get("x"));
-        const y = Number(url.searchParams.get("y"));
-        const z = Number(url.searchParams.get("z"));
-        sendJson(response, 200, controller.blockInfo(x, y, z));
-        return;
-      }
-
-      if (request.method === "GET" && url.pathname === "/world/block-in-sight") {
-        const maxSteps = Number(url.searchParams.get("maxSteps") ?? "256");
-        const vectorLength = Number(url.searchParams.get("vectorLength") ?? "5");
-        sendJson(response, 200, controller.blockInSight(maxSteps, vectorLength));
         return;
       }
 
@@ -550,12 +515,7 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
         return;
       }
 
-      if (request.method === "GET" && url.pathname === "/navigate/status") {
-        sendJson(response, 200, controller.navigationStatus());
-        return;
-      }
-
-      if (request.method === "POST" && url.pathname === "/navigate/configure") {
+      if (request.method === "POST" && ["/navigate/configure", "/advanced/navigate-configure"].includes(url.pathname)) {
         const body = (await readJson(request)) as {
           allowDig?: boolean;
           allowPlace?: boolean;
@@ -575,7 +535,16 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
         for (const key of ["maxDropDown", "searchRadius", "thinkTimeout", "tickTimeout"] as const) {
           if (body[key] !== undefined && (!Number.isSafeInteger(body[key]) || body[key]! < (key === "searchRadius" ? -1 : key === "maxDropDown" ? 0 : 1))) throw badInput(`Invalid ${key}.`);
         }
-        sendResult(controller.configureNavigation(body));
+        const tuning = url.pathname === "/advanced/navigate-configure";
+        const policyFields = ["allowDig", "allowPlace", "allowSprinting", "allowParkour", "canOpenDoors", "maxDropDown"] as const;
+        const tuningFields = ["searchRadius", "thinkTimeout", "tickTimeout"] as const;
+        for (const key of tuning ? policyFields : tuningFields) {
+          if (body[key] !== undefined) throw badInput(`Invalid navigation option '${key}'.`);
+        }
+        const result = controller.configureNavigation(body);
+        sendResult(tuning ? { configured: result.configured,
+          searchRadius: result.searchRadius, thinkTimeout: result.thinkTimeout, tickTimeout: result.tickTimeout }
+          : { configured: result.configured, movements: result.movements });
         return;
       }
 
@@ -593,11 +562,6 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
         return;
       }
 
-      if (request.method === "GET" && url.pathname === "/window/status") {
-        sendJson(response, 200, controller.windowStatus());
-        return;
-      }
-
       if (request.method === "GET" && url.pathname === "/entity/inspect") {
         const track = url.searchParams.get("track");
         if (!track) throw badInput("Entity inspection requires a runtime-scoped track.");
@@ -611,12 +575,9 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
           200,
           controller.findEntities({
             name: url.searchParams.get("name") ?? undefined,
-            type: url.searchParams.get("type") ?? undefined,
             types: url.searchParams.has("types") ? url.searchParams.getAll("types").flatMap(value => value.split(",")).map(value => value.trim()).filter(Boolean) : undefined,
             radius: Number(url.searchParams.get("radius") ?? "32"),
             limit: Number(url.searchParams.get("limit") ?? "50"),
-            includePlayers: url.searchParams.get("includePlayers") === "true",
-            includePassive: url.searchParams.get("includePassive") === "true",
           }),
         );
         return;

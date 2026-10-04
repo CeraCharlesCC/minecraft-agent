@@ -63,7 +63,6 @@ class FakeBot extends EventEmitter {
       ? { name: "wheat", displayName: "Wheat", type: 59, position, getProperties: () => ({ age: 7 }) }
       : { name: "dirt", displayName: "Dirt", type: 3, position },
   );
-  blockInSight = vi.fn(() => ({ name: "dirt", displayName: "Dirt", type: 3, position: new Vec3(2, 2, 2) }));
   blockAtCursor = vi.fn(() => ({ name: "dirt", displayName: "Dirt", type: 3, position: new Vec3(3, 3, 3) }));
   canDigBlock = vi.fn(() => true);
   digTime = vi.fn(() => 250);
@@ -93,10 +92,9 @@ class FakeBot extends EventEmitter {
   elytraFly = vi.fn();
   activateEntityCalls = vi.fn();
   activateEntity = this.activateEntityCalls;
-  useOn = vi.fn();
   attack = vi.fn();
-  swingArm = vi.fn();
-  mount = vi.fn();
+  vehicle: { id: number; [key: string]: unknown } | null = null;
+  mount = vi.fn((entity: FakeBot["entities"]["10"]) => { this.vehicle = entity; this.emit("mount"); });
   dismount = vi.fn();
   moveVehicle = vi.fn();
   openContainer = vi.fn(async () => this.currentWindow);
@@ -141,7 +139,7 @@ describe("BotController", () => {
     expect(found).not.toHaveProperty("runtimeId");
     const player = found.entities[1];
     subject.validateContext({ context: found.context });
-    await subject.activateEntity(player.trackId);
+    await subject.interactEntity(player.trackId);
     expect(bot.activateEntityCalls).toHaveBeenCalledWith(bot.players.Steve.entity);
     expect(() => subject.attackEntity(player.trackId)).toThrow("Refusing to attack a player");
     expect(subject.findEntities({ types: ["minecraft:sniffer"] }).entities).toEqual([expect.objectContaining({ type: "minecraft:sniffer" })]);
@@ -187,14 +185,18 @@ describe("BotController", () => {
 
   it("distinguishes unavailable queries from a known empty or closed observation", () => {
     const { subject, bot } = controller();
-    for (const query of [() => subject.position(), () => subject.inventory(), () => subject.controls(), () => subject.windowStatus(), () => subject.blockInfo(1, 2, 3)]) expect(query()).toEqual({ known: false });
+    expect(subject.blockAt(1, 2, 3)).toEqual({ known: false });
+    expect(subject.frame()).toMatchObject({ connection: { ready: false }, inventory: { known: false } });
     bot.emit("spawn");
     bot.currentWindow = null as any; bot.heldItem = null as any;
-    expect(subject.windowStatus()).toEqual({ known: true });
-    expect(subject.inventory()).toMatchObject({ known: true, items: expect.any(Array), quickBarSlot: 0 });
-    expect(subject.inventory()).not.toHaveProperty("heldItem");
+    const readyFrame = subject.frame();
+    expect(readyFrame).not.toHaveProperty("window");
+    expect(readyFrame.inventory).toMatchObject({ known: true, slots: expect.any(Array) });
+    expect(readyFrame.self.quickBarSlot).toBe(0);
+    expect(readyFrame.self).not.toHaveProperty("heldItem");
+    expect(readyFrame.unknownFields ?? []).not.toContain("/window");
     delete (bot as any).currentWindow;
-    expect(subject.windowStatus()).toEqual({ known: false });
+    expect(subject.frame().unknownFields).toContain("/window");
     subject.stop();
   });
 
@@ -205,7 +207,6 @@ describe("BotController", () => {
     expect(frame.connection.ready).toBe(true);
     expect(frame.self).not.toHaveProperty("controls");
     expect(frame.unknownFields).toContain("/self/controls");
-    expect(subject.controls()).toEqual({ known: false });
     bot.controlState = { forward: false };
     const known = subject.frame();
     expect(known.self.controls).toEqual([]);
@@ -339,8 +340,9 @@ describe("BotController", () => {
     bot.game = undefined as unknown as FakeBot["game"];
     bot.inventory = undefined as unknown as FakeBot["inventory"];
     bot.heldItem = null as unknown as FakeBot["heldItem"];
-    expect(subject.position()).toEqual({ known: false });
-    expect(subject.inventory()).toEqual({ known: false });
+    const unavailable = subject.frame();
+    expect(unavailable.self).not.toHaveProperty("position");
+    expect(unavailable.inventory).toEqual({ known: false });
     subject.flushChat();
     expect(events.list(0, 10)).toEqual(
       expect.arrayContaining([
@@ -357,16 +359,15 @@ describe("BotController", () => {
     expect(subject.players()).toMatchObject({
       players: [expect.objectContaining({ username: "Steve", distance: 3 })],
     });
-    expect(subject.entities(10, 5)).toMatchObject({
+    expect(subject.findEntities({ radius: 10, limit: 5 })).toMatchObject({
       entities: expect.arrayContaining([expect.objectContaining({ name: "cow", distance: 2, trackId: expect.any(String) })]),
     });
     expect(subject.tablist()).toMatchObject({ tablist: { header: "Welcome" } });
     expect(subject.scoreboards()).toMatchObject({ scoreboards: { main: { name: "main" } } });
     expect(subject.teams()).toMatchObject({ teams: { red: { name: "red" } } });
-    expect(subject.controls()).toEqual({ known: true, controls: [] });
+    expect(subject.frame().self.controls).toEqual([]);
     expect(subject.blockAt(4, 5, 6)).toMatchObject({ block: { name: "dirt", position: { x: 4, y: 5, z: 6 } } });
-    expect(subject.blockInfo(4, 5, 6)).toMatchObject({ canDig: true, digTimeMs: 250 });
-    expect(subject.blockInSight(256, 5)).toMatchObject({ known: true, block: { name: "dirt", position: { x: 1, y: 3, z: 3 } } });
+    expect(subject.blockAt(4, 5, 6)).toMatchObject({ known: true, canDig: true, digTimeMs: 250 });
     expect(subject.blockAtCursor(5)).toMatchObject({ known: true, block: { name: "dirt", position: { x: 1, y: 3, z: 3 } } });
     expect(subject.findBlocks("dirt", 16, 3)).toMatchObject({ blocks: [{ name: "dirt", position: { x: 1, y: 2, z: 3 } }] });
 
@@ -377,9 +378,11 @@ describe("BotController", () => {
     await subject.goto(10, 64, -2, 1);
     expect(bot.pathfinder.goto).toHaveBeenCalledWith(expect.objectContaining({ x: 10, y: 64, z: -2 }));
 
-    expect(subject.follow("Steve", 2)).toMatchObject({ following: "Steve", range: 2, targetPosition: { x: 4, y: 2, z: 3 } });
+    (bot.entities as Record<string, unknown>)["11"] = bot.players.Steve.entity;
+    const playerTrack = subject.findEntities({ name: "Steve", radius: 256 }).entities[0].trackId as string;
+    expect(subject.followTrack(playerTrack, 2)).toMatchObject({ kind: "navigate.follow", target: playerTrack, state: "running" });
     expect(bot.pathfinder.setGoal).toHaveBeenCalledWith(expect.objectContaining({ entity: bot.players.Steve.entity }), true);
-    expect(subject.navigationStatus()).toEqual({ moving: false, mining: false, building: false });
+    expect(subject.frame({ detail: "full" }).navigation).toMatchObject({ moving: false, mining: false, building: false });
     expect(subject.configureNavigation({ allowDig: false, allowSprinting: false, maxDropDown: 2, searchRadius: 32 })).toMatchObject({
       configured: true,
       searchRadius: 32,
@@ -392,7 +395,7 @@ describe("BotController", () => {
     await subject.goto(12, 64, -2, 1);
     expect(bot.pathfinder.movements).toMatchObject({ canDig: false, allowSprinting: false, maxDropDown: 2 });
     await expect(subject.collectItem(10, 1)).rejects.toMatchObject({ code: "COMMAND_BLOCKED" });
-    expect(subject.stopNavigation()).toEqual({ stopped: true });
+    expect(subject.stopActions(["movement"])).toEqual({ stopped: true, resources: ["movement"] });
     expect(bot.pathfinder.stop).toHaveBeenCalled();
   });
 
@@ -405,10 +408,10 @@ describe("BotController", () => {
     await expect(subject.tabComplete("/gi", true, false, 1000)).resolves.toEqual({ matches: ["hello"] });
     subject.setControl("forward", true);
     expect(bot.setControlState).toHaveBeenCalledWith("forward", true);
-    expect(subject.controls()).toEqual({ known: true, controls: ["forward"] });
-    expect(subject.clearControls()).toEqual({ cleared: true });
+    expect(subject.frame().self.controls).toEqual(["forward"]);
+    expect(subject.stopActions(["movement"])).toEqual({ stopped: true, resources: ["movement"] });
     expect(bot.clearControlStates).toHaveBeenCalled();
-    expect(subject.controls()).toEqual({ known: true, controls: [] });
+    expect(subject.frame().self.controls).toEqual([]);
     await subject.look(1, 0.5, true);
     expect(bot.look).toHaveBeenCalledWith(1, 0.5, true);
 
@@ -426,7 +429,7 @@ describe("BotController", () => {
     await expect(subject.consume()).rejects.toThrow("No held item is equipped to consume.");
     await expect(subject.fish()).rejects.toThrow("A fishing_rod must be equipped before fishing.");
     expect(subject.activateItem(false)).toEqual({ activated: true, offhand: false });
-    expect(subject.deactivateItem()).toEqual({ deactivated: true });
+    expect(subject.stopActions(["item"])).toEqual({ stopped: true, resources: ["item"] });
     expect(subject.recipes("stick", 1)).toMatchObject({ item: "stick", recipes: [{ id: "recipe" }] });
     await expect(subject.craft("stick", 1)).resolves.toMatchObject({
       crafted: "stick",
@@ -445,7 +448,7 @@ describe("BotController", () => {
     const dug = subject.runAction("world.dig", ["movement", "look", "item"], () => subject.dig(1, 2, 3));
     expect(await subject.actions.wait(dug.action, 1000)).toMatchObject({ state: "completed", result: { dug: true, block: { name: "dirt" } } });
     expect(bot.digCalls).toHaveBeenCalledWith(expect.objectContaining({ name: "dirt" }), true);
-    expect(subject.stopDigging()).toEqual({ stopped: true });
+    expect(subject.stopActions(["item"])).toEqual({ stopped: true, resources: ["item"] });
 
     const placed = subject.runAction("world.place", ["look", "item"], () => subject.place(1, 2, 3, "east", "dirt"));
     expect(await subject.actions.wait(placed.action, 1000)).toMatchObject({ state: "completed", result: { placed: true, face: "east" } });
@@ -460,22 +463,20 @@ describe("BotController", () => {
 
     await expect(subject.openWindowAt(1, 2, 3)).resolves.toMatchObject({ opened: true, window: { type: "minecraft:chest", slots: [{ name: "dirt" }] } });
     await expect(subject.openEntityWindow(10)).resolves.toMatchObject({ opened: true, entity: { name: "cow" }, window: { type: "minecraft:chest" } });
-    expect(subject.windowStatus()).toMatchObject({ window: { type: "minecraft:chest" } });
+    expect(subject.frame()).toMatchObject({ window: { type: "minecraft:chest" } });
     await expect(subject.windowDeposit("dirt", 1)).resolves.toMatchObject({ deposited: "dirt", count: 1 });
     await expect(subject.windowWithdraw("dirt", 1)).resolves.toMatchObject({ withdrew: "dirt", count: 1 });
     await expect(subject.windowClick(5, 0, 0)).resolves.toMatchObject({ clicked: true, slot: 5, window: { type: "minecraft:chest" } });
     expect(bot.clickWindow).toHaveBeenCalledWith(5, 0, 0);
     expect(subject.closeWindow()).toEqual({ closed: true });
 
-    await expect(subject.activateEntity(10)).resolves.toMatchObject({ activated: true, entity: { name: "cow" } });
-    expect(subject.useOnEntity(10)).toMatchObject({ usedOn: true, entity: { name: "cow" } });
-    expect(subject.findEntities({ name: "cow", radius: 16, limit: 5, includePassive: true })).toMatchObject({ entities: [expect.objectContaining({ trackId: expect.any(String), type: "minecraft:cow", status: "loaded" })] });
+    await expect(subject.interactEntity(10)).resolves.toMatchObject({ interacted: true, entity: { name: "cow" } });
+    expect(subject.findEntities({ name: "cow", radius: 16, limit: 5 })).toMatchObject({ entities: [expect.objectContaining({ trackId: expect.any(String), type: "minecraft:cow", status: "loaded" })] });
     expect(() => subject.attackEntity(10)).toThrow("Refusing to attack a passive mob");
     expect(subject.attackEntity(10, { allowPassive: true })).toMatchObject({ attacked: true, entity: { name: "cow" } });
     expect(subject.findEntities({ name: "sniffer", radius: 16, limit: 5 })).toMatchObject({ entities: [expect.objectContaining({ type: "minecraft:sniffer", status: "loaded" })] });
     expect(() => subject.attackEntity(12)).toThrow("Refusing to attack a passive mob");
-    expect(subject.swingArm("right", true)).toEqual({ swung: true, hand: "right", showHand: true });
-    expect(subject.mountEntity(10)).toMatchObject({ mounted: true, entity: { name: "cow" } });
+    await expect(subject.mountEntity(10)).resolves.toMatchObject({ mounted: true, entity: { name: "cow" } });
     expect(subject.dismount()).toEqual({ dismounted: true });
     expect(subject.moveVehicle(0.5, 1)).toEqual({ moved: true, left: 0.5, forward: 1 });
   });

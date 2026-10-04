@@ -11,7 +11,7 @@ function entity(id = 1, x = 5, uuid?: string) {
   return { id, type: "player", username: "Alex", name: "player", uuid, position: { x, y: 64, z: 0 }, velocity: { x: 0, y: 0, z: 0 } };
 }
 function bot(target = entity()) {
-  return { username: "Agent", game: { dimension: "overworld" }, health: 20, food: 20, oxygenLevel: 20, quickBarSlot: 0, heldItem: null, controlState: {},
+  return { username: "Agent", game: { dimension: "overworld" }, health: 20, food: 20, oxygenLevel: 20, quickBarSlot: 0, heldItem: null, vehicle: null, controlState: {},
     entity: { id: 0, yaw: 0, pitch: 0, onGround: true, equipment: [] as unknown[], position: { x: 0, y: 64, z: 0 }, velocity: { x: 0, y: 0, z: 0 } },
     entities: { "1": target } as Record<string, ReturnType<typeof entity>>,
     players: { Alex: { username: "Alex", uuid: target.uuid, entity: target } },
@@ -31,7 +31,7 @@ describe("observed world model", () => {
     const live = bot();
     live.inventory.slots = Array(46).fill(null) as any;
     live.inventory.slots[36] = { name: "stone", count: 1, slot: 99, nbt: { tag: "old" } } as any;
-    live.currentWindow = { id: 1, type: "chest", inventoryStart: 27, inventoryEnd: 63,
+    live.currentWindow = { id: 1, type: "chest", inventoryStart: 27, inventoryEnd: 63, hotbarStart: 54, hotbarEnd: 63,
       slots: [null, { name: "dirt", count: 2, nbt: { huge: "raw" } }, null] } as any;
     Object.assign(live, { heldItem: { name: "book", count: 1, nbt: { pages: ["huge"] } } });
     Object.assign(live.entity, { equipment: [{ name: "helmet", count: 1, nbt: { enchantments: ["huge"] } }] });
@@ -40,7 +40,7 @@ describe("observed world model", () => {
     expect(first.projection).toEqual({ included: 1, omitted: 0 });
     expect(first.entities[0]).toEqual({ trackId: expect.any(String), status: "loaded", type: "minecraft:player", name: "player", username: "Alex", position: { x: 5, y: 64, z: 0 }, distance: 5, unknownFields: ["customName"] });
     expect(first.inventory).toEqual({ known: true, slotCount: 46, slots: [{ name: "stone", count: 1, slot: 36 }] });
-    expect(first.window).toMatchObject({ inventoryStart: 27, inventoryEnd: 63, slotCount: 3, slots: [{ name: "dirt", count: 2, slot: 1 }] });
+    expect(first.window).toMatchObject({ id: 1, known: true, inventoryStart: 27, inventoryEnd: 63, hotbarStart: 54, hotbarEnd: 63, slotCount: 3, slots: [{ name: "dirt", count: 2, slot: 1 }] });
     expect(first.self.heldItem).toEqual({ name: "book", count: 1 });
     expect(first.self.equipment).toEqual({ "0": { name: "helmet", count: 1 } });
     live.inventory.slots[36].nbt.tag = "new";
@@ -95,16 +95,14 @@ describe("observed world model", () => {
     code(() => world.resolveTrack(target.trackId), "TRACK_LOST");
   });
 
-  it("validates canonical species separately from legacy categories", () => {
+  it("validates canonical species against the server registry", () => {
     const world = new WorldModel(new EventStore());
     const cow = { id: 1, name: "cow", type: "mob", position: { x: 2, y: 64, z: 0 } };
     const live = { ...bot(), entities: { "1": cow }, registry: { entitiesByName: { cow: {} } } };
     expect(world.searchLoaded(live, ready, { types: ["minecraft:cow"] }).entities[0]).toMatchObject({ type: "minecraft:cow" });
-    expect(world.searchLoaded(live, ready, { type: "mob" }).entities).toHaveLength(1);
     code(() => world.searchLoaded(live, ready, { types: ["minecraft:unknown"] }), "BAD_INPUT");
     expect(world.searchLoaded(live, ready, { types: ["cow"] }).entities).toEqual(world.searchLoaded(live, ready, { types: ["minecraft:cow"] }).entities);
     code(() => world.searchLoaded(live, ready, { types: ["mod:cow"] }), "BAD_INPUT");
-    code(() => world.searchLoaded(live, ready, { type: "mob", types: ["minecraft:cow"] }), "BAD_INPUT");
   });
 
   it("encodes action contexts independently of frame lifetime and rejects malformed tokens", () => {
@@ -238,7 +236,7 @@ describe("observed world model", () => {
     const first = world.frame(live, ready, { maxEntities: 0, detail: "full" });
     const track = world.trackFor(target);
     expect(first.entities).toEqual([]);
-    expect(first.navigation).toEqual({ moving: true, goal: { kind: "GoalFollow", parameters: { x: 5, y: 64, z: 0, rangeSq: 4 }, target: track } });
+    expect(first.navigation).toEqual({ moving: true, mining: false, building: false, goal: { kind: "GoalFollow", parameters: { x: 5, y: 64, z: 0, rangeSq: 4 }, target: track } });
     expect(JSON.stringify(first.navigation).length).toBeLessThan(300);
     target.equipment[0].nbt.pages[0] = "new raw NBT";
     const unchanged = world.frame(live, ready, { maxEntities: 0, since: first.frame, detail: "full" });

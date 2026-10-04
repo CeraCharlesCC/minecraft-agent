@@ -48,7 +48,7 @@ describe("observation provenance at the controller boundary", () => {
       const frame = controller.frame({ detail: "full" });
       expect(frame.self).not.toHaveProperty("position");
       expect(frame.self).not.toHaveProperty("onGround");
-      expect(controller.position()).toMatchObject({ known: false });
+      expect(frame.unknownFields).toContain("/self/position");
       spawnCow();
       const track = controller.world.trackFor(bot.entities[7])!;
       expect(() => controller.followTrack(track, 1)).toThrow(/absolute position/);
@@ -57,7 +57,7 @@ describe("observation provenance at the controller boundary", () => {
       expect(() => controller.attackEntity(track, { allowPassive: true })).toThrow(/absolute position/);
       expect(physicalLook).not.toHaveBeenCalled(); expect(physicalAttack).not.toHaveBeenCalled();
       position();
-      expect(controller.position()).toMatchObject({ known: true, position: { x: 0, y: 64, z: 0 } });
+      expect(controller.frame().self).toMatchObject({ position: { x: 0, y: 64, z: 0 } });
       expect(controller.actions.get(controller.followTrack(track, 1).action).state).toBe("running");
     } finally { controller.stop(); }
   });

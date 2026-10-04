@@ -1,3 +1,4 @@
+import { API_VERSION } from "../src/core/protocol.js";
 import { describe, expect, it, vi, afterEach } from "vitest";
 import { CliError } from "../src/output/errors.js";
 
@@ -120,14 +121,22 @@ describe("CLI actions", () => {
     const { handlers, mocks } = await loadActionsWithMocks();
     const record = { session: "default", token: "token", controlPort: 3000 };
     mocks.loadSessionForClient.mockResolvedValue(record);
-    await handlers.sessionDiagnose!({ session: "default" });
-    expect(mocks.daemonRequest).toHaveBeenLastCalledWith(record, "/diagnose");
+    await handlers.debugSession!({ session: "default" });
+    expect(mocks.daemonRequest).toHaveBeenLastCalledWith(record, "/debug/session");
+    await handlers.actionStop!({ session: "default", context: "chosen-observation", runtimeId: "runtime", worldEpoch: 2, resources: ["movement", "item"], observe: false });
+    expect(mocks.daemonRequest).toHaveBeenLastCalledWith(record, "/actions/stop", {
+      method: "POST", body: JSON.stringify({ context: "chosen-observation", runtimeId: "runtime", worldEpoch: 2, observe: false, resources: ["movement", "item"] }),
+    });
+    await handlers.actionStop!({ session: "default", context: "chosen-observation" });
+    expect(mocks.daemonRequest).toHaveBeenLastCalledWith(record, "/actions/stop", {
+      method: "POST", body: JSON.stringify({ context: "chosen-observation" }),
+    });
     await handlers.sessionEnsureReady!({ session: "default", timeout: 1000, maxAttempts: 2, backoff: 50 });
     expect(mocks.daemonRequest).toHaveBeenLastCalledWith(record, "/ensure-ready", { method: "POST", body: '{"timeout":1000,"maxAttempts":2,"backoff":50}', signal: expect.any(AbortSignal) });
     await handlers.observeFrame!({ session: "default", detail: "full", maxEntities: 0, radius: 64, tracks: [] });
     expect(mocks.daemonRequest).toHaveBeenLastCalledWith(record, "/frame?maxEntities=0&radius=64&detail=full");
-    await handlers.entityFind({ session: "default", types: ["minecraft:player", "minecraft:cow"], radius: 32, limit: 50, includePlayers: true, includePassive: true });
-    expect(mocks.daemonRequest).toHaveBeenLastCalledWith(record, "/entity/find?radius=32&limit=50&includePlayers=true&includePassive=true&types=minecraft%3Aplayer&types=minecraft%3Acow");
+    await handlers.entityFind({ session: "default", types: ["minecraft:player", "minecraft:cow"], radius: 32, limit: 50 });
+    expect(mocks.daemonRequest).toHaveBeenLastCalledWith(record, "/entity/find?radius=32&limit=50&types=minecraft%3Aplayer&types=minecraft%3Acow");
     await handlers.entityInspect({ session: "default", track: "opaque:e1" });
     expect(mocks.daemonRequest).toHaveBeenLastCalledWith(record, "/entity/inspect?track=opaque%3Ae1");
     await handlers.observeEvents({ session: "default", since: 0, limit: 50, profile: "agent", types: ["chat.player"] });
@@ -159,10 +168,10 @@ describe("CLI actions", () => {
     const { handlers, mocks } = await loadActionsWithMocks();
     mocks.loadSessionForClient.mockResolvedValue({ token: "secret", controlPort: 3000 });
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("{\"trackId\":\"r7:p1\"}\n", { headers: { "X-MC-Agent-API": "3.3" } })));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("{\"trackId\":\"r7:p1\"}\n", { headers: { "X-MC-Agent-API": API_VERSION } })));
     await handlers.observeWatch({ session: "default", since: 0, types: [], track: "r7:p1", fields: ["position", "velocity"], rate: 3 });
-    expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:3000/sample?track=r7%3Ap1&fields=position%2Cvelocity&rate=3", { signal: expect.any(AbortSignal), headers: { Authorization: "Bearer secret", "Content-Type": "application/json", "X-MC-Agent-API": "3.3" } });
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: "RUNTIME_MISMATCH", error: "Old cursor", remediation: "Observe again", details: { runtimeId: "r8" } }), { status: 409, headers: { "X-MC-Agent-API": "3.3" } })));
+    expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:3000/sample?track=r7%3Ap1&fields=position%2Cvelocity&rate=3", { signal: expect.any(AbortSignal), headers: { Authorization: "Bearer secret", "Content-Type": "application/json", "X-MC-Agent-API": API_VERSION } });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: "RUNTIME_MISMATCH", error: "Old cursor", remediation: "Observe again", details: { runtimeId: "r8" } }), { status: 409, headers: { "X-MC-Agent-API": API_VERSION } })));
     await expect(handlers.observeWatch({ session: "default", since: "r7:s2", types: [] })).rejects.toMatchObject({ code: "RUNTIME_MISMATCH", details: { runtimeId: "r8" } });
   });
 
@@ -260,7 +269,7 @@ describe("CLI actions", () => {
   it("reports incompatible legacy watch routes", async () => {
     const { handlers, mocks } = await loadActionsWithMocks();
     mocks.loadSessionForClient.mockResolvedValue({ controlPort: 3000, token: "secret" });
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: "not found" }), { status: 404, headers: { "X-MC-Agent-API": "3.3" } })));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: "not found" }), { status: 404, headers: { "X-MC-Agent-API": API_VERSION } })));
     await expect(handlers.observeWatch({ session: "default", since: 0, types: [], track: "r7:p1" })).rejects.toMatchObject({
       code: "DAEMON_INCOMPATIBLE", details: { path: "/sample" },
     });
@@ -279,29 +288,21 @@ describe("CLI actions", () => {
     await handlers.sendChat({ session: "default", message: "hello", allowCommand: false });
     await handlers.sendWhisper({ session: "default", username: "Steve", message: "hi" });
     await handlers.tabComplete({ session: "default", text: "/gi", assumeCommand: true, sendBlockInSight: false, timeout: 1000 });
-    await handlers.botPosition({ session: "default" });
-    await handlers.botInventory({ session: "default" });
     await handlers.botPlayers({ session: "default" });
-    await handlers.botEntities({ session: "default", radius: 16, limit: 5 });
     await handlers.botTablist({ session: "default" });
     await handlers.botScoreboards({ session: "default" });
     await handlers.botTeams({ session: "default" });
-    await handlers.botControls({ session: "default" });
     await handlers.controlTap({ session: "default", state: "forward", durationMs: 500 });
     await handlers.controlSet({ session: "default", state: "sprint", value: true });
-    await handlers.controlClear({ session: "default" });
     await handlers.lookAt({ session: "default", x: 1, y: 2, z: 3 });
     await handlers.look({ session: "default", yaw: 1, pitch: 0.5, force: true });
     await handlers.worldBlock({ session: "default", x: 4, y: 5, z: 6 });
-    await handlers.worldBlockInfo({ session: "default", x: 4, y: 5, z: 6 });
-    await handlers.worldBlockInSight({ session: "default", maxSteps: 256, vectorLength: 5 });
     await handlers.worldBlockAtCursor({ session: "default", maxDistance: 5 });
     await handlers.worldFindBlocks({ session: "default", name: "oak log", radius: 12, count: 2 });
     await handlers.navigateGoto({ session: "default", x: 7, y: 8, z: 9, range: 2 });
     await handlers.navigateFollow({ session: "default", track: "r7:p1", range: 3 });
-    await handlers.navigateStop({ session: "default" });
-    await handlers.navigateStatus({ session: "default" });
-    await handlers.navigateConfigure({ session: "default", allowDig: false, searchRadius: 32 });
+    await handlers.navigateConfigure({ session: "default", allowDig: false });
+    await handlers.navigateTune({ session: "default", searchRadius: 32, thinkTimeout: 1000, tickTimeout: 40 });
     await handlers.collectItem({ session: "default", track: "r7:e10", range: 1 });
     await handlers.inventoryEquip({ session: "default", item: "dirt", destination: "hand" });
     await handlers.inventoryUnequip({ session: "default", destination: "hand" });
@@ -310,11 +311,9 @@ describe("CLI actions", () => {
     await handlers.inventoryConsume({ session: "default" });
     await handlers.inventoryFish({ session: "default" });
     await handlers.inventoryActivateItem({ session: "default", offhand: false });
-    await handlers.inventoryDeactivateItem({ session: "default" });
     await handlers.inventoryRecipes({ session: "default", item: "stick", count: 1 });
     await handlers.inventoryCraft({ session: "default", item: "stick", count: 1, tableX: 1, tableY: 2, tableZ: 3 });
     await handlers.worldDig({ session: "default", x: 10, y: 11, z: 12 });
-    await handlers.worldStopDigging({ session: "default" });
     await handlers.worldPlace({ session: "default", x: 13, y: 14, z: 15, face: "up", item: "dirt" });
     await handlers.worldPlaceEntity({ session: "default", x: 13, y: 14, z: 15, face: "up", item: "oak_boat" });
     await handlers.worldActivate({ session: "default", x: 16, y: 17, z: 18 });
@@ -324,16 +323,13 @@ describe("CLI actions", () => {
     await handlers.worldElytraFly({ session: "default" });
     await handlers.windowOpenBlock({ session: "default", x: 1, y: 2, z: 3 });
     await handlers.windowOpenEntity({ session: "default", track: "r7:e10" });
-    await handlers.windowStatus({ session: "default" });
     await handlers.windowDeposit({ session: "default", item: "dirt", count: 1 });
     await handlers.windowWithdraw({ session: "default", item: "dirt", count: 1 });
     await handlers.windowClick({ session: "default", slot: 5, mouseButton: 0, mode: 0 });
     await handlers.windowClose({ session: "default" });
-    await handlers.entityFind({ session: "default", name: "zombie", radius: 16, limit: 5, includePlayers: false, includePassive: false });
-    await handlers.entityActivate({ session: "default", track: "r7:e10" });
-    await handlers.entityUseOn({ session: "default", track: "r7:e10" });
+    await handlers.entityFind({ session: "default", name: "zombie", radius: 16, limit: 5 });
+    await handlers.entityInteract({ session: "default", track: "r7:e10" });
     await handlers.entityAttack({ session: "default", track: "r7:e10", allowPlayers: false, allowPassive: true });
-    await handlers.entitySwingArm({ session: "default", hand: "right", showHand: true });
     await handlers.entityMount({ session: "default", track: "r7:e10" });
     await handlers.entityDismount({ session: "default" });
     await handlers.entityMoveVehicle({ session: "default", left: 0.5, forward: 1 });
@@ -348,14 +344,10 @@ describe("CLI actions", () => {
       method: "POST",
       body: JSON.stringify({ text: "/gi", assumeCommand: true, sendBlockInSight: false, timeout: 1000 }),
     });
-    expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/bot/position");
-    expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/bot/inventory");
     expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/bot/players");
-    expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/bot/entities?radius=16&limit=5");
     expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/bot/tablist");
     expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/bot/scoreboards");
     expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/bot/teams");
-    expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/bot/controls");
     expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/control/tap", {
       method: "POST",
       body: JSON.stringify({ state: "forward", durationMs: 500 }),
@@ -364,18 +356,15 @@ describe("CLI actions", () => {
       method: "POST",
       body: JSON.stringify({ state: "sprint", value: true }),
     });
-    expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/control/clear", { method: "POST", body: "{}" });
     expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/look/at", {
       method: "POST",
       body: JSON.stringify({ x: 1, y: 2, z: 3 }),
     });
-    expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/look/yaw-pitch", {
+    expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/advanced/look", {
       method: "POST",
       body: JSON.stringify({ yaw: 1, pitch: 0.5, force: true }),
     });
     expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/world/block?x=4&y=5&z=6");
-    expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/world/block-info?x=4&y=5&z=6");
-    expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/world/block-in-sight?maxSteps=256&vectorLength=5");
     expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/world/block-at-cursor?maxDistance=5");
     expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/world/find-blocks?name=oak%20log&radius=12&count=2");
     expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/navigate/goto", {
@@ -386,8 +375,6 @@ describe("CLI actions", () => {
       method: "POST",
       body: JSON.stringify({ track: "r7:p1", range: 3 }),
     });
-    expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/navigate/stop", { method: "POST", body: "{}" });
-    expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/navigate/status");
     expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/navigate/configure", {
       method: "POST",
       body: JSON.stringify({
@@ -396,10 +383,10 @@ describe("CLI actions", () => {
         allowParkour: undefined,
         canOpenDoors: undefined,
         maxDropDown: undefined,
-        searchRadius: 32,
-        thinkTimeout: undefined,
-        tickTimeout: undefined,
       }),
+    });
+    expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/advanced/navigate-configure", {
+      method: "POST", body: JSON.stringify({ searchRadius: 32, thinkTimeout: 1000, tickTimeout: 40 }),
     });
     expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/collect/item", {
       method: "POST",
@@ -427,7 +414,6 @@ describe("CLI actions", () => {
       method: "POST",
       body: JSON.stringify({ offhand: false }),
     });
-    expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/inventory/deactivate-item", { method: "POST", body: "{}" });
     expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/inventory/recipes?item=stick&count=1");
     expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/inventory/craft", {
       method: "POST",
@@ -437,7 +423,6 @@ describe("CLI actions", () => {
       method: "POST",
       body: JSON.stringify({ x: 10, y: 11, z: 12 }),
     });
-    expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/world/stop-digging", { method: "POST", body: "{}" });
     expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/world/place", {
       method: "POST",
       body: JSON.stringify({ x: 13, y: 14, z: 15, face: "up", item: "dirt" }),
@@ -468,7 +453,6 @@ describe("CLI actions", () => {
       method: "POST",
       body: JSON.stringify({ track: "r7:e10" }),
     });
-    expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/window/status");
     expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/window/deposit", {
       method: "POST",
       body: JSON.stringify({ item: "dirt", count: 1 }),
@@ -477,21 +461,16 @@ describe("CLI actions", () => {
       method: "POST",
       body: JSON.stringify({ item: "dirt", count: 1 }),
     });
-    expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/window/click", {
+    expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/advanced/window-click", {
       method: "POST",
       body: JSON.stringify({ slot: 5, mouseButton: 0, mode: 0 }),
     });
     expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/window/close", { method: "POST", body: "{}" });
-    expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/entity/find?radius=16&limit=5&includePlayers=false&includePassive=false&name=zombie");
-    expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/entity/activate", { method: "POST", body: JSON.stringify({ track: "r7:e10" }) });
-    expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/entity/use-on", { method: "POST", body: JSON.stringify({ track: "r7:e10" }) });
+    expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/entity/find?radius=16&limit=5&name=zombie");
+    expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/entity/interact", { method: "POST", body: JSON.stringify({ track: "r7:e10" }) });
     expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/entity/attack", {
       method: "POST",
       body: JSON.stringify({ track: "r7:e10", allowPlayers: false, allowPassive: true }),
-    });
-    expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/entity/swing-arm", {
-      method: "POST",
-      body: JSON.stringify({ hand: "right", showHand: true }),
     });
     expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/entity/mount", { method: "POST", body: JSON.stringify({ track: "r7:e10" }) });
     expect(mocks.daemonRequest).toHaveBeenCalledWith(record, "/entity/dismount", { method: "POST", body: "{}" });
@@ -512,7 +491,7 @@ describe("CLI actions", () => {
           controller.enqueue(new TextEncoder().encode('{"id":1}\n'));
           controller.close();
         },
-      }), { headers: { "X-MC-Agent-API": "3.3" } });
+      }), { headers: { "X-MC-Agent-API": API_VERSION } });
     vi.stubGlobal(
       "fetch",
       vi.fn()
@@ -523,23 +502,23 @@ describe("CLI actions", () => {
     await handlers.observeWatch({ session: "default", since: "r7:s7", types: [] });
     expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:3000/watch?since=r7%3As7", {
       signal: expect.any(AbortSignal),
-      headers: { Authorization: "Bearer secret", "Content-Type": "application/json", "X-MC-Agent-API": "3.3" },
+      headers: { Authorization: "Bearer secret", "Content-Type": "application/json", "X-MC-Agent-API": API_VERSION },
     });
     expect(write).toHaveBeenCalledWith(Buffer.from('{"id":1}\n'));
 
     await handlers.observeWatch({ session: "default", since: "r7:s8", types: ["chat", "message"] });
     expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:3000/watch?since=r7%3As8&type=chat&type=message", {
       signal: expect.any(AbortSignal),
-      headers: { Authorization: "Bearer secret", "Content-Type": "application/json", "X-MC-Agent-API": "3.3" },
+      headers: { Authorization: "Bearer secret", "Content-Type": "application/json", "X-MC-Agent-API": API_VERSION },
     });
 
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 500, headers: { "X-MC-Agent-API": "3.3" } })));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 500, headers: { "X-MC-Agent-API": API_VERSION } })));
     await expect(handlers.observeWatch({ session: "default", since: 0, types: [] })).rejects.toMatchObject({ code: "DAEMON_ERROR" });
   });
 
   it("passes now and self filtering directly to the daemon", async () => {
     const { handlers } = await loadActionsWithMocks();
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { headers: { "X-MC-Agent-API": "3.3" } })));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { headers: { "X-MC-Agent-API": API_VERSION } })));
     await expect(handlers.observeWatch({ session: "default", since: "now", profile: "agent", types: ["chat.player", "chat.whisper", "chat.unverified"], excludeSelf: true })).rejects.toMatchObject({ code: "DAEMON_ERROR" });
     expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:3000/watch?since=now&profile=agent&type=chat.player&type=chat.whisper&type=chat.unverified&excludeSelf=true", expect.anything());
   });
@@ -550,7 +529,7 @@ describe("CLI actions", () => {
     vi.useFakeTimers();
     let controller!: ReadableStreamDefaultController<Uint8Array>;
     const cancel = vi.fn();
-    const response = new Response(new ReadableStream<Uint8Array>({ start(value) { controller = value; }, cancel }), { headers: { "X-MC-Agent-API": "3.3" } });
+    const response = new Response(new ReadableStream<Uint8Array>({ start(value) { controller = value; }, cancel }), { headers: { "X-MC-Agent-API": API_VERSION } });
     const fetchMock = vi.fn().mockResolvedValue(response);
     vi.stubGlobal("fetch", fetchMock);
     const failure = new Error("stdout closed");
@@ -605,7 +584,7 @@ describe("CLI actions", () => {
     const { daemonIncompatible } = await import("../src/output/errors.js");
     mocks.daemonRequest.mockRejectedValue(daemonIncompatible("default", { actualApiVersion: "2" }));
     const result = await handlers.listSessions();
-    expect(result).toEqual({ sessions: [{ session: "default", alive: true, ready: false, connection: { state: "unresponsive", ready: false }, error: { code: "DAEMON_INCOMPATIBLE", message: expect.stringContaining("API v3.3") } }] });
+    expect(result).toEqual({ sessions: [{ session: "default", alive: true, ready: false, connection: { state: "unresponsive", ready: false }, error: { code: "DAEMON_INCOMPATIBLE", message: expect.stringContaining(`API v${API_VERSION}`) } }] });
     expect(JSON.stringify(result)).not.toContain("private-account");
     expect(JSON.stringify(result)).not.toContain("secret-token");
   });

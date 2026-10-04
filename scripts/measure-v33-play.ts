@@ -25,7 +25,7 @@ if (!initial.connection?.ready || !Number.isFinite(initial.self?.yaw) || !Number
   throw new Error("A ready observation with known yaw/pitch is required; no gameplay request was sent.");
 }
 let context: string = initial.context;
-const look = ["look", "yaw-pitch", "--yaw", String(initial.self.yaw), "--pitch", String(initial.self.pitch), "--force", "--wait", "1000"];
+const look = ["advanced", "look", "--yaw", String(initial.self.yaw), "--pitch", String(initial.self.pitch), "--force", "--wait", "1000"];
 const rows: unknown[] = [];
 for (const mode of ["previous_workflow", "combined_workflow", "combined_result_only"] as const) {
   let outputBytes = 0, calls = 0, frameQueries = 0, outputTokens: number | null = tokenize ? 0 : null;
@@ -54,5 +54,5 @@ if (initial.self?.position) {
 }
 const close = (await command("window", "close")).data;
 const settled = close.state === "running" ? (await command("action", "wait", "--action", close.action, "--timeout", "1000")).data : close;
-console.log(JSON.stringify({ measurement: "Configured live session, repeated unchanged yaw/pitch. Both workflows use API3.3: previous workflow manually observes after result-only action, combined workflow reads attached observation. Latencies include CLI process startup and context file I/O; initial frame and final checks excluded from rows. Dynamic world updates may affect bytes. Optional tokenizer is reported separately. No chat, item, or terrain operation.",
+console.log(JSON.stringify({ measurement: "Configured live session, repeated unchanged yaw/pitch. previous workflow manually observes after result-only action, combined workflow reads attached observation. Latencies include CLI process startup and context file I/O; initial frame and final checks excluded from rows. Dynamic world updates may affect bytes. Optional tokenizer is reported separately. No chat, item, or terrain operation.",
   tokenizer: tokenize ? "o200k_base" : "unavailable; token counts omitted", rows, checks: { navigation, windowClose: { initiallyOpen: !!initial.window, state: settled.state, closed: settled.result?.closed, error: settled.error?.code, observation: settled.observation?.type } } }, null, 2));

@@ -13,7 +13,7 @@ function fixture() {
     chat: vi.fn(), quit: vi.fn(), setControlState: vi.fn(), lookAt: vi.fn(), equip: vi.fn(), toss: vi.fn(),
     findBlocks: vi.fn(() => [new Vec3(1, 64, 1)]), recipesFor: vi.fn(() => [{ id: "stone", result: { count: 1 } }]), craft: vi.fn(),
     currentWindow: { deposit: vi.fn(), withdraw: vi.fn(), close: vi.fn() },
-    blockAt: vi.fn(() => undefined),
+    blockAt: vi.fn<(position: Vec3) => { name: string; type: number; position: Vec3 } | null | undefined>(() => undefined),
   });
   const controller = new BotController({ host: "localhost", port: 25565, username: "bot", auth: "offline" }, new EventStore(), () => bot);
   controller.start(); bot.emit("spawn");
@@ -28,6 +28,24 @@ describe("registry identifier aliases at block and inventory query boundaries", 
     expect(bot.findBlocks).toHaveBeenCalledWith({ matching: 1, maxDistance: 16, count: 4 });
     expect(controller.blockAt(0, 64, 0)).toEqual({ known: false });
     controller.stop();
+  });
+
+  it("inspects a loaded block with available dig facts and reports unavailable coverage consistently", () => {
+    const { bot, controller } = fixture();
+    const block = { name: "stone", type: 1, position: new Vec3(1, 64, 2) };
+    bot.blockAt.mockReturnValue(block);
+    Object.assign(bot, { canDigBlock: () => true, digTime: () => 250 });
+    expect(controller.blockAt(1, 64, 2)).toMatchObject({ known: true, block: { name: "stone", position: { x: 1, y: 64, z: 2 } }, canDig: true, digTimeMs: 250 });
+    Object.assign(bot, { canDigBlock: undefined, digTime: undefined });
+    const basic = controller.blockAt(1, 64, 2);
+    expect(basic).toMatchObject({ known: true, block: { name: "stone" } });
+    expect(basic).not.toHaveProperty("canDig"); expect(basic).not.toHaveProperty("digTimeMs");
+    bot.blockAt.mockReturnValue(null);
+    expect(controller.blockAt(1, 64, 2)).toEqual({ known: false });
+    bot.blockAt.mockReturnValue(undefined);
+    expect(controller.blockAt(1, 64, 2)).toEqual({ known: false });
+    controller.stop();
+    expect(controller.blockAt(1, 64, 2)).toEqual({ known: false });
   });
 
   it("normalizes inventory selection, recipes, crafting, toss and container transfers", async () => {

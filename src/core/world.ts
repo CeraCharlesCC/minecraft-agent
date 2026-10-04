@@ -28,7 +28,7 @@ export interface ProjectionOptions {
 }
 export type FrameOptions = ProjectionOptions;
 export interface EntitySearchOptions {
-  name?: string; type?: string; types?: string[]; radius?: number; limit?: number;
+  name?: string; types?: string[]; radius?: number; limit?: number;
 }
 
 type Point = { x: number; y: number; z: number };
@@ -47,8 +47,8 @@ type LiveBot = {
   game?: { dimension?: unknown }; health?: number; food?: number; foodSaturation?: number;
   oxygenLevel?: number; experience?: unknown; controlState?: Record<string, boolean>;
   inventory?: { items?: () => unknown[]; slots?: unknown[] }; currentWindow?: unknown;
-  heldItem?: unknown; quickBarSlot?: number;
-  pathfinder?: { goal?: unknown; isMoving?: () => boolean };
+  heldItem?: unknown; quickBarSlot?: number; vehicle?: Entity | null;
+  pathfinder?: { goal?: unknown; isMoving?: () => boolean; isMining?: () => boolean; isBuilding?: () => boolean };
   registry?: { entitiesByName?: Record<string, unknown> };
 };
 interface Track {
@@ -217,6 +217,27 @@ function publicSlots(input: ReturnType<typeof slotObservation>, detail: "compact
     slots.push({ ...projectItem(value, detail), slot });
   }
   return { known: true, ...(input.slotCount !== null ? { slotCount: input.slotCount } : {}), slots };
+}
+function observeWindow(input: unknown): unknown {
+  if (!input || typeof input !== "object") return null;
+  const window = input as Record<string, unknown>;
+  const fallback = typeof window.items === "function" ? window.items.call(window) : typeof window.containerItems === "function" ? window.containerItems.call(window) : undefined;
+  const title = typeof window.title === "string" ? window.title : window.title && typeof window.title === "object" && window.title.toString !== Object.prototype.toString ? String(window.title) : undefined;
+  return { id: window.id, type: window.type, title,
+    observation: slotObservation(window.slots, fallback, true), inventoryStart: window.inventoryStart, inventoryEnd: window.inventoryEnd,
+    hotbarStart: window.hotbarStart, hotbarEnd: window.hotbarEnd, selectedItem: projectItem(window.selectedItem, "full") };
+}
+function projectWindowObservation(input: unknown, detail: "compact" | "full"): Record<string, unknown> | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  const window = input as Record<string, unknown>, result: Record<string, unknown> = {};
+  for (const key of ["id", "inventoryStart", "inventoryEnd", "hotbarStart", "hotbarEnd"]) if (typeof window[key] === "number" && Number.isFinite(window[key])) result[key] = window[key];
+  for (const key of ["type", "title"]) if (typeof window[key] === "string") result[key] = window[key];
+  const selectedItem = projectItem(window.selectedItem, detail);
+  return { ...result, ...publicSlots(window.observation as ReturnType<typeof slotObservation>, detail), ...(selectedItem ? { selectedItem } : {}) };
+}
+/** Shared actionable window facts for frame observations and window operation results. */
+export function projectWindow(input: unknown, detail: "compact" | "full" = "compact"): Record<string, unknown> | undefined {
+  return projectWindowObservation(observeWindow(input), detail);
 }
 /** Detach public data without retaining live Mineflayer objects or cyclic references. */
 function copy(value: unknown, seen = new WeakSet<object>(), depth = 0): any {
@@ -489,6 +510,9 @@ export class WorldModel {
     const controls = context.getControls?.() ?? context.controls ?? bot.controlState;
     const unknownFields: string[] = [];
     const selfPosition = observedEntityPosition(bot.entity);
+    const vehicleTrack = bot.vehicle ? this.trackFor(bot.vehicle) : undefined;
+    const vehicleBinding = vehicleTrack ? this.tracks.get(vehicleTrack) : undefined;
+    const vehicle = vehicleBinding?.status === "loaded" && vehicleBinding.entity === bot.vehicle ? { trackId: vehicleTrack } : undefined;
     if (ready) {
       const values = { position: selfPosition, yaw: selfPosition ? bot.entity?.yaw : undefined, pitch: selfPosition ? bot.entity?.pitch : undefined,
         health: bot.health, food: bot.food, oxygenLevel: bot.oxygenLevel, quickBarSlot: bot.quickBarSlot,
@@ -500,6 +524,7 @@ export class WorldModel {
           : key === "position" ? !value : typeof value !== "number" || !Number.isFinite(value);
         if (unknown) unknownFields.push(`/self/${key}`);
       }
+      if (bot.vehicle !== null && !vehicle) unknownFields.push("/self/vehicle");
       if (bot.currentWindow === undefined) unknownFields.push("/window");
     }
     const players = context.connected ? Object.entries(bot.players ?? {}).map(([name, player]) => {
@@ -514,13 +539,13 @@ export class WorldModel {
       dimension: context.connected ? nextDimension ?? null : null,
       self: ready ? { username: bot.username, position: selfPosition, velocity: selfPosition ? point(bot.entity?.velocity) : undefined, yaw: selfPosition ? bot.entity?.yaw : undefined, pitch: selfPosition ? bot.entity?.pitch : undefined,
         health: bot.health, food: bot.food, foodSaturation: bot.foodSaturation, oxygenLevel: bot.oxygenLevel,
-        onGround: selfPosition ? bot.entity?.onGround : undefined, experience: copy(bot.experience), controls: copy(controls), equipment: Array.isArray(bot.entity?.equipment) ? bot.entity.equipment.map((item) => projectItem(item, "full")) : undefined, heldItem: projectItem(bot.heldItem, "full"), quickBarSlot: bot.quickBarSlot } : {},
+        onGround: selfPosition ? bot.entity?.onGround : undefined, experience: copy(bot.experience), controls: copy(controls), equipment: Array.isArray(bot.entity?.equipment) ? bot.entity.equipment.map((item) => projectItem(item, "full")) : undefined, heldItem: projectItem(bot.heldItem, "full"), quickBarSlot: bot.quickBarSlot, vehicle } : {},
       players,
       entities: [...this.tracks.values()].map((track) => this.serializeTrack(track)),
       inventory: slotObservation(bot.inventory?.slots, ready ? bot.inventory?.items?.() : undefined, ready),
-      window: ready ? this.serializeWindow(bot.currentWindow) : null,
+      window: ready ? observeWindow(bot.currentWindow) : null,
       actions: copy(context.getActions?.() ?? context.actions ?? []),
-      navigation: ready ? { moving: bot.pathfinder?.isMoving?.() ?? false, goal: this.serializeGoal(bot.pathfinder?.goal) } : { moving: false, goal: null },
+      navigation: ready ? { moving: bot.pathfinder?.isMoving?.() ?? false, mining: bot.pathfinder?.isMining?.() ?? false, building: bot.pathfinder?.isBuilding?.() ?? false, goal: this.serializeGoal(bot.pathfinder?.goal) } : { moving: false, mining: false, building: false, goal: null },
       unknownFields,
     };
     // Observation timestamps are excluded so repeated observations do not invent state changes.
@@ -558,8 +583,6 @@ export class WorldModel {
     if (!Number.isFinite(radius) || radius < 0 || radius > 4096) throw badInput("radius must be between 0 and 4096.");
     if (!Number.isInteger(limit) || limit < 0 || limit > 512) throw badInput("limit must be an integer between 0 and 512.");
     if (options.name !== undefined && (typeof options.name !== "string" || !options.name)) throw badInput("name must be a nonempty string.");
-    if (options.type !== undefined && (typeof options.type !== "string" || !options.type)) throw badInput("type must be a nonempty legacy entity category.");
-    if (options.type !== undefined && options.types !== undefined) throw badInput("Use either legacy type or canonical types, not both.");
     if (options.types !== undefined && (!Array.isArray(options.types) || options.types.length === 0 || options.types.length > 512 || options.types.some((type) => typeof type !== "string"))) throw badInput("types must list Minecraft species such as player or minecraft:player.");
     const types = options.types?.map((type) => `minecraft:${normalizeRegistryName(type)}`);
     const registry = (bot as LiveBot | undefined)?.registry?.entitiesByName;
@@ -571,7 +594,6 @@ export class WorldModel {
     const origin = readiness.connected && readiness.spawned ? observedEntityPosition((bot as LiveBot)?.entity) : undefined;
     const entities = [...this.tracks.values()].filter((track) => track.status === "loaded")
       .filter((entity) => !options.name || entity.name === options.name || entity.username === options.name)
-      .filter((entity) => !options.type || entity.kind === options.type)
       .filter((entity) => !types || types.includes(String(entity.type)))
       .map((entity): Record<string, unknown> & { distance?: number } => ({ ...this.serializeTrack(entity), distance: distance(origin, entity.position) }))
       .filter((entity) => entity.distance === undefined || entity.distance <= radius)
@@ -639,7 +661,7 @@ export class WorldModel {
       ...(state.dimension !== null && state.dimension !== undefined ? { dimension: copy(state.dimension) } : {}),
       self: this.projectSelf(state.self, projection.detail),
       inventory: publicSlots(state.inventory, projection.detail),
-      ...(state.window ? { window: this.projectWindow(state.window, projection.detail) } : {}),
+      ...(state.window ? { window: projectWindowObservation(state.window, projection.detail) } : {}),
       entities: selected.map((entity) => projectEntity(entity, projection.detail)!),
       actions: this.projectActions(state.actions),
       projection: { included, omitted: loaded.length - included, ...(Object.keys(aggregated).length ? { aggregates: aggregated } : {}) },
@@ -709,6 +731,7 @@ export class WorldModel {
     }
     for (const key of ["yaw", "pitch", "health", "food", "oxygenLevel", "quickBarSlot", ...(detail === "full" ? ["foodSaturation"] : [])]) if (typeof input[key] === "number" && Number.isFinite(input[key])) self[key] = input[key];
     if (typeof input.onGround === "boolean") self.onGround = input.onGround;
+    if (input.vehicle) self.vehicle = copy(input.vehicle);
     if (input.controls && typeof input.controls === "object") self.controls = Object.entries(input.controls).filter(([key, active]) => ["forward", "back", "left", "right", "jump", "sprint", "sneak"].includes(key) && active === true).map(([key]) => key).sort();
     if (Array.isArray(input.equipment)) self.equipment = Object.fromEntries(input.equipment.flatMap((value, slot) => value ? [[String(slot), projectItem(value, detail)]] : []));
     const heldItem = projectItem(input.heldItem, detail);
@@ -831,19 +854,5 @@ export class WorldModel {
   }
   private compactTrack(track: Record<string, unknown>): Record<string, unknown> & { trackId: string } {
     return projectEntity(track) as Record<string, unknown> & { trackId: string };
-  }
-  private projectWindow(input: unknown, detail: "compact" | "full"): unknown {
-    if (!input || typeof input !== "object") return undefined;
-    const window = input as Record<string, unknown>, result: Record<string, unknown> = {};
-    for (const key of ["id", "inventoryStart", "inventoryEnd"]) if (typeof window[key] === "number" && Number.isFinite(window[key])) result[key] = window[key];
-    for (const key of ["type", "title"]) if (typeof window[key] === "string") result[key] = window[key];
-    const selectedItem = projectItem(window.selectedItem, detail);
-    return { ...result, ...publicSlots(window.observation as ReturnType<typeof slotObservation>, detail), ...(selectedItem ? { selectedItem } : {}) };
-  }
-  private serializeWindow(input: unknown): unknown {
-    if (!input || typeof input !== "object") return null;
-    const window = input as Record<string, unknown>;
-    const fallback = typeof window.items === "function" ? window.items.call(window) : typeof window.containerItems === "function" ? window.containerItems.call(window) : undefined;
-    return { id: window.id, type: window.type, title: typeof window.title === "string" ? window.title : undefined, observation: slotObservation(window.slots, fallback, true), inventoryStart: window.inventoryStart, inventoryEnd: window.inventoryEnd, selectedItem: projectItem(window.selectedItem, "full") };
   }
 }

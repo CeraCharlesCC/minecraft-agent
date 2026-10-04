@@ -1,3 +1,4 @@
+import { API_VERSION } from "../src/core/protocol.js";
 /** Local HTTP response measurements with a simulated bot; never connects to Minecraft. */
 import { EventEmitter } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -26,7 +27,7 @@ await new Promise<void>(resolve => allocation.listen(0, "127.0.0.1", resolve));
 const port = (allocation.address() as { port: number }).port;
 await new Promise<void>(resolve => allocation.close(() => resolve()));
 const bot = new MeasurementBot();
-const headers = { Authorization: "Bearer measurement-token-12345678901234567890", "X-MC-Agent-API": "3.3", "Content-Type": "application/json" };
+const headers = { Authorization: "Bearer measurement-token-12345678901234567890", "X-MC-Agent-API": API_VERSION, "Content-Type": "application/json" };
 let tokenize: ((text: string) => number) | undefined;
 for (const name of [process.env.MC_AGENT_TOKENIZER_MODULE, "js-tiktoken", "tiktoken"].filter((value): value is string => !!value)) {
   try { const mod = await import(name); const enc = (mod.getEncoding ?? mod.get_encoding)("o200k_base"); tokenize = text => enc.encode(text).length; break; }
@@ -68,10 +69,10 @@ try {
         const started = performance.now();
         const input = { context, yaw: (i % 2) * 0.1, pitch: 0, force: false };
         if (mode.startsWith("previous_")) {
-          const action = await counted("/look/yaw-pitch", { ...input, observe: false }, false);
+          const action = await counted("/advanced/look", { ...input, observe: false }, false);
           await counted(`/actions/${action.action}/wait?timeout=1000&observe=false`);
           if (mode === "previous_loop") await counted("/frame");
-        } else await counted("/look/yaw-pitch", { ...input, wait: 1000, observe: mode !== "combined_result_only" });
+        } else await counted("/advanced/look", { ...input, wait: 1000, observe: mode !== "combined_result_only" });
         latencies.push(performance.now() - started - tokenizerTimeMs);
       }
       latencies.sort((a, b) => a - b);

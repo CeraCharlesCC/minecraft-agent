@@ -60,6 +60,50 @@ function makeProgram(version = "0.0.0") {
 describe("CLI protocol", () => {
 
   it.each([
+    { flags: [], resources: undefined },
+    { flags: ["--resource", "movement,item", "--resource", "look,movement"], resources: ["movement", "item", "look"] },
+  ])("stops the selected resources immediately with observation context %j", async ({ flags, resources }) => {
+    const { program, handlers } = makeProgram();
+    const context = encodeActionContext(runtimeId, 2);
+    await program.parseAsync(["node", "mc-agent", "action", "stop", ...flags, "--context", context, "--no-observe"]);
+    expect(handlers.actionStop).toHaveBeenCalledExactlyOnceWith({
+      session: "default", context, runtimeId, worldEpoch: 2, observe: false,
+      ...(resources ? { resources } : {}),
+    });
+    expect(handlers.actionWait).not.toHaveBeenCalled();
+  });
+
+  it("requires observation context before stopping resources", async () => {
+    const { program, handlers } = makeProgram();
+    await expect(program.parseAsync(["node", "mc-agent", "action", "stop"])).rejects.toMatchObject({ code: "CONTEXT_REQUIRED" });
+    expect(handlers.actionStop).not.toHaveBeenCalled();
+  });
+
+  it.each(["", "dig", "movement,invalid"])("rejects invalid stop resource selection %s", async resource => {
+    const { program, handlers } = makeProgram();
+    await expect(program.parseAsync(["node", "mc-agent", "action", "stop", "--resource", resource,
+      "--context", encodeActionContext(runtimeId, 2)])).rejects.toMatchObject({ code: "BAD_INPUT" });
+    expect(handlers.actionStop).not.toHaveBeenCalled();
+  });
+
+  it("routes held-item entity interactions through one operation", async () => {
+    const { program, handlers } = makeProgram();
+    const context = encodeActionContext(runtimeId, 2);
+    await program.parseAsync(["node", "mc-agent", "entity", "interact", "--track", `${runtimeTag}:e1`, "--context", context, "--wait", "100"]);
+    expect(handlers.entityInteract).toHaveBeenCalledExactlyOnceWith({ session: "default", context, runtimeId, worldEpoch: 2, track: `${runtimeTag}:e1`, wait: 100 });
+  });
+
+  it("exposes raw camera controls and pathfinder tuning under advanced", async () => {
+    const { program, handlers } = makeProgram();
+    const context = encodeActionContext(runtimeId, 2);
+    await program.parseAsync(["node", "mc-agent", "advanced", "look", "--yaw", "1", "--pitch", "0.5", "--force", "--context", context, "--wait", "100"]);
+    expect(handlers.look).toHaveBeenCalledWith({ session: "default", context, runtimeId, worldEpoch: 2, yaw: 1, pitch: 0.5, force: true, wait: 100 });
+    await program.parseAsync(["node", "mc-agent", "advanced", "navigate-configure", "--search-radius", "64", "--think-timeout", "1000", "--tick-timeout", "40", "--context", context]);
+    expect(handlers.navigateTune).toHaveBeenCalledWith({ session: "default", context, runtimeId, worldEpoch: 2, searchRadius: 64, thinkTimeout: 1000, tickTimeout: 40 });
+    expect(handlers.navigateConfigure).not.toHaveBeenCalled();
+  });
+
+  it.each([
     ["world", "wake"],
     ["world", "dig", "--x", "bad", "--y", "64", "--z", "0"],
     ["navigate", "goto", "--x", "bad", "--y", "64", "--z", "0"],
@@ -114,7 +158,6 @@ describe("CLI protocol", () => {
     ["world", "wake", "--context", encodeActionContext(runtimeId, 2), "--world-epoch", "3"],
     ["world", "wake", "--context", encodeActionContext(runtimeId, 2), "--wait", "30001"],
     ["action", "wait", "--action", `${runtimeTag}:a1`, "--timeout", "-1"],
-    ["entity", "find", "--type", "mob", "--types", "minecraft:cow"],
     ["entity", "find", "--types", "example:cow"],
     ["entity", "find", "--types", "minecraft:Cow"],
     ["observe", "events", "--profile", "future"],
@@ -141,7 +184,7 @@ describe("CLI protocol", () => {
     for (const name of ["cow", "minecraft:cow"]) {
       await program.parseAsync(["node", "mc-agent", "entity", "find", "--types", name]);
       expect(handlers.entityFind).toHaveBeenLastCalledWith({ session: "default", types: ["minecraft:cow"],
-        radius: 32, limit: 50, includePlayers: true, includePassive: true });
+        radius: 32, limit: 50 });
     }
   });
 
@@ -166,11 +209,11 @@ describe("CLI protocol", () => {
     await program.parseAsync(["node", "mc-agent", "observe", "frame", "--detail", "full", "--max-entities", "0"]);
     expect(handlers.observeFrame).toHaveBeenCalledWith({ session: "default", detail: "full", maxEntities: 0, radius: 64, tracks: [] });
     await program.parseAsync(["node", "mc-agent", "entity", "find", "--types", "minecraft:player,minecraft:cow", "--types", "minecraft:sheep"]);
-    expect(handlers.entityFind).toHaveBeenCalledWith({ session: "default", types: ["minecraft:player", "minecraft:cow", "minecraft:sheep"], radius: 32, limit: 50, includePlayers: true, includePassive: true });
+    expect(handlers.entityFind).toHaveBeenCalledWith({ session: "default", types: ["minecraft:player", "minecraft:cow", "minecraft:sheep"], radius: 32, limit: 50 });
     await program.parseAsync(["node", "mc-agent", "observe", "events", "--profile", "agent"]);
     expect(handlers.observeEvents).toHaveBeenCalledWith({ session: "default", profile: "agent", since: 0, limit: 50, types: [] });
-    await program.parseAsync(["node", "mc-agent", "session", "diagnose"]);
-    expect(handlers.sessionDiagnose).toHaveBeenCalledWith({ session: "default" });
+    await program.parseAsync(["node", "mc-agent", "debug", "session"]);
+    expect(handlers.debugSession).toHaveBeenCalledWith({ session: "default" });
     await program.parseAsync(["node", "mc-agent", "session", "ensure-ready"]);
     expect(handlers.sessionEnsureReady).toHaveBeenCalledWith({ session: "default", timeout: 10000, maxAttempts: 3, backoff: 250 });
     await program.parseAsync(["node", "mc-agent", "action", "wait", "--action", `${runtimeTag}:a1`]);
@@ -391,7 +434,7 @@ describe("CLI protocol", () => {
   it("exposes all planned top-level command groups", () => {
     const { program } = makeProgram();
     const names = program.commands.map((command) => command.name());
-    expect(names).toEqual(["session", "observe", "chat", "bot", "control", "look", "navigate", "collect", "inventory", "world", "window", "entity", "action", "debug", "skills", "daemon"]);
+    expect(names).toEqual(["session", "observe", "chat", "bot", "advanced", "control", "look", "navigate", "collect", "inventory", "world", "window", "entity", "action", "debug", "skills", "daemon"]);
   });
 
   it("prints bundled skill content directly", async () => {
@@ -449,8 +492,7 @@ describe("CLI protocol", () => {
       "--can-open-doors",
       "--max-drop-down",
       "8",
-      "--search-radius",
-      "64", "--runtime", runtimeId, "--world-epoch", "1"]);
+      "--runtime", runtimeId, "--world-epoch", "1"]);
 
     expect(handlers.navigateConfigure).toHaveBeenCalledWith({
       session: "s", runtimeId, worldEpoch: 1,
@@ -460,9 +502,6 @@ describe("CLI protocol", () => {
       allowParkour: false,
       canOpenDoors: true,
       maxDropDown: 8,
-      searchRadius: 64,
-      thinkTimeout: undefined,
-      tickTimeout: undefined,
     });
   });
 
@@ -474,18 +513,13 @@ describe("CLI protocol", () => {
     vi.spyOn(handlers, "observeEvents").mockResolvedValue({});
     vi.spyOn(handlers, "observeWatch").mockResolvedValue(undefined);
     vi.spyOn(handlers, "sendChat").mockResolvedValue({});
-    vi.spyOn(handlers, "botPosition").mockResolvedValue({});
-    vi.spyOn(handlers, "botInventory").mockResolvedValue({});
     vi.spyOn(handlers, "botPlayers").mockResolvedValue({});
-    vi.spyOn(handlers, "botEntities").mockResolvedValue({});
     vi.spyOn(handlers, "controlTap").mockResolvedValue({});
     vi.spyOn(handlers, "lookAt").mockResolvedValue({});
     vi.spyOn(handlers, "worldBlock").mockResolvedValue({});
     vi.spyOn(handlers, "worldFindBlocks").mockResolvedValue({});
     vi.spyOn(handlers, "navigateGoto").mockResolvedValue({});
     vi.spyOn(handlers, "navigateFollow").mockResolvedValue({});
-    vi.spyOn(handlers, "navigateStop").mockResolvedValue({});
-    vi.spyOn(handlers, "navigateStatus").mockResolvedValue({});
     vi.spyOn(handlers, "inventoryEquip").mockResolvedValue({});
     vi.spyOn(handlers, "worldDig").mockResolvedValue({});
     vi.spyOn(handlers, "worldPlace").mockResolvedValue({});
@@ -499,18 +533,13 @@ describe("CLI protocol", () => {
     await program.parseAsync(["node", "mc-agent", "observe", "events", "--session", "s", "--since", `${runtimeTag}:s2`, "--limit", "3"]);
     await program.parseAsync(["node", "mc-agent", "observe", "watch", "--session", "s", "--since", `${runtimeTag}:s4`]);
     await program.parseAsync(["node", "mc-agent", "chat", "send", "--session", "s", "--message", "/say hi", "--allow-command"]);
-    await program.parseAsync(["node", "mc-agent", "bot", "position", "--session", "s"]);
-    await program.parseAsync(["node", "mc-agent", "bot", "inventory", "--session", "s"]);
     await program.parseAsync(["node", "mc-agent", "bot", "players", "--session", "s"]);
-    await program.parseAsync(["node", "mc-agent", "bot", "entities", "--session", "s", "--radius", "16", "--limit", "4"]);
     await program.parseAsync(["node", "mc-agent", "control", "tap", "--session", "s", "--state", "jump", "--duration-ms", "25", "--runtime", runtimeId, "--world-epoch", "1"]);
     await program.parseAsync(["node", "mc-agent", "look", "at", "--session", "s", "--x", "1", "--y", "2", "--z", "3", "--runtime", runtimeId, "--world-epoch", "1"]);
     await program.parseAsync(["node", "mc-agent", "world", "block", "--session", "s", "--x", "4", "--y", "5", "--z", "6"]);
     await program.parseAsync(["node", "mc-agent", "world", "find-blocks", "--session", "s", "--name", "farmland", "--radius", "12", "--count", "3"]);
     await program.parseAsync(["node", "mc-agent", "navigate", "goto", "--session", "s", "--x", "7", "--y", "8", "--z", "9", "--range", "2", "--runtime", runtimeId, "--world-epoch", "1"]);
     await program.parseAsync(["node", "mc-agent", "navigate", "follow", "--session", "s", "--track", `${runtimeTag}:p1`, "--range", "3", "--runtime", runtimeId, "--world-epoch", "1"]);
-    await program.parseAsync(["node", "mc-agent", "navigate", "stop", "--session", "s", "--runtime", runtimeId, "--world-epoch", "1"]);
-    await program.parseAsync(["node", "mc-agent", "navigate", "status", "--session", "s"]);
     await program.parseAsync(["node", "mc-agent", "inventory", "equip", "--session", "s", "--item", "dirt", "--destination", "hand", "--runtime", runtimeId, "--world-epoch", "1"]);
     await program.parseAsync(["node", "mc-agent", "world", "dig", "--session", "s", "--x", "10", "--y", "11", "--z", "12", "--runtime", runtimeId, "--world-epoch", "1"]);
     await program.parseAsync([
@@ -531,7 +560,7 @@ describe("CLI protocol", () => {
       "--item",
       "dirt", "--runtime", runtimeId, "--world-epoch", "1"]);
     await program.parseAsync(["node", "mc-agent", "world", "activate", "--session", "s", "--x", "16", "--y", "17", "--z", "18", "--runtime", runtimeId, "--world-epoch", "1"]);
-    await program.parseAsync(["node", "mc-agent", "window", "click", "--session", "s", "--slot", "5", "--mouse-button", "1", "--mode", "0", "--runtime", runtimeId, "--world-epoch", "1"]);
+    await program.parseAsync(["node", "mc-agent", "advanced", "window-click", "--session", "s", "--slot", "5", "--mouse-button", "1", "--mode", "0", "--runtime", runtimeId, "--world-epoch", "1"]);
     await program.parseAsync(["node", "mc-agent", "daemon", "run", "--control-port", "4567"]);
 
     expect(handlers.sessionStatus).toHaveBeenCalledWith({ session: "s" });
@@ -540,18 +569,13 @@ describe("CLI protocol", () => {
     expect(handlers.observeEvents).toHaveBeenCalledWith({ session: "s", since: `${runtimeTag}:s2`, profile: "all", limit: 3, types: [] });
     expect(handlers.observeWatch).toHaveBeenCalledWith({ session: "s", since: `${runtimeTag}:s4`, profile: "all", types: [] });
     expect(handlers.sendChat).toHaveBeenCalledWith({ session: "s", message: "/say hi", allowCommand: true });
-    expect(handlers.botPosition).toHaveBeenCalledWith({ session: "s" });
-    expect(handlers.botInventory).toHaveBeenCalledWith({ session: "s" });
     expect(handlers.botPlayers).toHaveBeenCalledWith({ session: "s" });
-    expect(handlers.botEntities).toHaveBeenCalledWith({ session: "s", radius: 16, limit: 4 });
     expect(handlers.controlTap).toHaveBeenCalledWith({ session: "s", runtimeId, worldEpoch: 1, state: "jump", durationMs: 25 });
     expect(handlers.lookAt).toHaveBeenCalledWith({ session: "s", runtimeId, worldEpoch: 1, x: 1, y: 2, z: 3 });
     expect(handlers.worldBlock).toHaveBeenCalledWith({ session: "s", x: 4, y: 5, z: 6 });
     expect(handlers.worldFindBlocks).toHaveBeenCalledWith({ session: "s", name: "farmland", radius: 12, count: 3 });
     expect(handlers.navigateGoto).toHaveBeenCalledWith({ session: "s", runtimeId, worldEpoch: 1, x: 7, y: 8, z: 9, range: 2 });
     expect(handlers.navigateFollow).toHaveBeenCalledWith({ session: "s", runtimeId, worldEpoch: 1, track: `${runtimeTag}:p1`, range: 3 });
-    expect(handlers.navigateStop).toHaveBeenCalledWith({ session: "s", runtimeId, worldEpoch: 1 });
-    expect(handlers.navigateStatus).toHaveBeenCalledWith({ session: "s" });
     expect(handlers.inventoryEquip).toHaveBeenCalledWith({ session: "s", runtimeId, worldEpoch: 1, item: "dirt", destination: "hand" });
     expect(handlers.worldDig).toHaveBeenCalledWith({ session: "s", runtimeId, worldEpoch: 1, x: 10, y: 11, z: 12 });
     expect(handlers.worldPlace).toHaveBeenCalledWith({ session: "s", runtimeId, worldEpoch: 1, x: 13, y: 14, z: 15, face: "east", item: "dirt" });
