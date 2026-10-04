@@ -1,6 +1,7 @@
 import { API_VERSION } from "../src/core/protocol.js";
 import { EventEmitter } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Vec3 } from "vec3";
@@ -68,9 +69,36 @@ async function makeTempDir() {
   return dir;
 }
 
+async function unusedPort() {
+  const server = createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const port = (server.address() as { port: number }).port;
+  await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  return port;
+}
+
+function ndjsonEvents(reader: ReadableStreamDefaultReader<Uint8Array>) {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  return async () => {
+    while (!buffer.includes("\n")) {
+      const chunk = await reader.read();
+      if (chunk.done) throw new Error("Unexpected NDJSON stream end");
+      buffer += decoder.decode(chunk.value, { stream: true });
+    }
+    const end = buffer.indexOf("\n");
+    const line = buffer.slice(0, end);
+    buffer = buffer.slice(end + 1);
+    return JSON.parse(line);
+  };
+}
+
 async function responseDaemon(session: string) {
   process.env.MC_AGENT_STATE_DIR = await makeTempDir();
-  const bot = new FakeBot(), port = 54180 + Math.floor(Math.random() * 1000);
+  const bot = new FakeBot(), port = await unusedPort();
   Object.assign(bot, { controlState: {}, clearControlStates: vi.fn() });
   await runDaemon({ session, controlPort: port, token: TOKEN_A, host: "localhost", port: 25565,
     username: "AgentBot", auth: "offline", createBotFn: () => bot, exitOnStop: false });
@@ -219,7 +247,7 @@ describe("daemon server", () => {
     const dir = await makeTempDir();
     process.env.MC_AGENT_STATE_DIR = dir;
     const fakeBot = new FakeBot();
-    const port = 35180 + Math.floor(Math.random() * 1000);
+    const port = await unusedPort();
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
 
     await runDaemon({
@@ -285,7 +313,7 @@ describe("daemon server", () => {
     const dir = await makeTempDir();
     process.env.MC_AGENT_STATE_DIR = dir;
     const fakeBot = new FakeBot();
-    const port = 36180 + Math.floor(Math.random() * 1000);
+    const port = await unusedPort();
     const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined as never) as typeof process.exit);
 
     await runDaemon({
@@ -305,8 +333,7 @@ describe("daemon server", () => {
 
     const stop = await fetch(`http://127.0.0.1:${port}/stop`, { method: "POST", headers: { "X-MC-Agent-API": API_VERSION, Authorization: `Bearer ${TOKEN_B}` } });
     await stop.text();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    expect(exit).toHaveBeenCalledWith(0);
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
     exit.mockRestore();
   });
 
@@ -314,7 +341,7 @@ describe("daemon server", () => {
     const dir = await makeTempDir();
     process.env.MC_AGENT_STATE_DIR = dir;
     const fakeBot = new FakeBot();
-    const port = 32180 + Math.floor(Math.random() * 1000);
+    const port = await unusedPort();
 
     await runDaemon({
       session: "test",
@@ -361,7 +388,7 @@ describe("daemon server", () => {
     const dir = await makeTempDir();
     process.env.MC_AGENT_STATE_DIR = dir;
     const fakeBot = new FakeBot();
-    const port = 37180 + Math.floor(Math.random() * 1000);
+    const port = await unusedPort();
 
     await runDaemon({
       session: "filtered-events",
@@ -409,7 +436,7 @@ describe("daemon server", () => {
     const dir = await makeTempDir();
     process.env.MC_AGENT_STATE_DIR = dir;
     const fakeBot = new FakeBot();
-    const port = 33180 + Math.floor(Math.random() * 1000);
+    const port = await unusedPort();
 
     await runDaemon({
       session: "watch",
@@ -431,21 +458,16 @@ describe("daemon server", () => {
     });
     const reader = response.body!.getReader();
 
-    const { value } = await reader.read();
-    let lines = Buffer.from(value!).toString("utf8").trim().split("\n").map(line => JSON.parse(line));
-    expect(lines[0]).toMatchObject({ type: "events.replay", gap: false, profile: "agent", unknownTypes: "excluded" });
-    expect(lines[0].types).toContain("chat.unverified");
-    expect(lines[0].types).not.toContain("server.control");
-    if (lines.length === 1) {
-      const replay = await reader.read();
-      lines = lines.concat(Buffer.from(replay.value!).toString("utf8").trim().split("\n").map(line => JSON.parse(line)));
-    }
-    expect(lines[1]).toMatchObject({ type: "chat.unverified", candidateSender: "Alex", text: "old" });
+    const nextEvent = ndjsonEvents(reader);
+    const metadata = await nextEvent();
+    expect(metadata).toMatchObject({ type: "events.replay", gap: false, profile: "agent", unknownTypes: "excluded" });
+    expect(metadata.types).toContain("chat.unverified");
+    expect(metadata.types).not.toContain("server.control");
+    expect(await nextEvent()).toMatchObject({ type: "chat.unverified", candidateSender: "Alex", text: "old" });
     fakeBot.emit("entityMoved", fakeBot.entities["12"]);
     fakeBot.emit("message", { text: "§f§a§i§r§x§a§e§r§o" }, "system");
     fakeBot.emit("chat", "Alex", "ping", undefined, { text: "ping" });
-    const next = await reader.read();
-    expect(JSON.parse(Buffer.from(next.value!).toString("utf8").trim())).toMatchObject({ text: "ping" });
+    expect(await nextEvent()).toMatchObject({ text: "ping" });
     await reader.cancel();
     const rawReplay = await (await fetch(`http://127.0.0.1:${port}/events?profile=all`, {
       headers: { "X-MC-Agent-API": API_VERSION, Authorization: `Bearer ${TOKEN_B}` },
@@ -456,7 +478,7 @@ describe("daemon server", () => {
 
   it("starts now on the daemon, skipping history while retaining future events", async () => {
     process.env.MC_AGENT_STATE_DIR = await makeTempDir();
-    const fakeBot = new FakeBot(), port = 46180 + Math.floor(Math.random() * 1000);
+    const fakeBot = new FakeBot(), port = await unusedPort();
     await runDaemon({ session: "watch-now", controlPort: port, token: TOKEN_C, host: "localhost", port: 25565, username: "AgentBot", auth: "offline", createBotFn: () => fakeBot, exitOnStop: false });
     const headers = { "X-MC-Agent-API": API_VERSION, Authorization: `Bearer ${TOKEN_C}` };
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
@@ -468,10 +490,11 @@ describe("daemon server", () => {
       expect(page.nextCursor).toBe(page.latestCursor);
       const response = await fetch(`http://127.0.0.1:${port}/watch?since=now&profile=agent&type=chat.unverified`, { headers });
       reader = response.body!.getReader();
-      const metadata = JSON.parse(Buffer.from((await reader.read()).value!).toString("utf8").trim());
+      const nextEvent = ndjsonEvents(reader);
+      const metadata = await nextEvent();
       expect(metadata).toMatchObject({ type: "events.replay", gap: false, expiredTypes: [] });
       fakeBot.emit("chat", "Alex", "new", undefined, { text: "new" });
-      const event = JSON.parse(Buffer.from((await reader.read()).value!).toString("utf8").trim());
+      const event = await nextEvent();
       expect(event).toMatchObject({ type: "chat.unverified", candidateSender: "Alex", text: "new" });
       const next = await (await fetch(`http://127.0.0.1:${port}/events?since=${encodeURIComponent(page.nextCursor)}&profile=agent`, { headers })).json() as any;
       expect(next.events).toEqual([event]);
@@ -480,9 +503,10 @@ describe("daemon server", () => {
       fakeBot.emit("chat", "Alex", "while disconnected", undefined, { text: "while disconnected" });
       const reattached = await fetch(`http://127.0.0.1:${port}/watch?since=now&profile=agent&type=chat.unverified`, { headers });
       reader = reattached.body!.getReader();
-      expect(JSON.parse(Buffer.from((await reader.read()).value!).toString("utf8").trim())).toMatchObject({ type: "events.replay", gap: false });
+      const nextReattachedEvent = ndjsonEvents(reader);
+      expect(await nextReattachedEvent()).toMatchObject({ type: "events.replay", gap: false });
       fakeBot.emit("chat", "Alex", "after reconnect", undefined, { text: "after reconnect" });
-      expect(JSON.parse(Buffer.from((await reader.read()).value!).toString("utf8").trim())).toMatchObject({ type: "chat.unverified", text: "after reconnect" });
+      expect(await nextReattachedEvent()).toMatchObject({ type: "chat.unverified", text: "after reconnect" });
     } finally {
       await reader?.cancel();
       await fetch(`http://127.0.0.1:${port}/stop`, { method: "POST", headers });
@@ -491,7 +515,7 @@ describe("daemon server", () => {
 
   it("filters bot echoes from replay and live chat without dropping repeated player messages", async () => {
     process.env.MC_AGENT_STATE_DIR = await makeTempDir();
-    const fakeBot = new FakeBot(), port = 47180 + Math.floor(Math.random() * 1000);
+    const fakeBot = new FakeBot(), port = await unusedPort();
     await runDaemon({ session: "chat-self", controlPort: port, token: TOKEN_C, host: "localhost", port: 25565, username: "private-account@example.com", auth: "offline", createBotFn: () => fakeBot, exitOnStop: false });
     const headers = { "X-MC-Agent-API": API_VERSION, Authorization: `Bearer ${TOKEN_C}` };
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
@@ -500,17 +524,7 @@ describe("daemon server", () => {
       fakeBot.emit("chat", "Alex", "player replay", undefined, { text: "player replay" });
       const response = await fetch(`http://127.0.0.1:${port}/watch?since=0&profile=agent&type=chat.player&type=chat.whisper&type=chat.unverified&excludeSelf=true`, { headers });
       reader = response.body!.getReader();
-      let buffer = "";
-      const nextEvent = async () => {
-        while (!buffer.includes("\n")) {
-          const chunk = await reader!.read();
-          if (chunk.done) throw new Error("Unexpected stream end");
-          buffer += Buffer.from(chunk.value!).toString("utf8");
-        }
-        const end = buffer.indexOf("\n"), line = buffer.slice(0, end);
-        buffer = buffer.slice(end + 1);
-        return JSON.parse(line);
-      };
+      const nextEvent = ndjsonEvents(reader);
       expect(await nextEvent()).toMatchObject({ type: "events.replay", excludeSelf: true });
       expect(await nextEvent()).toMatchObject({ type: "chat.unverified", candidateSender: "Alex", text: "player replay" });
       fakeBot.emit("chat", "agentbot", "self live", undefined, { text: "self live" });
@@ -538,7 +552,7 @@ describe("daemon server", () => {
     process.env.MC_AGENT_STATE_DIR = dir;
     const fakeBot = new FakeBot();
     fakeBot.pathfinder.goto.mockRejectedValueOnce(new Error("Took to long to decide path to goal!"));
-    const port = 38180 + Math.floor(Math.random() * 1000);
+    const port = await unusedPort();
 
     await runDaemon({
       session: "navigation-failure",
@@ -572,7 +586,7 @@ describe("daemon server", () => {
     const dir = await makeTempDir();
     process.env.MC_AGENT_STATE_DIR = dir;
     const fakeBot = new FakeBot();
-    const port = 34180 + Math.floor(Math.random() * 1000);
+    const port = await unusedPort();
 
     await runDaemon({
       session: "actions",
@@ -613,8 +627,7 @@ describe("daemon server", () => {
       body: JSON.stringify({ context, state: "forward", durationMs: 1 }),
     });
     expect(fakeBot.setControlState).toHaveBeenCalledWith("forward", true);
-    await new Promise(resolve => setTimeout(resolve, 5));
-    expect(fakeBot.setControlState).toHaveBeenCalledWith("forward", false);
+    await vi.waitFor(() => expect(fakeBot.setControlState).toHaveBeenCalledWith("forward", false));
 
     await fetch(`http://127.0.0.1:${port}/look/at`, {
       method: "POST",
@@ -706,7 +719,7 @@ describe("daemon server", () => {
   });
   it("serves frames, typed stale-handle errors and explicit delta reset details", async () => {
     process.env.MC_AGENT_STATE_DIR = await makeTempDir();
-    const fakeBot = new FakeBot(), port = 40180 + Math.floor(Math.random()*1000);
+    const fakeBot = new FakeBot(), port = await unusedPort();
     await runDaemon({session:"runtime-api",controlPort:port,token:TOKEN_A,host:"localhost",port:25565,username:"AgentBot",auth:"offline",createBotFn:()=>fakeBot,exitOnStop:false});
     const headers = { "X-MC-Agent-API": API_VERSION, Authorization: `Bearer ${TOKEN_A}`, "Content-Type":"application/json" };
     const get = async (path: string) => (await fetch(`http://127.0.0.1:${port}${path}`, {headers})).json() as Promise<any>;
@@ -773,7 +786,7 @@ describe("daemon server", () => {
 
   it("samples a target outside semantic history and reports structured sampling failures", async () => {
     process.env.MC_AGENT_STATE_DIR = await makeTempDir();
-    const fakeBot = new FakeBot(), port = 41180 + Math.floor(Math.random()*1000);
+    const fakeBot = new FakeBot(), port = await unusedPort();
     await runDaemon({session:"samples",controlPort:port,token:TOKEN_B,host:"localhost",port:25565,username:"AgentBot",auth:"offline",createBotFn:()=>fakeBot,exitOnStop:false});
     const headers = { "X-MC-Agent-API": API_VERSION, Authorization:`Bearer ${TOKEN_B}`};
     try {
@@ -785,12 +798,14 @@ describe("daemon server", () => {
       const response = await fetch(`http://127.0.0.1:${port}/sample?track=${track}&fields=position,velocity,status&rate=10`,{headers});
       expect(response.headers.get("X-MC-Agent-API")).toBe(API_VERSION);
       const reader = response.body!.getReader();
-      const first = JSON.parse(Buffer.from((await reader.read()).value!).toString("utf8").trim());
+      const nextEvent = ndjsonEvents(reader);
+      const first = await nextEvent();
       expect(first).toMatchObject({type:"track.sample",trackId:track,values:{status:"loaded",position:{x:3,y:2,z:3}}});
       const replay = await (await fetch(`http://127.0.0.1:${port}/events?since=${frame.eventCursor}`,{headers})).json() as any;
       expect(replay.events).toEqual([]); expect(replay.latestCursor).toBe(frame.eventCursor);
       fakeBot.emit("entityGone",fakeBot.entities["12"]);
-      const lost = JSON.parse(Buffer.from((await reader.read()).value!).toString("utf8").trim());
+      let lost = await nextEvent();
+      while (lost.type === "track.sample") lost = await nextEvent();
       expect(lost).toMatchObject({type:"track.error",code:"TRACK_LOST",details:{trackId:track}});
       await reader.cancel();
     } finally { await fetch(`http://127.0.0.1:${port}/stop`,{method:"POST",headers}); }
@@ -798,7 +813,7 @@ describe("daemon server", () => {
 
   it("replays a retained chat backlog with gap metadata and backpressure before streaming live events", async () => {
     process.env.MC_AGENT_STATE_DIR = await makeTempDir();
-    const fakeBot = new FakeBot(), port = 42180 + Math.floor(Math.random()*1000);
+    const fakeBot = new FakeBot(), port = await unusedPort();
     await runDaemon({session:"watch-backlog",controlPort:port,token:TOKEN_C,host:"localhost",port:25565,username:"AgentBot",auth:"offline",createBotFn:()=>fakeBot,exitOnStop:false});
     const headers = { "X-MC-Agent-API": API_VERSION, Authorization:`Bearer ${TOKEN_C}`};
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
@@ -806,23 +821,18 @@ describe("daemon server", () => {
       for (let i=0;i<1100;i++) fakeBot.emit("chat","Alex",`message ${i}`,undefined,{text:`message ${i}`});
       const response = await fetch(`http://127.0.0.1:${port}/watch?since=0&profile=agent&type=chat.unverified`,{headers});
       reader = response.body!.getReader();
-      let buffer = "", count = 0, previous = 0, metadata: any;
-      while (count < 1024) {
-        const chunk = await reader.read(); expect(chunk.done).toBe(false);
-        buffer += Buffer.from(chunk.value!).toString("utf8");
-        const lines = buffer.split("\n"); buffer = lines.pop()!;
-        for (const line of lines) {
-          const event = JSON.parse(line);
-          if (event.type === "events.replay") metadata = event;
-          else {
-            expect(event.type).toBe("chat.unverified"); expect(event.id).toBeGreaterThan(previous); previous=event.id; count++;
-          }
-        }
+      const nextEvent = ndjsonEvents(reader);
+      const metadata = await nextEvent();
+      let previous = 0;
+      for (let index = 0; index < 1024; index++) {
+        const event = await nextEvent();
+        expect(event).toMatchObject({ type: "chat.unverified", text: `message ${index + 76}`, id: index + 77 });
+        previous = event.id;
       }
       expect(metadata).toMatchObject({profile:"agent",types:["chat.unverified"],unknownTypes:"excluded",gap:true,expiredTypes:["chat.unverified"]});
-      expect(count).toBe(1024); expect(previous).toBe(1100);
+      expect(previous).toBe(1100);
       fakeBot.emit("chat","Alex","live",undefined,{text:"live"});
-      const live = JSON.parse(Buffer.from((await reader.read()).value!).toString("utf8").trim());
+      const live = await nextEvent();
       expect(live).toMatchObject({type:"chat.unverified",text:"live",id:1101});
     } finally { await reader?.cancel(); await fetch(`http://127.0.0.1:${port}/stop`,{method:"POST",headers}); }
   });

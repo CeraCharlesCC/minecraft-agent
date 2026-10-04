@@ -52,6 +52,9 @@ describe("daemon lifecycle routes", () => {
       const initial = await request("/debug/session");
       expect(initial.body).toMatchObject({ daemonResponsive: true, ready: false, connection: { authentication: { state: "unknown" } } });
       const recovery = request("/ensure-ready", { timeout: 500, maxAttempts: 1, backoff: 0 });
+      await vi.waitFor(async () => {
+        expect((await request("/status")).body.connection.recovery?.state).toBe("recovering");
+      });
       bot.emit("login");
       expect((await request("/status")).body).toMatchObject({ ready: false, connection: { state: "waiting_for_spawn" } });
       bot.emit("spawn");
@@ -70,8 +73,7 @@ describe("daemon lifecycle routes", () => {
       const stop = await request("/stop", {});
       expect(stop.body).toMatchObject({ stopping: true, stopped: false, persistenceError: { code: "ENOSPC" } });
       expect(bot.quit).toHaveBeenCalledOnce();
-      for (let i = 0; i < 400 && await readSession("lifecycle", dir); i++) await new Promise((resolve) => setTimeout(resolve, 5));
-      expect(await readSession("lifecycle", dir)).toBeUndefined();
+      await vi.waitFor(async () => expect(await readSession("lifecycle", dir)).toBeUndefined(), { timeout: 2000 });
       await expect(request("/status")).rejects.toThrow();
     } finally { persist.mockRestore(); log.mockRestore(); await cleanup(); }
   });
@@ -80,13 +82,14 @@ describe("daemon lifecycle routes", () => {
     const { request, cleanup, dir } = await setup();
     try {
       const recovery = request("/ensure-ready", { timeout: 120_000, maxAttempts: 1 });
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      await vi.waitFor(async () => {
+        expect((await request("/status")).body.connection.recovery?.state).toBe("recovering");
+      });
       const stops = await Promise.all([request("/stop", {}), request("/stop", {})]);
       for (const stop of stops)
         expect(stop.body).toEqual({ stopping: true, stopped: false });
       expect((await recovery).body).toMatchObject({ ready: false, connection: { state: "stopping" } });
-      for (let i = 0; i < 400 && await readSession("lifecycle", dir); i++) await new Promise((resolve) => setTimeout(resolve, 5));
-      expect(await readSession("lifecycle", dir)).toBeUndefined();
+      await vi.waitFor(async () => expect(await readSession("lifecycle", dir)).toBeUndefined(), { timeout: 2000 });
       await expect(request("/status")).rejects.toThrow();
     } finally { await cleanup(); }
   });

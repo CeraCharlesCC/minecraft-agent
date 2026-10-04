@@ -54,11 +54,13 @@ describe("output responses", () => {
     expect(json.value).toBe('{"ok":true,"data":{"value":1}}\n');
     expect(text.value).toBe("hello\n");
     expect(formatDefaultText("plain")).toBe("plain");
-    expect(formatDefaultText({ nested: true })).toBe(JSON.stringify({ nested: true }, null, 2));
+    expect(formatDefaultText({ nested: true })).toBe('{\n  "nested": true\n}');
   });
   it("keeps actionable track facts while excluding internal runtime details", () => {
     const details = { trackId: "runtime:p1", worldEpoch: 3 };
-    expect(failure(new CliError("TRACK_LOST", "lost", "observe", 1, details))).toMatchObject({ ok:false, error: {code:"TRACK_LOST", details: { trackId: details.trackId }} });
+    const result = failure(new CliError("TRACK_LOST", "lost", "observe", 1, details));
+    expect(result).toMatchObject({ ok: false, error: { code: "TRACK_LOST" } });
+    expect(result.error.details).toEqual({ trackId: "runtime:p1" });
   });
 
   it("projects context guidance and meaningful navigation facts without private diagnostics", () => {

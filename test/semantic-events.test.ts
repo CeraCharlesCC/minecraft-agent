@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it } from "vitest";
 import { CanonicalChat } from "../src/core/chat.js";
-import { AGENT_EVENT_TYPES, EventStore, eventMatchesFilter, projectEvent, resolveEventFilter } from "../src/core/events.js";
+import { EventStore, eventMatchesFilter, projectEvent, resolveEventFilter } from "../src/core/events.js";
 import { decodeHandle, encodeHandle } from "../src/core/handles.js";
 
 const tick = async (): Promise<void> => { await Promise.resolve(); };
@@ -50,7 +50,7 @@ describe("semantic event replay", () => {
     events.add({ type: "future.notification" });
     const failed = events.add({ type: "action.failed" });
     const first = events.query(0, 1, [], "agent");
-    expect(first).toMatchObject({ profile: "agent", types: AGENT_EVENT_TYPES, unknownTypes: "excluded",
+    expect(first).toMatchObject({ profile: "agent", types: expect.arrayContaining(["chat.unverified", "action.failed"]), unknownTypes: "excluded",
       gap: false, expiredTypes: [], events: [unverified], nextCursor: unverified.cursor });
     expect(events.query(first.nextCursor, 1, [], "agent").events).toEqual([failed]);
     const exhausted = events.query(failed.cursor, 50, [], "agent");

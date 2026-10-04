@@ -179,11 +179,16 @@ describe("entity observation provenance and late identity", () => {
     // The real plugin loader is registered before installEntityObservation.
     bot.once("inject_allowed", () => require("mineflayer/lib/plugins/entities.js")(bot));
     installEntityObservation(bot);
-    bot.on("entityMoved", (entity: any) => expect(observedEntityPosition(entity)).toEqual(entity.id === 7 ? { x: 4, y: 64, z: 0 } : undefined));
+    const movements: Array<{ id: number; position: unknown }> = [];
+    bot.on("entityMoved", (entity: any) => movements.push({ id: entity.id, position: observedEntityPosition(entity) }));
     bot.emit("inject_allowed");
     bot._client.emit("entity_teleport", { entityId: 7, x: 4, y: 64, z: 0, yaw: 0, pitch: 0 });
     metadata(bot, 8);
     bot._client.emit("rel_entity_move", { entityId: 8, dX: 4096, dY: 0, dZ: 0 });
+    expect(movements).toEqual([
+      { id: 7, position: { x: 4, y: 64, z: 0 } },
+      { id: 8, position: undefined },
+    ]);
     expect(observedEntityPosition(bot.entities[8])).toBeUndefined();
   });
 });

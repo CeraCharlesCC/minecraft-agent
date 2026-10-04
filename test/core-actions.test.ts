@@ -62,6 +62,9 @@ describe("runtime action ownership", () => {
       { action: old.action, kind: "old", state: "completed" },
     ];
     expect(actions.observation()).toEqual(expected);
+    const detached = actions.observation();
+    detached[0]!.state = "failed";
+    detached.pop();
     expect(actions.observation()).toEqual(expected);
     expect(actions.get(newer.action).state).toBe("completed");
     actions.fail(running.action, new CliError("TRACK_LOST", "Lost", "Observe."));

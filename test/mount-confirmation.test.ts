@@ -22,11 +22,11 @@ function runtime() {
   subjects.push(controller);
   controller.start(); bot.emit("spawn");
   const track = controller.world.trackFor(bot.target)!;
-  const start = () => controller.runAction("entity.mount", ["movement", "look", "item"], () => controller.mountEntity(track), track);
+  let mounting!: ReturnType<BotController["mountEntity"]>;
+  const start = () => controller.runAction("entity.mount", ["movement", "look", "item"], () => mounting = controller.mountEntity(track), track);
   const confirm = () => { bot.vehicle = bot.target; bot.emit("mount"); };
-  return { bot, controller, start, confirm, track };
+  return { bot, controller, start, confirm, track, pendingMount: () => mounting };
 }
-async function flush() { for (let i = 0; i < 8; i++) await Promise.resolve(); }
 afterEach(() => { for (const controller of subjects.splice(0)) controller.stop(); vi.useRealTimers(); });
 
 describe("confirmed entity mounting", () => {
@@ -41,7 +41,7 @@ describe("confirmed entity mounting", () => {
 
   it("holds ownership until the server confirms the vehicle", async () => {
     const { controller, start, confirm } = runtime();
-    const action = start(); await flush();
+    const action = start();
     expect(controller.actions.get(action.action).state).toBe("running");
     for (const resource of ["movement", "look", "item"] as const) expect(controller.actions.owner(resource)).toBe(action.action);
     confirm();
@@ -65,7 +65,7 @@ describe("confirmed entity mounting", () => {
 
   it.each(["cancel", "replace", "reset", "target lost"])("cleans listeners and timers on %s", async mode => {
     vi.useFakeTimers();
-    const { bot, controller, start, confirm } = runtime();
+    const { bot, controller, start, confirm, pendingMount } = runtime();
     const action = start();
     if (mode === "cancel") controller.actions.cancel(action.action);
     if (mode === "replace") controller.runAction("inventory.test", ["item"], () => new Promise(() => {}));
@@ -73,7 +73,8 @@ describe("confirmed entity mounting", () => {
     if (mode === "target lost") { delete bot.entities[7]; bot.emit("entityGone", bot.target); }
     expect(bot.listenerCount("mount")).toBe(0);
     expect(vi.getTimerCount()).toBe(0);
-    confirm(); await flush();
+    confirm();
+    await expect(pendingMount()).rejects.toMatchObject({ code: "COMMAND_BLOCKED" });
     expect(controller.actions.get(action.action).state).toBe(["reset", "target lost"].includes(mode) ? "failed" : "cancelled");
     expect(controller.actions.get(action.action)).not.toHaveProperty("result");
   });
@@ -93,9 +94,10 @@ describe("confirmed entity mounting", () => {
 
   it("releases listeners if mount dispatch throws", async () => {
     vi.useFakeTimers();
-    const { bot, controller, start } = runtime();
+    const { bot, controller, start, pendingMount } = runtime();
     bot.mount.mockImplementation(() => { throw new Error("dispatch failed"); });
-    const action = start(); await flush();
+    const action = start();
+    await expect(pendingMount()).rejects.toThrow("dispatch failed");
     expect(controller.actions.get(action.action).state).toBe("failed");
     expect(bot.listenerCount("mount")).toBe(0);
     expect(vi.getTimerCount()).toBe(0);

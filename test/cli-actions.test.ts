@@ -17,7 +17,7 @@ async function loadActionsWithMocks() {
   const store = await vi.importActual<typeof import("../src/session/store.js")>("../src/session/store.js");
   const record = { ...startInput(), pid: process.pid, controlPort: 3000, token: "private-token", startedAt: "2026-10-04T00:00:00Z" };
   const mocks = {
-    isProcessAlive: vi.fn().mockReturnValue(false),
+    isSessionProcessAlive: vi.fn().mockReturnValue(false),
     samePidNamespace: vi.fn(store.samePidNamespace),
     daemonRequest: vi.fn(),
     loadSessionForClient: vi.fn().mockResolvedValue(record),
@@ -37,10 +37,9 @@ async function loadActionsWithMocks() {
   vi.doMock("../src/daemon/server.js", () => ({ runDaemon: mocks.runDaemon }));
   vi.doMock("../src/daemon/spawn.js", () => ({ spawnSessionDaemon: mocks.spawnSessionDaemon }));
   vi.doMock("../src/session/store.js", () => ({
-    isProcessAlive: mocks.isProcessAlive,
+    ...store,
     samePidNamespace: mocks.samePidNamespace,
-    isSessionProcessAlive: (record: import("../src/session/store.js").SessionRecord) =>
-      !mocks.samePidNamespace(record) || mocks.isProcessAlive(record.pid),
+    isSessionProcessAlive: mocks.isSessionProcessAlive,
     listSessions: mocks.listSessions,
     readSession: mocks.readSession,
     removeSession: mocks.removeSession,
@@ -91,13 +90,13 @@ describe("CLI actions", () => {
     mocks.loadSessionForClient.mockResolvedValue(original);
     mocks.daemonRequest.mockResolvedValue({ stopping: true, runtimeId: "r7", pid: 123 });
     mocks.readSession.mockResolvedValue(undefined);
-    mocks.isProcessAlive.mockReturnValue(true);
+    mocks.isSessionProcessAlive.mockReturnValue(true);
     const pending = handlers.stopSession({ session: "default" });
     await vi.advanceTimersByTimeAsync(5100);
     await expect(pending).resolves.toMatchObject({ session: "default", stopping: true, stopped: false, timedOut: true });
-    expect(mocks.isProcessAlive).toHaveBeenCalledWith(123);
+    expect(mocks.isSessionProcessAlive).toHaveBeenCalledWith(expect.objectContaining({ pid: 123 }));
     expect(mocks.removeSession).not.toHaveBeenCalled();
-    mocks.isProcessAlive.mockReturnValueOnce(true).mockReturnValue(false);
+    mocks.isSessionProcessAlive.mockReturnValueOnce(true).mockReturnValue(false);
     const completed = handlers.stopSession({ session: "default" });
     await vi.advanceTimersByTimeAsync(100);
     await expect(completed).resolves.toMatchObject({ session: "default", stopped: true, timedOut: false });
@@ -114,7 +113,7 @@ describe("CLI actions", () => {
     const pending = handlers.stopSession({ session: "default" });
     await vi.advanceTimersByTimeAsync(200);
     await expect(pending).resolves.toMatchObject({ stopped: true, timedOut: false });
-    expect(mocks.isProcessAlive).not.toHaveBeenCalled();
+    expect(mocks.isSessionProcessAlive).not.toHaveBeenCalled();
   });
 
   it("forwards recovery, compact frame, canonical species, profile, and action wait requests", async () => {
@@ -178,7 +177,7 @@ describe("CLI actions", () => {
   it("preserves the original stopping session until its daemon exits", async () => {
     const { handlers, mocks } = await loadActionsWithMocks();
     mocks.readSession.mockResolvedValue({ session: "default", pid: 123, stopping: true });
-    mocks.isProcessAlive.mockReturnValue(true);
+    mocks.isSessionProcessAlive.mockReturnValue(true);
     await expect(handlers.startSession(startInput())).rejects.toMatchObject({ code: "SESSION_ALREADY_RUNNING", message: expect.stringContaining("still stopping") });
     expect(mocks.removeSession).not.toHaveBeenCalled();
     expect(mocks.spawnSessionDaemon).not.toHaveBeenCalled();
@@ -232,7 +231,7 @@ describe("CLI actions", () => {
     mocks.spawnSessionDaemon.mockResolvedValueOnce({ controlPort: 11111 });
 
     await handlers.startSession(startInput());
-    expect(mocks.isProcessAlive).toHaveBeenCalledWith(123);
+    expect(mocks.isSessionProcessAlive).toHaveBeenCalledWith(expect.objectContaining({ pid: 123 }));
     expect(mocks.removeSession).toHaveBeenCalledWith("default");
     expect(mocks.spawnSessionDaemon).toHaveBeenCalled();
   });
@@ -245,9 +244,9 @@ describe("CLI actions", () => {
     const original = { session: "default", pid: 123, token: "original", controlPort: 3000 };
     mocks.readSession.mockResolvedValue(original);
     mocks.daemonRequest.mockRejectedValue(error);
-    mocks.isProcessAlive.mockReturnValue(true);
+    mocks.isSessionProcessAlive.mockReturnValue(true);
     await expect(handlers.startSession(startInput())).rejects.toMatchObject({ code: "DAEMON_ERROR", details: { session: "default", pid: 123 } });
-    expect(mocks.isProcessAlive).toHaveBeenCalledWith(123);
+    expect(mocks.isSessionProcessAlive).toHaveBeenCalledWith(expect.objectContaining({ pid: 123 }));
     expect(mocks.removeSession).not.toHaveBeenCalled();
     expect(mocks.spawnSessionDaemon).not.toHaveBeenCalled();
   });

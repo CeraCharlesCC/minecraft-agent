@@ -74,22 +74,26 @@ describe("daemon client", () => {
   });
 
   it("sends authorized local daemon requests and parses JSON responses", async () => {
-    const saved = record({ controlPort: 39234, token: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
-    const fetchMock = vi.fn().mockResolvedValue(apiResponse(JSON.stringify({ connected: true }), { status: 200 }));
-    vi.stubGlobal("fetch", fetchMock);
+    const received: { path?: string; method?: string; headers?: Record<string, unknown> } = {};
+    const controlPort = await listen(createServer((request, response) => {
+      Object.assign(received, { path: request.url, method: request.method, headers: request.headers });
+      response.writeHead(200, { "Content-Type": "application/json", [API_VERSION_HEADER]: API_VERSION });
+      response.end(JSON.stringify({ connected: true }));
+    }));
+    const saved = record({ controlPort, token: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
 
     await expect(daemonRequest(saved, "/status", { method: "GET", headers: { "X-Test": "1" } })).resolves.toEqual({
       connected: true,
     });
 
-    expect(fetchMock).toHaveBeenCalledWith("http://127.0.0.1:39234/status", {
+    expect(received).toMatchObject({
+      path: "/status",
       method: "GET",
-      signal: expect.any(AbortSignal),
       headers: {
-        Authorization: "Bearer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "Content-Type": "application/json",
-        [API_VERSION_HEADER]: API_VERSION,
-        "X-Test": "1",
+        authorization: "Bearer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "content-type": "application/json",
+        [API_VERSION_HEADER.toLowerCase()]: API_VERSION,
+        "x-test": "1",
       },
     });
   });

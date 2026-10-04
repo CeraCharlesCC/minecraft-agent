@@ -223,7 +223,7 @@ describe("BotController", () => {
     subject.stop();
   });
 
-  it("waits for Mineflayer plugin injection before installing method guards", () => {
+  it("waits for Mineflayer plugin injection and then blocks stale look continuations", async () => {
     const bot = new FakeBot();
     const lookAt = bot.lookAt;
     const pathfinder = bot.pathfinder;
@@ -239,10 +239,19 @@ describe("BotController", () => {
     bot.lookAt = lookAt;
     bot.pathfinder = pathfinder;
     bot.emit("inject_allowed");
-    expect(bot.lookAt).not.toBe(lookAt);
     expect(pathfinder.setMovements).toHaveBeenCalledOnce();
     bot.emit("spawn");
     expect(subject.frame().connection.ready).toBe(true);
+    let finishTurn!: () => void;
+    lookAt.mockReturnValue(new Promise<void>(resolve => { finishTurn = resolve; }));
+    let turning!: Promise<void>;
+    const action = subject.runAction("look.at", ["look"], () => turning = subject.lookAt(4, 2, 3));
+    expect(lookAt).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ x: 4, y: 2, z: 3 }));
+    subject.actions.cancel(action.action);
+    const rejected = expect(turning).rejects.toMatchObject({ code: "COMMAND_BLOCKED" });
+    finishTurn();
+    await rejected;
+    expect(subject.actions.get(action.action).state).toBe("cancelled");
     subject.stop();
   });
 

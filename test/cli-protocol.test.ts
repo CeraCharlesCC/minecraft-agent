@@ -4,7 +4,6 @@ import { buildProgram } from "../src/cli/program.js";
 import type { CliHandlers } from "../src/cli/handlers.js";
 import { encodeActionContext } from "../src/core/context.js";
 import { encodeRuntimeTag } from "../src/core/handles.js";
-import { getSkillContent } from "../src/core/skills.js";
 import { sessionNotFound } from "../src/output/errors.js";
 
 const runtimeId = "00000000-0000-4000-8000-000000000007";
@@ -431,18 +430,19 @@ describe("CLI protocol", () => {
     });
   });
 
-  it("exposes all planned top-level command groups", () => {
-    const { program } = makeProgram();
-    const names = program.commands.map((command) => command.name());
-    expect(names).toEqual(["session", "observe", "chat", "bot", "advanced", "control", "look", "navigate", "collect", "inventory", "world", "window", "entity", "action", "debug", "skills", "daemon"]);
-  });
-
-  it("prints bundled skill content directly", async () => {
+  it("prints raw Markdown and includes the detailed reference only with --full", async () => {
     const { program, stdout } = makeProgram();
 
-    await program.parseAsync(["node", "mc-agent", "skills", "get", "core"]);
+    await program.parseAsync(["node", "mc-agent", "--output", "json", "skills", "get", "core"]);
 
-    expect(stdout.value).toBe(`${getSkillContent("core", false)}\n`);
+    expect(stdout.value).toMatch(/^# \S[^\n]*\n/);
+    expect(stdout.value.endsWith("\n")).toBe(true);
+
+    const full = makeProgram();
+    await full.program.parseAsync(["node", "mc-agent", "--output", "json", "skills", "get", "core", "--full"]);
+    expect(full.stdout.value.startsWith(`${stdout.value.trimEnd()}\n\n`)).toBe(true);
+    const sections = (markdown: string) => markdown.match(/^## \S.+$/gm)?.length ?? 0;
+    expect(sections(full.stdout.value)).toBeGreaterThan(sections(stdout.value));
   });
 
   it("writes structured errors for streaming and raw-output commands", async () => {

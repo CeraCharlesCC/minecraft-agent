@@ -3,6 +3,7 @@ import { EventStore } from "../src/core/events.js";
 import { encodeActionContext, decodeActionContext } from "../src/core/context.js";
 import { encodeHandle } from "../src/core/handles.js";
 import { WorldModel } from "../src/core/world.js";
+import { ActionManager } from "../src/core/actions.js";
 import { goals } from "mineflayer-pathfinder";
 
 const ready = { connected: true, spawned: true };
@@ -272,12 +273,16 @@ describe("observed world model", () => {
   });
 
   it("captures authoritative action failures at the same observation boundary", () => {
-    const events = new EventStore(); const world = new WorldModel(events); const live = bot();
-    world.frame(live, ready); let state = "running";
-    world.onTrackLost = () => { state = "failed"; };
+    const events = new EventStore(); const world = new WorldModel(events); const actions = new ActionManager(events); const live = bot();
+    const track = world.frame(live, ready).entities[0].trackId;
+    world.onTrackLost = target => actions.failTarget(target);
+    const action = actions.start("navigate.follow", 1, ["movement"], { target: track, continuous: true });
+    const staleActions = actions.observation();
     live.entities = {};
-    const frame = world.frame(live, { ...ready, actions: [{ state: "running" }], getActions: () => [{ state }] });
-    expect(frame.actions).toEqual([{ state: "failed" }]);
+    const frame = world.frame(live, { ...ready, actions: staleActions, getActions: () => actions.observation() });
+    expect(frame.actions).toEqual([{ action: action.action, kind: "navigate.follow", target: track,
+      state: "failed", reason: "TRACK_LOST", error: { code: "TRACK_LOST" } }]);
+    expect(actions.owner("movement")).toBeUndefined();
   });
 
   it("refreshes readiness after synchronous dimension reset callbacks", () => {
@@ -376,22 +381,34 @@ describe("observed world model", () => {
     expect(events.list(0, 20)).toEqual(expect.arrayContaining([expect.objectContaining({ type: "self.damaged", health: 5, amount: 15 })]));
   });
 
-  it("bounds dictionary bindings across eventless key changes and incremental replacement churn", () => {
+  it("bounds dictionary bindings and preserves live tracks across key changes and replacement churn", () => {
     const world = new WorldModel(new EventStore()), original = entity(1, 5), live = bot(original);
     world.syncBindings(live, ready);
+    const originalTrack = world.trackFor(original)!;
     for (let n = 2; n <= 20; n++) {
       live.entities = { [n]: original };
       world.syncBindings(live, ready);
+      expect(world.resolveTrack(originalTrack)).toBe(original);
     }
+    // This resource bound needs internal inspection: correct public results
+    // alone cannot reveal leaked dictionary entries retaining entity objects.
     expect((world as any).dictionaryTracks.size).toBe(1);
+    let latestTrack = originalTrack;
     for (let n = 21; n <= 560; n++) {
       const replacement = entity(n, 5);
       live.entities = { "20": replacement };
       world.updateEntity(live, ready, replacement);
+      expect(() => world.resolveTrack(latestTrack)).toThrow(expect.objectContaining({ code: "TRACK_LOST" }));
+      latestTrack = world.trackFor(replacement)!;
+      expect(world.resolveTrack(latestTrack)).toBe(replacement);
     }
     expect((world as any).dictionaryTracks.size).toBe(1);
     expect((world as any).tracks.size).toBeLessThanOrEqual(513);
+    expect(() => world.resolveTrack(originalTrack)).toThrow(expect.objectContaining({ code: "TRACK_UNKNOWN" }));
+    expect(world.frame(live, ready).entities.map((entry: any) => entry.trackId)).toEqual([latestTrack]);
     world.reset("respawn");
+    expect(() => world.resolveTrack(latestTrack)).toThrow(expect.objectContaining({ code: "WORLD_CHANGED" }));
+    expect(world.frame(live, ready).entities).toEqual([]);
     expect((world as any).dictionaryTracks.size).toBe(0);
   });
 

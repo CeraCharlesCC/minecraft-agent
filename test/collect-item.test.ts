@@ -211,14 +211,17 @@ describe("confirmed dropped item collection", () => {
     let turn!: () => void;
     let release!: () => void;
     bot.lookCalls.mockImplementation(() => new Promise<void>(resolve => { turn = resolve; }));
-    bot.pathfinder.goto.mockImplementation(async () => {
+    let approaching!: Promise<void>;
+    bot.pathfinder.goto.mockImplementation(() => approaching = (async () => {
       const looking = bot.lookAt({ x: 6, y: 64, z: 0 });
       await new Promise<void>(resolve => { release = resolve; });
       bot._client.write("arm_animation", {});
       await looking;
       bot._client.write("use_entity", {});
-    });
-    const action = start(); gone(); release(); turn(); await flush();
+    })());
+    const action = start(); gone();
+    const rejected = expect(approaching).rejects.toMatchObject({ code: "TRACK_LOST" });
+    release(); turn(); await rejected;
     expect(bot.packetWrites).not.toHaveBeenCalled();
     expect(controller.actions.get(action.action).state).toBe("running");
     bot.emit("playerCollect", bot.entity, bot.item);

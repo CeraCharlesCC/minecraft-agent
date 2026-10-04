@@ -1,8 +1,24 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { main } from "../src/cli/main.js";
 
-afterEach(() => {
+let stateDir: string;
+beforeEach(async () => {
+  stateDir = await mkdtemp(join(tmpdir(), "mc-main-"));
+  vi.stubEnv("MC_AGENT_STATE_DIR", stateDir);
+  vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+  vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+});
+
+afterEach(async () => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+  vi.doUnmock("../src/cli/program.js");
+  vi.doUnmock("../src/cli/actions.js");
+  vi.resetModules();
+  await rm(stateDir, { recursive: true, force: true });
 });
 
 describe("main", () => {

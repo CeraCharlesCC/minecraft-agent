@@ -10,17 +10,18 @@ const UUID = "12345678-1234-1234-1234-123456789abc";
 /** Actual entity/health plugins, without a network connection or physics timer. */
 function runtime() {
   const registry = require("prismarine-registry")("1.20.4");
-  const physicalLook = vi.fn(), physicalAttack = vi.fn(), packetWrites = vi.fn();
+  const physicalLook = vi.fn(), packetWrites = vi.fn();
   const bot: any = Object.assign(new EventEmitter(), {
     registry, version: "1.20.4", supportFeature: registry.supportFeature, username: "Agent",
     game: { dimension: "overworld" }, inventory: { slots: [], items: () => [] },
-    chat: vi.fn(), quit: vi.fn(), setControlState: vi.fn(), clearControlStates: vi.fn(),
-    lookAt: physicalLook, attack: physicalAttack,
+    chat: vi.fn(), quit: vi.fn(), setControlState: vi.fn(), clearControlStates: vi.fn(), getControlState: () => false,
+    lookAt: physicalLook,
     pathfinder: { movements: {}, setMovements: vi.fn(), setGoal: vi.fn(), stop: vi.fn(), goto: vi.fn(),
       isMoving: () => false, isMining: () => false, isBuilding: () => false },
     _client: Object.assign(new EventEmitter(), { username: "Agent", write: packetWrites }),
   });
   require("mineflayer/lib/plugins/entities.js")(bot);
+  const physicalAttack = vi.spyOn(bot, "attack");
   require("mineflayer/lib/plugins/health.js")(bot, { respawn: false });
   // Apply position packets as physics does, without its asynchronous timer.
   bot._client.on("position", (packet: any) => {
@@ -42,7 +43,7 @@ function runtime() {
 
 describe("observation provenance at the controller boundary", () => {
   it("keeps health-before-position ready state unknown and blocks physical operations", async () => {
-    const { controller, bot, position, spawnCow, physicalLook, physicalAttack } = runtime();
+    const { controller, bot, position, spawnCow, physicalLook, physicalAttack, packetWrites } = runtime();
     try {
       expect(controller.connectionStatus().ready).toBe(true);
       const frame = controller.frame({ detail: "full" });
@@ -59,6 +60,9 @@ describe("observation provenance at the controller boundary", () => {
       position();
       expect(controller.frame().self).toMatchObject({ position: { x: 0, y: 64, z: 0 } });
       expect(controller.actions.get(controller.followTrack(track, 1).action).state).toBe("running");
+      expect(controller.attackEntity(track, { allowPassive: true })).toMatchObject({ attacked: true });
+      expect(physicalAttack).toHaveBeenCalledExactlyOnceWith(bot.entities[7]);
+      expect(packetWrites).toHaveBeenCalledWith("use_entity", expect.objectContaining({ target: 7, mouse: 1 }));
     } finally { controller.stop(); }
   });
 

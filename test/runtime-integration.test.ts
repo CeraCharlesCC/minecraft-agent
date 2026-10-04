@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { BotController } from "../src/daemon/bot.js";
 import { EventStore } from "../src/core/events.js";
 
@@ -30,11 +30,14 @@ class LiveBot extends EventEmitter {
   pathfinder = { movements: {} as never, setMovements: vi.fn(), setGoal: vi.fn(), stop: vi.fn(),
     goto: vi.fn(), isMoving: () => false, isMining: () => false, isBuilding: () => false };
 }
+const subjects: BotController[] = [];
+afterEach(() => { for (const subject of subjects.splice(0)) subject.stop(); vi.useRealTimers(); });
+
 function runtime() {
   const events = new EventStore();
   const bot = new LiveBot();
   const controller = new BotController({ host: "localhost", port: 25565, username: "AgentBot", auth: "offline" }, events, () => bot);
-  controller.start(); bot.emit("spawn");
+  subjects.push(controller); controller.start(); bot.emit("spawn");
   return { controller, bot, events, track: controller.world.trackFor(bot.entities["7"])! };
 }
 function deferred() { let resolve!: () => void; const promise = new Promise<void>(r => { resolve = r; }); return { promise, resolve }; }
@@ -81,10 +84,12 @@ describe("runtime integration", () => {
   it("replacement cancels a pending navigation and late completion cannot resurrect it", async () => {
     const { controller, bot, track } = runtime();
     const pending = deferred(); bot.pathfinder.goto.mockReturnValue(pending.promise);
-    const first = controller.runAction("navigate.goto", ["movement", "look"], () => controller.goto(10,64,0,1));
+    let navigating!: ReturnType<BotController["goto"]>;
+    const first = controller.runAction("navigate.goto", ["movement", "look"], () => navigating = controller.goto(10,64,0,1));
     const second = controller.followTrack(track, 2);
     expect(controller.actions.get(first.action)).toMatchObject({ state: "cancelled", reason: "REPLACED" });
-    pending.resolve(); await Promise.resolve(); await Promise.resolve();
+    const rejected = expect(navigating).rejects.toMatchObject({ code: "COMMAND_BLOCKED" });
+    pending.resolve(); await rejected;
     expect(controller.actions.get(first.action).state).toBe("cancelled");
     expect(controller.actions.get(second.action).state).toBe("running");
   });
@@ -136,8 +141,12 @@ describe("runtime integration", () => {
 
   it("cancelled placement cannot perform its next physical step after equip resolves", async () => {
     const { controller, bot } = runtime(); const pending = deferred(); bot.equipCalls.mockReturnValue(pending.promise);
-    const action = controller.runAction("world.place", ["item", "look"], () => controller.place(1,64,0,"up","dirt"));
-    controller.actions.cancel(action.action); pending.resolve(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    let placing!: ReturnType<BotController["place"]>;
+    const action = controller.runAction("world.place", ["item", "look"], () => placing = controller.place(1,64,0,"up","dirt"));
+    expect(bot.equipCalls).toHaveBeenCalledOnce();
+    controller.actions.cancel(action.action);
+    const rejected = expect(placing).rejects.toMatchObject({ code: "COMMAND_BLOCKED" });
+    pending.resolve(); await rejected;
     expect(bot.placeBlockCalls).not.toHaveBeenCalled(); expect(controller.actions.get(action.action).state).toBe("cancelled");
   });
 
@@ -158,10 +167,13 @@ describe("runtime integration", () => {
       bot._client.write("use_entity", { target: entity.id });
     });
     const controller = new BotController({host:"localhost",port:25565,username:"AgentBot",auth:"offline"},events,()=>bot);
-    controller.start(); bot.emit("spawn"); const track = controller.world.trackFor(bot.entities["7"])!;
-    const action = controller.runAction("entity.interact", ["item", "look"], () => controller.interactEntity(track), track);
-    bot.emit("entityGone", bot.entities["7"]); pending.resolve();
-    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    subjects.push(controller); controller.start(); bot.emit("spawn"); const track = controller.world.trackFor(bot.entities["7"])!;
+    let interacting!: ReturnType<BotController["interactEntity"]>;
+    const action = controller.runAction("entity.interact", ["item", "look"], () => interacting = controller.interactEntity(track), track);
+    expect(bot.lookAtCalls).toHaveBeenCalledOnce();
+    bot.emit("entityGone", bot.entities["7"]);
+    const rejected = expect(interacting).rejects.toMatchObject({ code: "COMMAND_BLOCKED" });
+    pending.resolve(); await rejected;
     expect(controller.actions.get(action.action)).toMatchObject({ state: "failed", reason: "TRACK_LOST" });
     expect(bot.packetWrites).not.toHaveBeenCalled();
   });
@@ -170,9 +182,10 @@ describe("runtime integration", () => {
     const { controller, bot } = runtime(), pending = deferred();
     bot.currentWindow.deposit = async () => { await pending.promise; bot._client.write("window_click", {slot:1}); };
     (bot as any).registry = {itemsByName: {dirt: {id:3}}};
-    const action = controller.runAction("window.deposit", ["window", "item"], () => controller.windowDeposit("dirt",1));
-    controller.actions.cancel(action.action); pending.resolve();
-    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    let depositing!: ReturnType<BotController["windowDeposit"]>;
+    const action = controller.runAction("window.deposit", ["window", "item"], () => depositing = controller.windowDeposit("dirt",1));
+    controller.actions.cancel(action.action);
+    pending.resolve(); await depositing;
     expect(controller.actions.get(action.action).state).toBe("cancelled");
     expect(bot.packetWrites).not.toHaveBeenCalled();
   });
@@ -191,7 +204,7 @@ describe("runtime integration", () => {
     const events = new EventStore(), bot = new LiveBot(), pending = deferred();
     bot.lookAtCalls.mockReturnValue(pending.promise);
     const controller = new BotController({host:"localhost",port:25565,username:"AgentBot",auth:"offline"},events,()=>bot);
-    controller.start(); bot.emit("spawn");
+    subjects.push(controller); controller.start(); bot.emit("spawn");
     const track = controller.world.trackFor(bot.entities["7"])!;
     const action = controller.runAction("navigate.goto", ["movement", "look"], () => new Promise(() => {}), track);
     // Match pathfinder's unawaited call outside the action's async context.
@@ -219,7 +232,7 @@ describe("runtime integration", () => {
     self.position.y = 64;
     bot.entities[7] = { id: 7, type: "player", position: { x: 4, y: 64, z: 0 } };
     const controller = new BotController({host:"localhost",port:25565,username:"AgentBot",auth:"offline"},events,()=>bot);
-    controller.start(); bot.emit("spawn");
+    subjects.push(controller); controller.start(); bot.emit("spawn");
     expect(controller.frame().entities).toHaveLength(1);
     for (const lifecycle of ["death", "respawn"]) {
       bot.emit(lifecycle);
@@ -243,7 +256,7 @@ describe("runtime integration", () => {
     for (let n = 0; n < 256; n++) {
       const action = controller.runAction("inventory.quickbar", ["item"], () => controller.setQuickBarSlot(n % 9));
       oldest ||= action.action;
-      await Promise.resolve(); await Promise.resolve();
+      expect(await controller.actions.wait(action.action, 1000)).toMatchObject({ state: "completed", result: { quickBarSlot: n % 9 } });
     }
     const frame = controller.frame({ maxEntities: 0, radius: 0 });
     expect(frame.actions).toHaveLength(2);
@@ -254,7 +267,7 @@ describe("runtime integration", () => {
     expect(controller.actions.get(oldest).result).toEqual({ quickBarSlot: 0 });
     expect(JSON.stringify(frame).length).toBeLessThan(6000);
     const next = controller.runAction("inventory.quickbar", ["item"], () => ({ pages: "y".repeat(10000) }));
-    await Promise.resolve(); await Promise.resolve();
+    expect(await controller.actions.wait(next.action, 1000)).toMatchObject({ state: "completed" });
     const delta = controller.frame({ maxEntities: 0, radius: 0, since: frame.frame });
     expect(delta.delta.changed.actions).toHaveLength(2);
     expect(delta.delta.changed.actions.at(-1).action).toBe(next.action);
@@ -382,12 +395,12 @@ describe("runtime integration", () => {
       bot.entities[7].position.x = 30; bot.emit("entityMoved", bot.entities[7]);
       bot.emit("physicsTick");
       expect(events.list(cursor, 20)).toEqual([]);
-      expect((controller.world as any).pendingProximity.size).toBe(1);
       vi.advanceTimersByTime(1100); bot.emit("physicsTick"); bot.emit("physicsTick");
       expect(events.list(cursor, 20)).toEqual([expect.objectContaining({ type: "entity.left_nearby", trackId: track, distance: 30 })]);
-      expect((controller.world as any).pendingProximity.size).toBe(0);
       expect(otherPosition).not.toHaveBeenCalled();
       expect(reconcile).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(2000); bot.emit("physicsTick");
+      expect(events.list(cursor, 20)).toEqual([expect.objectContaining({ type: "entity.left_nearby", trackId: track, distance: 30 })]);
     } finally { vi.useRealTimers(); }
   });
 
@@ -398,12 +411,10 @@ describe("runtime integration", () => {
       const cursor = events.getLastEventId();
       vi.advanceTimersByTime(500);
       bot.entities[7].position.x = 30; bot.emit("entityMoved", bot.entities[7]);
-      expect((controller.world as any).pendingProximity.size).toBe(1);
       bot.entities[7].position.x = 5;
       if (change === "move") bot.emit("entityMoved", bot.entities[7]);
       vi.advanceTimersByTime(1100); bot.emit("physicsTick");
       expect(events.list(cursor, 20)).toEqual([]);
-      expect((controller.world as any).pendingProximity.size).toBe(0);
     } finally { vi.useRealTimers(); }
   });
 
@@ -413,13 +424,11 @@ describe("runtime integration", () => {
       const { controller, bot, events } = runtime();
       vi.advanceTimersByTime(500);
       bot.entities[7].position.x = 30; bot.emit("entityMoved", bot.entities[7]);
-      expect((controller.world as any).pendingProximity.size).toBe(1);
       const cursor = events.getLastEventId();
       if (change === "gone") bot.emit("entityGone", bot.entities[7]);
       if (change === "eventless-removal") delete bot.entities[7];
       if (change === "reset") bot.emit("death");
       vi.advanceTimersByTime(1100); bot.emit("physicsTick");
-      expect((controller.world as any).pendingProximity.size).toBe(0);
       expect(events.list(cursor, 20).map(event => event.type)).toContain("entity.lost");
       expect(events.list(cursor, 20).map(event => event.type)).not.toContain("entity.left_nearby");
     } finally { vi.useRealTimers(); }

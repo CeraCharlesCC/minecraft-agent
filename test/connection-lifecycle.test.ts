@@ -50,11 +50,12 @@ describe("connection lifecycle", () => {
   });
 
   it("shares simultaneous recovery and waits for spawn after login", async () => {
+    vi.useFakeTimers();
     const { subject, bots, create } = setup();
     bots[0].emit("end", "socketClosed");
     const first = subject.ensureReady({ timeout: 500, backoff: 0 });
     const second = subject.ensureReady({ timeout: 500, backoff: 0 });
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    await vi.advanceTimersByTimeAsync(0);
     expect(create).toHaveBeenCalledTimes(2);
     bots[1].emit("login");
     expect(subject.diagnose().ready).toBe(false);
@@ -66,6 +67,7 @@ describe("connection lifecycle", () => {
   });
 
   it("fences late retired callbacks and preserves runtime while advancing epoch", async () => {
+    vi.useFakeTimers();
     const { subject, bots } = setup();
     bots[0].emit("spawn");
     const before = { runtimeId: subject.world.runtimeId, worldEpoch: subject.world.worldEpoch };
@@ -73,7 +75,7 @@ describe("connection lifecycle", () => {
     const oldEnd = bots[0].listeners("end")[0];
     bots[0].emit("end", "socketClosed");
     const recovery = subject.ensureReady({ timeout: 500, backoff: 0 });
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    await vi.advanceTimersByTimeAsync(0);
     bots[1].emit("spawn");
     await recovery;
     const after = { runtimeId: subject.world.runtimeId, worldEpoch: subject.world.worldEpoch };
@@ -90,18 +92,19 @@ describe("connection lifecycle", () => {
   });
 
   it("does not resume continuous physical actions on recovery", async () => {
+    vi.useFakeTimers();
     const { subject, bots } = setup();
     bots[0].emit("spawn");
-    const run = vi.fn();
-    const action = subject.runAction("control.set", ["movement"], run, undefined, true);
-    await Promise.resolve();
+    const action = subject.runAction("control.set", ["movement"], () => subject.setControl("forward", true), undefined, true);
+    expect(bots[0].setControlState).toHaveBeenCalledExactlyOnceWith("forward", true);
     bots[0].emit("end", "socketClosed");
     expect(subject.actions.get(action.action).state).toBe("failed");
     const recovery = subject.ensureReady({ timeout: 500, backoff: 0 });
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    await vi.advanceTimersByTimeAsync(0);
     bots[1].emit("spawn");
     await recovery;
-    expect(run).toHaveBeenCalledOnce();
+    expect(bots[1].setControlState).not.toHaveBeenCalled();
+    expect(subject.actions.owner("movement")).toBeUndefined();
     expect(subject.actions.get(action.action).state).toBe("failed");
   });
 

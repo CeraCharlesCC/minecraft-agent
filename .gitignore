@@ -4,3 +4,5 @@ coverage/
 .minecraft-agent/
 .npm-cache/
 *.log
+ignoredocs
+ignoredocs/*

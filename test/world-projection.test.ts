@@ -50,9 +50,10 @@ describe("v3 public world projection", () => {
     bot.currentWindow = window;
     for (const detail of ["compact", "full"] as const) {
       const observed = world.frame(bot, ready, { detail }).window;
-      expect(observed).toEqual(projectWindow(window, detail));
-      expect(observed).toMatchObject({ id: 3, known: true, title: "Supplies", inventoryStart: 27, inventoryEnd: 63,
-        hotbarStart: 54, hotbarEnd: 63, slotCount: 2, slots: [{ name: "apple", count: 2, slot: 1 }], selectedItem: { name: "stone", count: 3 } });
+      const expected = { id: 3, type: "minecraft:chest", known: true, title: "Supplies", inventoryStart: 27, inventoryEnd: 63,
+        hotbarStart: 54, hotbarEnd: 63, slotCount: 2, slots: [{ name: "apple", count: 2, slot: 1 }], selectedItem: { name: "stone", count: 3 } };
+      expect(observed).toEqual(expected);
+      expect(projectWindow(window, detail)).toEqual(expected);
       expect(observed.selectedItem).not.toHaveProperty("nbt");
     }
     expect(projectWindow({ id: 4 })).toEqual({ id: 4, known: false });

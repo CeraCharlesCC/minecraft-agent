@@ -40,7 +40,11 @@ describe("self-only oxygen adapter with installed Mineflayer plugins", () => {
     bot.on("breath", () => duringBreath.push(bot.oxygenLevel));
     metadata(2, 75);
     expect(bot.oxygenLevel).toBe(20);
-    expect(duringBreath.every(value => value === 20)).toBe(true);
+    // Observe self packets too: versions that emit no breath event for other
+    // entities still exercise the value exposed synchronously to subscribers.
+    metadata(1, 300);
+    expect(duringBreath.length).toBeGreaterThan(0);
+    expect(duringBreath).toEqual(Array(duringBreath.length).fill(20));
     expect(frame().self.oxygenLevel).toBe(20);
     metadata(1, 150);
     expect(frame().self.oxygenLevel).toBe(10);
@@ -51,7 +55,9 @@ describe("self-only oxygen adapter with installed Mineflayer plugins", () => {
     expect(bot.oxygenLevel).toBe(19);
     adapter.dispose();
     adapter.dispose();
-    expect(bot._client.listenerCount("entity_metadata")).toBe(version === "1.12.2" ? 2 : 1);
+    expect(bot).not.toHaveProperty("oxygenLevel");
+    metadata(1, 150);
+    expect(bot.oxygenLevel).toBe(10);
   });
 
   it("also works when installed after plugins and does not manufacture finite values", () => {
