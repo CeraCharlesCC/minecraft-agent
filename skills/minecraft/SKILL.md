@@ -7,7 +7,7 @@ description: Control a live Minecraft bot through mc-agent.
 
 Use `--output json` and command `--help`.
 
-Normal loop: observe → action with observation → next action. With stable `MC_AGENT_CLIENT_ID` (or `--client`), ready frame/find/inspect saves context per client/session. Without an ID or with `--strict-context`, pass `--context`. Explicit context wins. Entity targets need loaded `--track`; pass handles unchanged.
+Normal loop: observe → action with observation → next action. With stable `MC_AGENT_CLIENT_ID` (or `--client`), ready frame/surroundings/find/inspect saves context per client/session. Without an ID or with `--strict-context`, pass `--context`. Explicit context wins. Entity targets need loaded `--track`; pass handles unchanged.
 
 Use `--wait 10000` before dependent work. Only `completed` means success; `ok: true` means processed. `timedOut: true` leaves work running. Continuous follow/look requires stop. Read `data.observation`; `--no-observe` omits it.
 

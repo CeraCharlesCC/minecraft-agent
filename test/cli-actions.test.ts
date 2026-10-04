@@ -58,6 +58,17 @@ afterEach(() => {
 });
 
 describe("CLI actions", () => {
+  it("transmits surroundings filters to a fresh read endpoint", async () => {
+    const { handlers, mocks } = await loadActionsWithMocks();
+    await handlers.observeSurroundings!({ session: "default", range: 8, detail: true, bounds: { min: [-2, -1, -2], max: [2, 4, 2] } });
+    const path = mocks.daemonRequest.mock.calls[0]![1] as string;
+    const url = new URL(path, "http://localhost");
+    expect(url.pathname).toBe("/surroundings");
+    expect(url.searchParams.get("range")).toBe("8");
+    expect(url.searchParams.get("detail")).toBe("true");
+    expect(JSON.parse(url.searchParams.get("bounds")!)).toEqual({ min: [-2, -1, -2], max: [2, 4, 2] });
+  });
+
   it("transmits wait and observation preferences on the original gameplay POST", async () => {
     const { handlers, mocks } = await loadActionsWithMocks();
     mocks.loadSessionForClient.mockResolvedValue({ session: "default", controlPort: 3000, token: "secret" });

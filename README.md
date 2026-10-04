@@ -11,11 +11,13 @@ mc-agent --output json navigate goto --x 10 --y 64 --z 5 --wait 10000
 # Read data.state and data.observation before choosing the next action.
 ```
 
-Ready frame/find/inspect saves context for that client/session. Without a client ID, or with `--strict-context`, pass `--context`. `--no-observe` omits the attached frame. Only `completed` means success; `timedOut: true` leaves the action running. After world changes, explicitly observe again.
+Ready frame/surroundings/find/inspect saves context for that client/session. Without a client ID, or with `--strict-context`, pass `--context`. `--no-observe` omits the attached frame. Only `completed` means success; `timedOut: true` leaves the action running. After world changes, explicitly observe again.
 
 `session start` streams chat; retain its process handle. Use `--no-listen` to return once or `chat listen` to attach. Closing a listener leaves the daemon running; `session stop` disconnects. Stop old daemons with their matching CLI before upgrading to API 3.3.
 
 Arguments: `mc-agent <group> <command> --help`. Agent loop: [skill](skills/minecraft/SKILL.md) or `skills get core`. Contracts: [reference](skills/minecraft/references/playbooks.md) or `skills get core --full`.
+
+Nearby surfaces: `mc-agent observe surroundings [--range 32] [--detail] [--bounds=-8,-4,-8:8,4,8]`. This fresh scan uses fixed world axes; omitted surfaces mean unobserved, and visible floors do not establish safe routes.
 
 Development: `npm ci`, `npm test`, `npm run typecheck`, `npm run build`.
 

@@ -2,6 +2,7 @@ import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { BotOptions, BotController, CreateBotFn } from "./bot.js";
 import { CliError, badInput, daemonIncompatible, publicError } from "../output/errors.js";
 import { API_VERSION, API_VERSION_HEADER } from "./client.js";
+import { validateSurroundingsOptions } from "../core/surroundings-input.js";
 import { ActionResource, RuntimeAction, projectAction } from "../core/actions.js";
 import { EventStore, projectEvent, eventMatchesFilter, resolveEventFilter } from "../core/events.js";
 import { readSession, removeSession, SessionRecord, writeSession } from "../session/store.js";
@@ -227,6 +228,16 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
         if (activeStreams.size >= 32) throw new CliError("STREAM_OVERFLOW", "Subscriber limit reached.", "Close an existing stream before reconnecting.");
         activeStreams.add(response);
         response.on("close", () => activeStreams.delete(response));
+      }
+      if (request.method === "GET" && url.pathname === "/surroundings") {
+        const detail = url.searchParams.get("detail");
+        if (detail !== null && !["true", "false"].includes(detail)) throw badInput("Surroundings detail must be true or false.");
+        const bounds = url.searchParams.get("bounds");
+        sendJson(response, 200, controller.surroundings(validateSurroundingsOptions({
+          range: Number(url.searchParams.get("range") ?? "32"), detail: detail === "true",
+          ...(bounds === null ? {} : { bounds: JSON.parse(bounds) }),
+        })));
+        return;
       }
       if (request.method === "GET" && url.pathname === "/frame") {
         sendJson(response, 200, controller.frame({

@@ -116,6 +116,13 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       return daemonRequest(record, `/frame?${params}`);
     },
 
+    async observeSurroundings(input) {
+      const record = await loadSessionForClient(input.session);
+      const params = new URLSearchParams({ range: String(input.range ?? 32), detail: String(input.detail ?? false) });
+      if (input.bounds) params.set("bounds", JSON.stringify(input.bounds));
+      return daemonRequest(record, `/surroundings?${params}`);
+    },
+
     async debugEvents(input) {
       const record = await loadSessionForClient(input.session);
       const params = new URLSearchParams();

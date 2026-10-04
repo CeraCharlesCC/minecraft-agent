@@ -7,6 +7,7 @@ import { failure, formatDefaultText, resolveOutputMode, success, writeJson, writ
 import { decodeActionContext } from "../core/context.js";
 import { isHandle } from "../core/handles.js";
 import { normalizeRegistryName } from "../core/registry.js";
+import { parseSurroundingsBounds, validateSurroundingsOptions } from "../core/surroundings-input.js";
 import { CliHandlers } from "./handlers.js";
 import { acquireClientContext, resolveClientId, resolveStrictContext, type ClientContextLease } from "../session/client-context.js";
 
@@ -315,7 +316,7 @@ function commandRunner<T>(
       const globals = command.optsWithGlobals();
       const clientId = resolveClientId(globals.client ?? process.env.MC_AGENT_CLIENT_ID);
       const strict = resolveStrictContext(globals.strictContext);
-      const explicitObservation = (command.parent?.name() === "observe" && command.name() === "frame") ||
+      const explicitObservation = (command.parent?.name() === "observe" && ["frame", "surroundings"].includes(command.name())) ||
         (command.parent?.name() === "entity" && ["find", "inspect"].includes(command.name()));
       const explicitContext = opts.context !== undefined || opts.runtimeId !== undefined || opts.worldEpoch !== undefined;
       if (clientId && (explicitObservation || (handlers && !explicitContext && !strict))) {
@@ -459,7 +460,19 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
       timeout: z.coerce.number().int().min(1).max(120000), maxAttempts: z.coerce.number().int().min(1).max(10), backoff: z.coerce.number().int().min(0).max(30000),
     }).parse(opts)))());
 
-  const observe = program.command("observe").description("Observe coherent frames and semantic events");
+  const observe = program.command("observe").description("Observe frames, surroundings, and semantic events");
+
+  observe.command("surroundings")
+    .description("Fresh world-aligned scan of sampled visible block surfaces in all directions")
+    .option("--session <name>", "session name", "default")
+    .option("--range <blocks>", "radial eye-to-surface range (greater than 0, at most 32)", "32")
+    .option("--detail", "individual observed blocks and faces instead of merged patches", false)
+    .option("--bounds <min:max>", "inclusive world-axis offsets: minX,minY,minZ:maxX,maxY,maxZ")
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.observeSurroundings!({
+      ...sessionSchema.parse(opts),
+      ...validateSurroundingsOptions({ range: Number(opts.range), detail: opts.detail,
+        ...(opts.bounds === undefined ? {} : { bounds: parseSurroundingsBounds(opts.bounds) }) }),
+    }))());
 
   observe
     .command("frame")

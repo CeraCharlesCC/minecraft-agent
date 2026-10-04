@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
 import { createBot } from "mineflayer";
 import pathfinderPackage from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
@@ -9,11 +10,13 @@ import { installEntityObservation, observedEntityPosition, resetEntityObservatio
 import { installSelfOxygen } from "./self-oxygen.js";
 import { CanonicalChat } from "../core/chat.js";
 import { ActionManager, ActionResource } from "../core/actions.js";
-import { decodeActionContext } from "../core/context.js";
+import { decodeActionContext, encodeActionContext } from "../core/context.js";
 import { CliError, commandBlocked, contextRequired } from "../output/errors.js";
 import { normalizeRegistryName } from "../core/registry.js";
 import { API_VERSION } from "../core/protocol.js";
 import { queryBlockRay } from "./ray-query.js";
+import { DEFAULT_SURROUNDINGS_OUTPUT_BYTES, scanSurroundings, type SurroundingsWorld } from "./surroundings.js";
+import { validateSurroundingsOptions, type SurroundingsInput } from "../core/surroundings-input.js";
 
 const { goals, Movements, pathfinder } = pathfinderPackage;
 
@@ -649,6 +652,40 @@ export class BotController {
   frame(options: FrameOptions = {}) {
     this.flushChat();
     return this.world.frame(this.bot, this.observationContext(), options);
+  }
+
+  surroundings(input: SurroundingsInput = {}) {
+    const options = validateSurroundingsOptions(input);
+    this.flushChat();
+    this.checkWorld();
+    if (!this.connectionStatus().ready) {
+      throw new CliError("NOT_READY", "Bot has no ready world context.", "Request surroundings after the connection is ready.", 1, this.connectionStatus());
+    }
+    const bot = this.requireBot();
+    const position = { ...this.requireObservedSelfPosition() };
+    const height = bot.entity?.height;
+    if (typeof height !== "number" || !Number.isFinite(height) || height <= 0 ||
+        !bot.world || typeof (bot.world as SurroundingsWorld).getBlock !== "function") {
+      throw commandBlocked("Eye pose or loaded world is unavailable for surroundings observation.", "Observe after the world and self pose are available.");
+    }
+    const runtimeId = this.world.runtimeId, worldEpoch = this.world.worldEpoch;
+    const generation = this.generation, dimension = bot.game?.dimension, blockWorld = bot.world;
+    const identity = { type: "surroundings", scanId: randomUUID(), fresh: true, observedAt: new Date().toISOString(), position,
+      runtimeId, worldEpoch, context: encodeActionContext(runtimeId, worldEpoch),
+      connection: this.connectionStatus(), ...(dimension === undefined ? { unknownFields: ["/dimension"] } : { dimension }) };
+    // Reserve the serialized controller metadata before selecting surface records.
+    const result = scanSurroundings(blockWorld as SurroundingsWorld, { position, height }, {
+      ...options, maxOutputBytes: DEFAULT_SURROUNDINGS_OUTPUT_BYTES - Buffer.byteLength(JSON.stringify(identity)) - 128,
+    });
+    this.checkWorld();
+    if (this.world.worldEpoch !== worldEpoch || this.generation !== generation || this.bot !== bot ||
+        bot.game?.dimension !== dimension || bot.world !== blockWorld || !this.connectionStatus().ready) {
+      throw new CliError("WORLD_CHANGED", "World context changed during surroundings observation.", "Request fresh surroundings after the connection is ready.");
+    }
+    const response = { ...identity, ...result };
+    response.budget.maxOutputBytes = DEFAULT_SURROUNDINGS_OUTPUT_BYTES;
+    for (let i = 0; i < 3; i++) response.budget.outputBytes = Buffer.byteLength(JSON.stringify(response));
+    return response;
   }
 
   flushChat() { this.chatReceiver?.flush(); }

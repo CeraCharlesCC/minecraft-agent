@@ -4,7 +4,7 @@ Arguments: `mc-agent <group> <command> --help`.
 
 ## Context and results
 
-- Ready `observe frame`, `entity find`, or `entity inspect` establishes context for `MC_AGENT_CLIENT_ID` / `--client`, per session. Status and startup probes do not. Without an ID, pass `--context`.
+- Ready `observe frame`, `observe surroundings`, `entity find`, or `entity inspect` establishes context for `MC_AGENT_CLIENT_ID` / `--client`, per session. Status and startup probes do not. Without an ID, pass `--context`.
 - Explicit `--context` wins; `--runtime` plus `--world-epoch` also works. Invalid/conflicting inputs never fall back. `--strict-context` / `MC_AGENT_STRICT_CONTEXT=true` requires explicit context.
 - Serialize each client/session; overlap returns `CLIENT_BUSY`. Parallel operations need different IDs or explicit context. Only explicit observations switch worlds/runtimes (`contextReset.reason`: `world_changed` / `runtime_changed`). Error observations never switch or replay work.
 - Context checks runtime/epoch, not frame freshness or target position. `window close` closes the currently open window; context does not identify a particular window.
@@ -26,6 +26,14 @@ Arguments: `mc-agent <group> <command> --help`.
 Navigation returns `finalPosition` / `goalSatisfied: true`. `distanceToGoal` is distance to requested coordinates and may exceed range on arrival; arrival does not guarantee interaction. `navigate configure` persists for movement.
 
 `collect item` accepts dropped item tracks. `pickupConfirmed: true` confirms self pickup, possibly partial; quantity remains unknown and inventory may update later. `PICKUP_UNCONFIRMED` requires inspecting state before retrying.
+
+## Surroundings
+
+- `observe surroundings [--range 32] [--detail] [--bounds=-8,-4,-8:8,4,8]` / `GET /surroundings?range=32&detail=false` makes a fresh all-direction scan without turning. HTTP `bounds` is JSON `{min:[x,y,z],max:[x,y,z]}`. Range is radial eye-to-hit distance, at most 32; it never loads chunks.
+- `blockOrigin` is floor(self position). Patch `min`/`max` and block `position` are inclusive integer offsets in fixed world X/Y/Z; faces are west/east, down/up, north/south. `material` indexes the response-local exact-name `palette`. Partial block `shapes[].bounds` are local boxes `[minX,minY,minZ,maxX,maxY,maxZ]`, with sampled `faces`.
+- Default `patches` plus `partialBlocks` preserve the same sampled information as `--detail` `blocks` before output truncation. Patches group adjacent sampled cells on one material/face/plane, without asserting visibility of every point.
+- `visibilityPolicy` specifies geometry approximations and fallback: opaque blocks/bedrock/barrier stop rays; glass/water retain layers and continue within the layer cap. Unloaded data stops as unknown. Supported partial shapes use explicit approximations; unsupported blocks conservatively occlude as cubes.
+- Check `sampling`, `coverage`, and `budget`: finite sampling can miss features; range/unknown/layer/work exhaustion and output omissions are reported separately. `sampling.complete` means planned rays finished, not complete world coverage. Absence never means air; floors do not establish safe routes. Bounds focus a new scan and filter output, retaining occlusion/range checks. Maps stay separate from attached action frames and navigation checks.
 
 ## Events and deltas
 

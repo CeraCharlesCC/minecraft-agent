@@ -38,6 +38,12 @@ export interface WatchInput extends SessionInput {
   rate?: number;
 }
 
+export interface SurroundingsInput extends Omit<SessionInput, "detail"> {
+  range?: number;
+  detail?: boolean;
+  bounds?: { min: [number, number, number]; max: [number, number, number] };
+}
+
 export interface FrameInput extends SessionInput {
   detail?: "compact" | "full";
   since?: string;
@@ -241,6 +247,7 @@ export interface DaemonRunInput extends StartSessionInput {
 
 export interface CliHandlers {
   observeFrame?(input: FrameInput): Promise<unknown>;
+  observeSurroundings?(input: SurroundingsInput): Promise<unknown>;
   debugEvents?(input: DebugEventsInput): Promise<unknown>;
   sessionDiagnose?(input: SessionInput): Promise<unknown>;
   sessionEnsureReady?(input: EnsureReadyInput): Promise<unknown>;

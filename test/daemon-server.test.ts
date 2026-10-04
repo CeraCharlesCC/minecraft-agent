@@ -87,6 +87,21 @@ afterEach(async () => {
 });
 
 describe("daemon server", () => {
+  it("serves fresh surroundings and rejects invalid direct HTTP options", async () => {
+    const daemon = await responseDaemon("surroundings");
+    Object.assign(daemon.bot.entity, { height: 1.6 });
+    Object.assign(daemon.bot, { world: { getBlock: () => ({ name: "air", shapes: [] }) } });
+    try {
+      const scan = await daemon.get('/surroundings?range=2&detail=true&bounds=%7B%22min%22%3A%5B-1%2C-1%2C-1%5D%2C%22max%22%3A%5B1%2C3%2C1%5D%7D');
+      expect(scan).toMatchObject({ type: "surroundings", fresh: true, context: daemon.context, range: 2, representation: "blocks", blocks: [], bounds: { min: [-1, -1, -1], max: [1, 3, 1] } });
+      for (const query of ["range=33", "range=Infinity", "range=", "detail=full", "bounds=null", "bounds=not-json", "bounds=%7B%7D"]) {
+        const response = await fetch(`${daemon.url}/surroundings?${query}`, { headers: { "X-MC-Agent-API": "3.3", Authorization: `Bearer ${TOKEN_A}` } });
+        expect(response.status).toBe(400);
+        expect(await response.json()).toMatchObject({ code: "BAD_INPUT" });
+      }
+    } finally { await daemon.close(); }
+  });
+
   it("returns settled actions with fresh observations and preserves their terminal results", async () => {
     const daemon = await responseDaemon("response-settlement");
     const { bot, context, get, post } = daemon;

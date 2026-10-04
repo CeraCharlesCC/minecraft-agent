@@ -38,6 +38,13 @@ async function observe(value = context, session = "default", client = "agent-a")
 }
 
 describe("persisted client context", () => {
+  it("continues actions from an explicit fresh surroundings observation", async () => {
+    await cli({ observeSurroundings: vi.fn(async () => ({ ...ready(), type: "surroundings", fresh: true })) }).run("observe", "surroundings");
+    const close = vi.fn(async () => ({ closed: true }));
+    await cli({ windowClose: close }).run("window", "close");
+    expect(close).toHaveBeenCalledExactlyOnceWith({ session: "default", context, runtimeId: runtime, worldEpoch: 1 });
+  });
+
   it("continues across CLI instances with an atomic private state file, including window close", async () => {
     await observe();
     const close = vi.fn(async () => ({ closed: true, observation: ready() }));
