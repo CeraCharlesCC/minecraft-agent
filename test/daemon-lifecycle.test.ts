@@ -30,9 +30,9 @@ async function setup() {
     controlPort: port, token, createBotFn: create, exitOnStop: false });
   const request = async (path: string, body?: unknown) => {
     const response = await fetch(`http://127.0.0.1:${port}${path}`, { method: body === undefined ? "GET" : "POST",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      headers: { "X-MC-Agent-API": "3.3", Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}) });
-    expect(response.headers.get("X-MC-Agent-API")).toBe("3.2");
+    expect(response.headers.get("X-MC-Agent-API")).toBe("3.3");
     return { status: response.status, body: await response.json() as any };
   };
   const cleanup = async () => {

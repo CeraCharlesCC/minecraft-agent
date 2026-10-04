@@ -8,6 +8,7 @@ import { decodeActionContext } from "../core/context.js";
 import { isHandle } from "../core/handles.js";
 import { normalizeRegistryName } from "../core/registry.js";
 import { CliHandlers } from "./handlers.js";
+import { acquireClientContext, resolveClientId, resolveStrictContext, type ClientContextLease } from "../session/client-context.js";
 
 export interface CliIo {
   stdout: Writable;
@@ -20,6 +21,8 @@ const sessionSchema = z.object({
   context: z.string().min(1).optional(),
   runtimeId: z.string().min(1).optional(),
   worldEpoch: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+  wait: z.coerce.number().int().min(0).max(30000).optional(),
+  observe: z.boolean().optional(),
 });
 
 const physicalSchema = sessionSchema.extend({
@@ -302,12 +305,24 @@ function commandRunner<T>(
 ) {
   return async () => {
     let mode: ReturnType<typeof getOutputMode> | undefined;
+    let lease: ClientContextLease | undefined;
+    const opts = command.opts();
+    const originalContext = { context: opts.context, runtimeId: opts.runtimeId, worldEpoch: opts.worldEpoch, wait: opts.wait };
     try {
       mode = getOutputMode(command, io);
+      if (command.getOptionValueSource("observe") === "default") delete opts.observe;
       const handlers = physicalHandlers.get(command);
-      const opts = command.opts();
-      let waitTimeout: number | undefined;
+      const globals = command.optsWithGlobals();
+      const clientId = resolveClientId(globals.client ?? process.env.MC_AGENT_CLIENT_ID);
+      const strict = resolveStrictContext(globals.strictContext);
+      const explicitObservation = (command.parent?.name() === "observe" && command.name() === "frame") ||
+        (command.parent?.name() === "entity" && ["find", "inspect"].includes(command.name()));
+      const explicitContext = opts.context !== undefined || opts.runtimeId !== undefined || opts.worldEpoch !== undefined;
+      if (clientId && (explicitObservation || (handlers && !explicitContext && !strict))) {
+        lease = await acquireClientContext(clientId, opts.session ?? "default");
+      }
       if (handlers) {
+        if (!explicitContext && !strict && lease?.context) opts.context = lease.context;
         if (opts.context === undefined && opts.runtimeId === undefined && opts.worldEpoch === undefined) throw contextRequired();
         if (opts.context !== undefined) {
           const decoded = decodeActionContext(opts.context);
@@ -318,13 +333,12 @@ function commandRunner<T>(
           opts.runtimeId = decoded.runtimeId;
           opts.worldEpoch = decoded.worldEpoch;
         }
-        if (opts.wait !== undefined) waitTimeout = waitTimeoutSchema.parse(opts.wait === true ? 5000 : opts.wait);
+        if (opts.wait !== undefined) opts.wait = waitTimeoutSchema.parse(opts.wait === true ? 5000 : opts.wait);
       }
       let data: unknown = await action();
-      if (handlers && waitTimeout !== undefined) {
-        const actionId = (data as { action?: unknown } | null)?.action;
-        if (typeof actionId !== "string") throw badInput("This command did not return an action to wait for.");
-        data = await handlers.actionWait!({ session: opts.session ?? "default", action: actionId, timeout: waitTimeout });
+      if (explicitObservation && lease) {
+        const reason = await lease.remember(data);
+        if (reason && data && typeof data === "object") data = { ...data, contextReset: { reason } };
       }
       if (mode === "json") {
         writeJson(io.stdout, success(data));
@@ -341,6 +355,11 @@ function commandRunner<T>(
         writeText(io.stderr, `${projected.code}: ${projected.message}`);
       }
       throw normalized;
+    } finally {
+      for (const [key, value] of Object.entries(originalContext)) {
+        if (value === undefined) delete opts[key]; else opts[key] = value;
+      }
+      await lease?.release();
     }
   };
 }
@@ -373,6 +392,8 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .description("Agent-ready Minecraft bot CLI powered by mineflayer.")
     .version(version)
     .option("--output <mode>", "output mode: json or text")
+    .option("--client <id>", "stable client identity (default MC_AGENT_CLIENT_ID)")
+    .option("--strict-context", "require explicit action context (or MC_AGENT_STRICT_CONTEXT=1)")
     .showHelpAfterError();
 
   const session = program.command("session").description("Manage Minecraft bot sessions");
@@ -683,6 +704,8 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
           ...(parsed.context ? { context: parsed.context } : {}),
           ...(parsed.runtimeId ? { runtimeId: parsed.runtimeId } : {}),
           ...(parsed.worldEpoch !== undefined ? { worldEpoch: parsed.worldEpoch } : {}),
+          ...(parsed.wait !== undefined ? { wait: parsed.wait } : {}),
+          ...(parsed.observe !== undefined ? { observe: parsed.observe } : {}),
           allowPlace: parsed.place === false ? false : parsed.allowPlace,
           allowDig: parsed.noDig || parsed.dig === false ? false : parsed.allowDig,
           allowSprinting: parsed.noSprinting || parsed.sprinting === false ? false : parsed.allowSprinting,
@@ -1046,6 +1069,7 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .requiredOption("--action <action>", "runtime-scoped action id")
     .option("--session <name>", "session name", "default")
     .option("--timeout <ms>", "wait timeout (0-30000 ms)", "5000")
+    .option("--no-observe", "omit the response observation")
     .action((opts, cmd) => commandRunner(cmd, io, () => handlers.actionWait!(actionSchema.extend({ timeout: waitTimeoutSchema }).parse(opts)))());
   action.command("cancel")
     .requiredOption("--action <action>", "runtime-scoped action id")
@@ -1106,11 +1130,12 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
       if (!physicalCommands[group.name()]?.includes(command.name())) continue;
       physicalHandlers.set(command, handlers);
       command.option("--context <context>", "action context token from a frame or entity search");
+      command.option("--no-observe", "omit the response observation");
       const immediate = (group.name() === "navigate" && ["stop", "configure"].includes(command.name())) ||
         (group.name() === "control" && command.name() === "clear") ||
         (group.name() === "world" && command.name() === "stop-digging") ||
         (group.name() === "inventory" && command.name() === "deactivate-item");
-      if (!immediate) command.option("--wait [ms]", "wait for this action, default 5000 ms; timeout leaves it running");
+      if (!immediate) command.option("--wait [ms]", "bounded daemon wait, default 5000 ms; continuous actions return after start");
       command.option("--runtime <runtimeId>", "expected daemon runtime identity from frame");
       command.option("--world-epoch <epoch>", "expected world context epoch from frame");
       command.hook("preAction", (_command, actionCommand) => {

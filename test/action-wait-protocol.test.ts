@@ -31,10 +31,10 @@ async function server() {
   const port = (allocation.address() as { port: number }).port;
   await new Promise<void>(resolve => allocation.close(() => resolve()));
   const bot = new WaitBot();
-  const headers = { Authorization: "Bearer wait-protocol-test-token-123456789", "Content-Type": "application/json" };
+  const headers = { "X-MC-Agent-API": "3.3", Authorization: "Bearer wait-protocol-test-token-123456789", "Content-Type": "application/json" };
   const request = async (path: string, init: RequestInit = {}) => {
     const response = await fetch(`http://127.0.0.1:${port}${path}`, { ...init, headers });
-    expect(response.headers.get("X-MC-Agent-API")).toBe("3.2");
+    expect(response.headers.get("X-MC-Agent-API")).toBe("3.3");
     return response;
   };
   const get = async (path: string) => (await request(path)).json() as Promise<any>;
@@ -59,7 +59,7 @@ describe("authoritative action waits over HTTP", () => {
     let resolve!: () => void;
     bot.lookAtCalls.mockReturnValue(new Promise<void>(done => { resolve = done; }));
     const action = await post("/look/at", { context, x: 6, y: 64, z: 0 });
-    expect(Object.keys(action).sort()).toEqual(["action", "kind", "state"]);
+    expect(Object.keys(action).sort()).toEqual(["action", "kind", "observation", "state"]);
     const waiting = get(`/actions/${action.action}/wait?timeout=1000`);
     expect(await get(`/actions/${action.action}`)).toMatchObject({ state: "running" });
     expect(await post(`/actions/${action.action}/cancel`, { context })).toMatchObject({ state: "cancelled" });
@@ -93,5 +93,27 @@ describe("authoritative action waits over HTTP", () => {
     expect(await get(`/actions/${action.action}`)).toMatchObject({ state: "running" });
     expect(await post(`/actions/${action.action}/cancel`, { context })).toMatchObject({ state: "cancelled" });
     expect(await get(`/actions/${action.action}/wait?timeout=0`)).toMatchObject({ state: "cancelled", timedOut: false });
+  });
+
+  it("disconnects a bounded POST waiter without cancelling the accepted operation", async () => {
+    const { bot, request, get, context } = await server();
+    let resolve!: () => void, started!: () => void;
+    const beginning = new Promise<void>(done => { started = done; });
+    bot.lookAtCalls.mockImplementationOnce(() => {
+      started();
+      return new Promise<void>(done => { resolve = done; });
+    });
+    const abort = new AbortController();
+    const posting = request("/look/at", { method: "POST", signal: abort.signal,
+      body: JSON.stringify({ context, x: 6, y: 64, z: 0, wait: 30000 }) });
+    const rejection = expect(posting).rejects.toMatchObject({ name: "AbortError" });
+    await beginning;
+    const frame = await get("/frame");
+    const action = frame.actions.find((record: any) => record.kind === "look.at").action;
+    abort.abort();
+    await rejection;
+    expect(await get(`/actions/${action}`)).toMatchObject({ state: "running" });
+    resolve();
+    expect(await get(`/actions/${action}/wait?timeout=1000`)).toMatchObject({ state: "completed", timedOut: false, observation: { type: "full" } });
   });
 });

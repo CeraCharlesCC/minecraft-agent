@@ -71,14 +71,14 @@ describe("CLI protocol", () => {
     for (const handler of [handlers.worldWake, handlers.worldDig, handlers.navigateGoto, handlers.actionCancel]) expect(handler).not.toHaveBeenCalled();
   });
 
-  it("decodes observation context and waits only for the returned action identity", async () => {
+  it("decodes observation context and sends bounded wait in the initial command", async () => {
     const { program, handlers, stdout } = makeProgram();
     const context = encodeActionContext(runtimeId, 2);
-    vi.mocked(handlers.navigateFollow).mockResolvedValue({ action: `${runtimeTag}:a9`, state: "running" });
+    vi.mocked(handlers.navigateFollow).mockResolvedValue({ action: `${runtimeTag}:a9`, state: "running", timedOut: true });
     vi.mocked(handlers.actionWait!).mockResolvedValue({ action: `${runtimeTag}:a9`, state: "running", timedOut: true });
     await program.parseAsync(["node", "mc-agent", "navigate", "follow", "--track", `${runtimeTag}:p1`, "--context", context, "--wait", "75"]);
-    expect(handlers.navigateFollow).toHaveBeenCalledWith({ session: "default", context, runtimeId, worldEpoch: 2, track: `${runtimeTag}:p1`, range: 2 });
-    expect(handlers.actionWait).toHaveBeenCalledWith({ session: "default", action: `${runtimeTag}:a9`, timeout: 75 });
+    expect(handlers.navigateFollow).toHaveBeenCalledWith({ session: "default", context, runtimeId, worldEpoch: 2, track: `${runtimeTag}:p1`, range: 2, wait: 75 });
+    expect(handlers.actionWait).not.toHaveBeenCalled();
     expect(JSON.parse(stdout.value)).toEqual({ ok: true, data: { action: `${runtimeTag}:a9`, state: "running", timedOut: true } });
     expect(handlers.actionCancel).not.toHaveBeenCalled();
   });
@@ -89,10 +89,11 @@ describe("CLI protocol", () => {
   ])("preserves terminal action %s details from bounded waits", async terminal => {
     const { program, handlers, stdout } = makeProgram();
     const completed = { action: `${runtimeTag}:a9`, kind: "world.dig", timedOut: false, ...terminal };
-    vi.mocked(handlers.worldDig).mockResolvedValue({ action: `${runtimeTag}:a9`, state: "running" });
+    vi.mocked(handlers.worldDig).mockResolvedValue(completed);
     vi.mocked(handlers.actionWait!).mockResolvedValue(completed);
     await program.parseAsync(["node", "mc-agent", "world", "dig", "--x", "1", "--y", "2", "--z", "3", "--context", encodeActionContext(runtimeId, 2), "--wait", "150"]);
-    expect(handlers.actionWait).toHaveBeenCalledWith({ session: "default", action: `${runtimeTag}:a9`, timeout: 150 });
+    expect(handlers.worldDig).toHaveBeenCalledWith(expect.objectContaining({ wait: 150 }));
+    expect(handlers.actionWait).not.toHaveBeenCalled();
     expect(JSON.parse(stdout.value)).toEqual({ ok: true, data: completed });
     expect(handlers.actionCancel).not.toHaveBeenCalled();
   });
@@ -102,8 +103,8 @@ describe("CLI protocol", () => {
     const context = encodeActionContext(runtimeId, 2);
     vi.mocked(handlers.actionCancel!).mockResolvedValue({ action: `${runtimeTag}:a1`, state: "cancelled" });
     await program.parseAsync(["node", "mc-agent", "action", "cancel", "--action", `${runtimeTag}:a1`, "--context", context, "--runtime", runtimeId, "--world-epoch", "2", "--wait"]);
-    expect(handlers.actionCancel).toHaveBeenCalledWith({ session: "default", context, runtimeId, worldEpoch: 2, action: `${runtimeTag}:a1` });
-    expect(handlers.actionWait).toHaveBeenCalledWith({ session: "default", action: `${runtimeTag}:a1`, timeout: 5000 });
+    expect(handlers.actionCancel).toHaveBeenCalledWith({ session: "default", context, runtimeId, worldEpoch: 2, action: `${runtimeTag}:a1`, wait: 5000 });
+    expect(handlers.actionWait).not.toHaveBeenCalled();
   });
 
   it.each([

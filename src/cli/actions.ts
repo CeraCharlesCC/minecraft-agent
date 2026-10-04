@@ -13,11 +13,13 @@ function appendEventTypes(params: URLSearchParams, types: readonly string[]): vo
   }
 }
 
-function context(input: SessionInput): { context?: string; runtimeId?: string; worldEpoch?: number } {
+function context(input: SessionInput): Pick<SessionInput, "context" | "runtimeId" | "worldEpoch" | "wait" | "observe"> {
   return {
     ...(input.context !== undefined ? { context: input.context } : {}),
     ...(input.runtimeId !== undefined ? { runtimeId: input.runtimeId } : {}),
     ...(input.worldEpoch !== undefined ? { worldEpoch: input.worldEpoch } : {}),
+    ...(input.wait !== undefined ? { wait: input.wait } : {}),
+    ...(input.observe !== undefined ? { observe: input.observe } : {}),
   };
 }
 
@@ -126,7 +128,7 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
 
     async actionWait(input) {
       const record = await loadSessionForClient(input.session);
-      return daemonRequest(record, `/actions/${encodeURIComponent(input.action)}/wait?timeout=${input.timeout}`,
+      return daemonRequest(record, `/actions/${encodeURIComponent(input.action)}/wait?timeout=${input.timeout}${input.observe === false ? "&observe=false" : ""}`,
         { signal: AbortSignal.timeout(input.timeout + 1500) });
     },
 

@@ -1,8 +1,8 @@
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { BotOptions, BotController, CreateBotFn } from "./bot.js";
-import { CliError, badInput, publicError } from "../output/errors.js";
+import { CliError, badInput, daemonIncompatible, publicError } from "../output/errors.js";
 import { API_VERSION, API_VERSION_HEADER } from "./client.js";
-import { ActionResource, projectAction } from "../core/actions.js";
+import { ActionResource, RuntimeAction, projectAction } from "../core/actions.js";
 import { EventStore, projectEvent, eventMatchesFilter, resolveEventFilter } from "../core/events.js";
 import { readSession, removeSession, SessionRecord, writeSession } from "../session/store.js";
 
@@ -126,10 +126,43 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
   let record: SessionRecord;
   const server = createServer(async (request, response) => {
     response.setHeader(API_VERSION_HEADER, API_VERSION);
+    let includeObservation = false;
+    const observation = () => {
+      if (!includeObservation) return {};
+      try { return { observation: controller.frame({ detail: "compact" }) }; }
+      catch (error) { return { observationError: daemonErrorResponse(error).body }; }
+    };
+    const sendResult = (result: object) => {
+      if (!response.destroyed) sendJson(response, 200, { ...result, ...observation() });
+    };
+    const responseOptions = (body: Record<string, unknown>) => {
+      if (!body || typeof body !== "object" || Array.isArray(body)) throw badInput("Action body must be an object.");
+      if (body.observe !== undefined && typeof body.observe !== "boolean") throw badInput("observe must be a boolean.");
+      includeObservation = body.observe !== false;
+      if (body.wait !== undefined && (typeof body.wait !== "number" || !Number.isSafeInteger(body.wait) || body.wait < 0 || body.wait > 30000)) {
+        throw badInput("Action wait timeout must be an integer between 0 and 30000 milliseconds.");
+      }
+      return body.wait as number | undefined;
+    };
+    const waitAction = async (action: string, timeout: number) => {
+      const abort = new AbortController();
+      const close = () => { if (!response.writableEnded) abort.abort(); };
+      response.on("close", close);
+      try { return await controller.actions.wait(action, timeout, abort.signal); }
+      finally { response.off("close", close); }
+    };
+    const sendAction = async (action: RuntimeAction, timeout?: number, continuous = false) => {
+      const result = timeout !== undefined && !continuous ? await waitAction(action.action, timeout) : action;
+      sendResult(projectAction(result));
+    };
     try {
       if (!isAuthorized(request, options.token)) {
         sendJson(response, 401, { code: "DAEMON_ERROR", message: "Unauthorized daemon request." });
         return;
+      }
+      const requestApiVersion = request.headers[API_VERSION_HEADER.toLowerCase()];
+      if (requestApiVersion !== API_VERSION) {
+        throw daemonIncompatible(options.session, { actualApiVersion: requestApiVersion ?? null });
       }
 
       /* v8 ignore next -- Incoming HTTP requests always provide a URL; fallback is defensive. */
@@ -285,26 +318,30 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
       }
       const actionWaitRoute = /^\/actions\/([^/]+)\/wait$/.exec(url.pathname);
       if (request.method === "GET" && actionWaitRoute) {
-        const abort = new AbortController();
-        const close = () => { if (!response.writableEnded) abort.abort(); };
-        response.on("close", close);
-        try {
-          const result = await controller.actions.wait(decodeURIComponent(actionWaitRoute[1]), Number(url.searchParams.get("timeout") ?? "5000"), abort.signal);
-          if (!response.destroyed) sendJson(response, 200, { ...projectAction(result), timedOut: result.timedOut });
-        } finally { response.off("close", close); }
+        const observe = url.searchParams.get("observe");
+        if (observe !== null && !["true", "false"].includes(observe)) throw badInput("observe must be true or false.");
+        includeObservation = observe !== "false";
+        const result = await waitAction(decodeURIComponent(actionWaitRoute[1]), Number(url.searchParams.get("timeout") ?? "5000"));
+        sendResult(projectAction(result));
         return;
       }
       const actionRoute = /^\/actions\/([^/]+)(\/cancel)?$/.exec(url.pathname);
       if (actionRoute && ((request.method === "GET" && !actionRoute[2]) || (request.method === "POST" && actionRoute[2]))) {
         const action = decodeURIComponent(actionRoute[1]);
-        if (request.method === "POST") controller.validateContext((await readJson(request)) as never, false);
-        sendJson(response, 200, projectAction(request.method === "GET" ? controller.actions.get(action) : controller.actions.cancel(action)));
+        if (request.method === "POST") {
+          const body = await readJson(request);
+          if (!body || typeof body !== "object" || Array.isArray(body)) throw badInput("Action body must be an object.");
+          responseOptions(body as Record<string, unknown>);
+          controller.validateContext(body as never, false);
+        }
+        sendResult(projectAction(request.method === "GET" ? controller.actions.get(action) : controller.actions.cancel(action)));
         return;
       }
       if (request.method === "POST" && physicalRoutes.has(url.pathname)) {
         const input = await readJson(request);
         if (!input || typeof input !== "object" || Array.isArray(input)) throw badInput("Action body must be an object.");
         const body = input as Record<string, unknown>;
+        const wait = responseOptions(body);
         controller.validateContext(body);
         const path = url.pathname;
         const track = () => {
@@ -333,20 +370,20 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
           return value;
         };
         if (path === "/navigate/follow") {
-          sendJson(response, 200, projectAction(controller.followTrack(track(), range(2)))); return;
+          await sendAction(controller.followTrack(track(), range(2)), wait, true); return;
         }
         if (path === "/look/track") {
-          sendJson(response, 200, projectAction(controller.trackLook(track()))); return;
+          await sendAction(controller.trackLook(track()), wait, true); return;
         }
         if (["/navigate/stop", "/control/clear"].includes(path)) {
           controller.actions.cancelResources(["movement", "look"], "STOPPED");
-          sendJson(response, 200, path === "/navigate/stop" ? controller.stopNavigation() : controller.clearControls()); return;
+          sendResult(path === "/navigate/stop" ? controller.stopNavigation() : controller.clearControls()); return;
         }
         if (path === "/world/stop-digging") {
-          controller.actions.cancelResources(["item"], "STOPPED"); sendJson(response, 200, controller.stopDigging()); return;
+          controller.actions.cancelResources(["item"], "STOPPED"); sendResult(controller.stopDigging()); return;
         }
         if (path === "/inventory/deactivate-item") {
-          controller.actions.cancelResources(["item"], "STOPPED"); sendJson(response, 200, controller.deactivateItem()); return;
+          controller.actions.cancelResources(["item"], "STOPPED"); sendResult(controller.deactivateItem()); return;
         }
         let run: () => unknown | Promise<unknown>;
         let target: string | undefined;
@@ -390,7 +427,7 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
           case "/entity/move-vehicle": { const left = num("left"), forward = num("forward"); if (Math.abs(left)>1 || Math.abs(forward)>1) throw badInput("Invalid vehicle controls."); resources = ["movement"]; run = () => controller.moveVehicle(left,forward); break; }
           default: throw badInput("Unknown action.");
         }
-        sendJson(response, 200, projectAction(controller.runAction(path.slice(1).replaceAll("/","."), resources, run, target, continuous)));
+        await sendAction(controller.runAction(path.slice(1).replaceAll("/","."), resources, run, target, continuous), wait, continuous);
         return;
       }
 
@@ -519,6 +556,7 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
           thinkTimeout?: number;
           tickTimeout?: number;
         };
+        responseOptions(body as Record<string, unknown>);
         controller.validateContext(body as never);
         for (const key of ["allowDig", "allowPlace", "allowSprinting", "allowParkour", "canOpenDoors"] as const) {
           if (body[key] !== undefined && typeof body[key] !== "boolean") throw badInput(`Invalid ${key}.`);
@@ -526,7 +564,7 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
         for (const key of ["maxDropDown", "searchRadius", "thinkTimeout", "tickTimeout"] as const) {
           if (body[key] !== undefined && (!Number.isSafeInteger(body[key]) || body[key]! < (key === "searchRadius" ? -1 : key === "maxDropDown" ? 0 : 1))) throw badInput(`Invalid ${key}.`);
         }
-        sendJson(response, 200, controller.configureNavigation(body));
+        sendResult(controller.configureNavigation(body));
         return;
       }
 
@@ -578,7 +616,7 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
       if (response.destroyed || response.writableEnded) return;
       if (!(error instanceof CliError) && !(error instanceof SyntaxError)) console.error("Daemon request failed:", error);
       const { statusCode, body } = daemonErrorResponse(error);
-      sendJson(response, statusCode, body);
+      sendJson(response, statusCode, { ...body, ...observation() });
     }
   });
 

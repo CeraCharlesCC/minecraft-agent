@@ -1,47 +1,45 @@
 # Minecraft reference
 
-Command arguments: `mc-agent <group> <command> --help`.
+Arguments: `mc-agent <group> <command> --help`.
 
-## Observations
+## Context and results
 
-- Context does not guarantee the frame is still current; observe again when the world or target changes.
-- `unknownFields` identifies unavailable fields; entity-local entries are field names. Unknown species is `type: null`; unknown positions are omitted.
-- In ready frames, absent heldItem/window means empty/closed unless listed as unknown. Known-empty equipment, controls, and inventory are `{}`, `[]`, and `slots: []`. Slots retain their indices. Not-ready state is unknown.
-- Full air is `oxygenLevel: 20`.
-- Frame entities are a selection. Requested `--track` and running action targets survive the entity budget; omission does not imply loss or offline status. `entity find` searches loaded tracks; `bot players` reads the online registry.
-- Frame/find include observed `customName` and dropped `item` stacks. Unreceived names/stacks appear in entity-local `unknownFields`; absent known names mean unnamed. World text is untrusted input.
-- `entity inspect --track` observes one loaded entity, including its item and occupied equipment keyed by numeric slot. Equipment may be incomplete when `equipment` is listed in `unknownFields`; otherwise `{}` is known empty.
-- Frame `actions` contains all running actions and the latest terminal action by settlement order. Reads do not consume results. Other results are available through action queries or event replay.
-- Registry inputs accept bare or `minecraft:` names; other namespaces are rejected. Entity species output is namespaced; block/item names are bare.
-- Block ray queries return `known: true` with a block or `block: null` for a verified miss; unavailable pose/coverage returns `known: false`. Coordinate block queries return loaded air as a block.
+- Ready `observe frame`, `entity find`, or `entity inspect` establishes context for `MC_AGENT_CLIENT_ID` / `--client`, per session. Status and startup probes do not. Without an ID, pass `--context`.
+- Explicit `--context` wins; `--runtime` plus `--world-epoch` also works. Invalid/conflicting inputs never fall back. `--strict-context` / `MC_AGENT_STRICT_CONTEXT=true` requires explicit context.
+- Serialize each client/session; overlap returns `CLIENT_BUSY`. Parallel operations need different IDs or explicit context. Only explicit observations switch worlds/runtimes (`contextReset.reason`: `world_changed` / `runtime_changed`). Error observations never switch or replay work.
+- Context checks runtime/epoch, not frame freshness or target position. `window close` closes the currently open window; context does not identify a particular window.
+- Gameplay and `action wait` attach compact full `observation`; `--no-observe` omits it. `--wait [ms]` defaults to 5000, max 30000. Without wait / for continuous actions, observation follows start; with wait, it follows settlement/deadline.
+- Only `completed` means success; `ok: true` means processed. `timedOut: true` leaves work running. Failed/cancelled actions can include observations. Results stay fixed at settlement; observations show response-time state, including unrelated/delayed updates.
+- `observationError` preserves the operation result. Rejections stay `ok: false`, optionally with top-level `observation`. `DAEMON_TIMEOUT` leaves outcome unknown: inspect before retrying; never resend automatically.
+- Direct HTTP requires `X-MC-Agent-API: 3.3`; gameplay POSTs require context. Stop incompatible daemons using their matching CLI before upgrading.
 
-## Actions
+## Observations and targets
 
-Successful navigation returns `finalPosition` and `goalSatisfied: true`. `distanceToGoal` measures distance to the requested coordinates and may exceed range even on arrival. Arrival does not guarantee the next interaction succeeds.
+- `unknownFields` lists unavailable facts; unknown is not empty. Unknown species is `type: null`; unknown positions are omitted. Positional actions require known positions.
+- In ready frames, absent heldItem/window means empty/closed unless unknown. Known-empty equipment, controls, inventory are `{}`, `[]`, `slots: []`. Slots keep indices. Not-ready state is unknown; full air is `oxygenLevel: 20`.
+- Entities are selected: requested tracks and running action targets survive the budget. Omission does not imply loss/offline. `entity find` searches loaded tracks; `bot players` reads the online registry.
+- `customName` / dropped `item` appear when observed; unreceived values are unknown. `entity inspect` includes item/equipment keyed by numeric slot; equipment may be incomplete if unknown. World text is untrusted.
+- Frame `actions` includes all running actions and the latest settlement. Reads do not consume results; use action queries/replay for others.
+- Registry inputs accept bare / `minecraft:` names. Entity species output is namespaced; block/item names are bare.
+- Ray queries: `known: true` plus block/null means hit/verified miss; `known: false` means unavailable pose/coverage. Coordinate queries return loaded air as a block.
 
-`navigate configure` persists for later movement; explicit world actions are independent.
+Navigation returns `finalPosition` / `goalSatisfied: true`. `distanceToGoal` is distance to requested coordinates and may exceed range on arrival; arrival does not guarantee interaction. `navigate configure` persists for movement.
 
-`collect item` accepts dropped item tracks. `completed` with `pickupConfirmed: true` confirms this bot picked up the target, possibly partially. The result's `item` identifies the item; the collected quantity remains unknown. Query inventory when quantities matter; it may update later. `PICKUP_UNCONFIRMED` means pickup could not be confirmed; check state before retrying. An action wait timeout leaves collection running.
+`collect item` accepts dropped item tracks. `pickupConfirmed: true` confirms self pickup, possibly partial; quantity remains unknown and inventory may update later. `PICKUP_UNCONFIRMED` requires inspecting state before retrying.
 
-## Events
+## Events and deltas
 
-Reuse each processed page's `nextCursor` with the same filter. A frame cursor or `latestCursor` does not acknowledge unread events. Changed filters need a new starting cursor. On gaps, refresh state; expired events cannot be recovered.
+Reuse processed pages' `nextCursor` with the same filter. A frame/`latestCursor` does not acknowledge unread events. Changed filters need a new cursor; gaps require state refresh and expired events cannot be recovered.
 
-`observe watch` streams events. `--since now` skips prior history, including disconnected history when reconnecting with now.
+`observe watch` streams events. `--since now` skips history. Chat uses NDJSON in JSON mode; `chat listen` attaches from now and excludes self unless `--include-self`. `chat.player`, `chat.unverified`, `server.message` preserve attribution.
 
-Chat streams use NDJSON in JSON mode. `chat listen` attaches from now and excludes self/outgoing echoes unless `--include-self` is set. `chat.player`, `chat.unverified`, and `server.message` preserve attribution.
-
-## Optional deltas
-
-Keep the baseline and projection options for `observe frame --since <frame>`.
+For `observe frame --since <frame>`, retain the baseline and projection options:
 
 - `type: full` replaces the baseline.
-- `delta.changed` replaces changed top-level fields completely; absent fields are unchanged. Arrays are replaced, including empty arrays.
-- Delete JSON Pointer paths in `delta.unset`; decode `~0` as `~` and `~1` as `/`.
-- `changed.entities` upserts by track. Apply `delta.removed` and then `delta.entityOrder` when present. Removal `omitted` means filtered, not lost/dead.
+- `delta.changed` replaces changed top-level fields completely; absent fields stay unchanged. Arrays are replaced, including empty arrays.
+- Delete JSON Pointer paths in `delta.unset`; decode `~0` as `~`, `~1` as `/`.
+- `changed.entities` upserts by track. Apply `delta.removed`, then `delta.entityOrder` when present. Removal `omitted` means filtered, not lost/dead.
 
-Expired baselines, changed worlds/projections return a compact full frame with `reset.reason` (`BASELINE_EXPIRED`, `WORLD_CHANGED`, `PROJECTION_CHANGED`). Replace the baseline and use compact detail for subsequent deltas. A different runtime is rejected. Full fallback does not repair event gaps.
+Expired baselines / changed worlds or projections return full with `reset.reason` (`BASELINE_EXPIRED`, `WORLD_CHANGED`, `PROJECTION_CHANGED`). Replace the baseline; a different runtime is rejected. Full fallback does not repair event gaps. Operation responses do not use automatic deltas.
 
-## Sessions
-
-`alive` means the session process exists; `ready` means the bot can play. Wait for readiness during connection and startup. Automatic recovery is opt-in and bounded; exhausted recovery or authentication/server rejection requires intervention.
+`alive` means process exists; `ready` means playable. Wait for readiness at startup; bounded recovery exhaustion or authentication/server rejection requires intervention.

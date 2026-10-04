@@ -19,8 +19,8 @@ describe("core skill content", () => {
 
   it("keeps ordinary play focused on observation and action", () => {
     const compact = getSkillContent("core", false);
-    expect(compact).toContain("frame/find → action/wait → observation");
-    expect(compact).toContain("Copy `data.context` as `--context`");
+    expect(compact).toContain("observe → action with observation → next action");
+    expect(compact).toContain("`MC_AGENT_CLIENT_ID`");
     expect(compact).toContain("`unknownFields`");
     expect(compact).toContain("old actions are not replayed");
     expect(compact).not.toContain("`session diagnose`");

@@ -17,6 +17,8 @@ export interface SessionInput {
   context?: string;
   runtimeId?: string;
   worldEpoch?: number;
+  wait?: number;
+  observe?: boolean;
 }
 
 export interface EventsInput extends SessionInput {

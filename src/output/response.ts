@@ -10,6 +10,8 @@ export interface ApiSuccess<T> {
 
 export interface ApiFailure {
   ok: false;
+  observation?: unknown;
+  observationError?: { code: string; message: string };
   error: {
     code: string;
     message: string;
@@ -27,6 +29,8 @@ export function failure(error: CliError): ApiFailure {
   return {
     ok: false,
     error: publicError(error),
+    ...(error.observation !== undefined ? { observation: error.observation } : {}),
+    ...(error.observationError !== undefined ? { observationError: error.observationError } : {}),
   };
 }
 

@@ -88,6 +88,7 @@ describe("daemon client", () => {
       headers: {
         Authorization: "Bearer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "Content-Type": "application/json",
+        [API_VERSION_HEADER]: API_VERSION,
         "X-Test": "1",
       },
     });
@@ -126,16 +127,16 @@ describe("daemon client", () => {
     await expect(daemonRequest(record(), "/frame?maxEntities=50")).rejects.toMatchObject({
       code: "DAEMON_INCOMPATIBLE",
       remediation: expect.stringContaining("session stop --session default"),
-      details: { session: "default", expectedApiVersion: "3.2", path: "/frame", httpStatus: 404, actualApiVersion: null },
+      details: { session: "default", expectedApiVersion: "3.3", path: "/frame", httpStatus: 404, actualApiVersion: null },
     });
   });
 
   it("rejects successful old, missing, and future protocol headers before reading JSON", async () => {
-    for (const version of [undefined, "2", "3", "3.1", "4"]) {
+    for (const version of [undefined, "2", "3", "3.1", "3.2", "4"]) {
       const response = new Response("not valid JSON", { headers: version ? { [API_VERSION_HEADER]: version } : {} });
       vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response));
       await expect(daemonRequest(record(), "/status")).rejects.toMatchObject({
-        code: "DAEMON_INCOMPATIBLE", details: { expectedApiVersion: "3.2", actualApiVersion: version ?? null },
+        code: "DAEMON_INCOMPATIBLE", details: { expectedApiVersion: "3.3", actualApiVersion: version ?? null },
       });
       expect(response.bodyUsed).toBe(true);
     }
@@ -187,6 +188,31 @@ describe("daemon client", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("budgets a gameplay POST deadline for its bounded wait without retrying unknown outcomes", async () => {
+    vi.useFakeTimers();
+    const fetchMock = stalledFetch();
+    const request = daemonRequest(record(), "/navigate/goto", {
+      method: "POST", body: JSON.stringify({ wait: 10000, context: "context" }),
+    });
+    const failure = expect(request).rejects.toMatchObject({ code: "DAEMON_TIMEOUT", details: {
+      timeoutMs: 11500, outcome: "unknown", mayHaveExecuted: true, responseConfirmed: false,
+    } });
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(fetchMock.mock.calls[0]![1].signal!.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(5500);
+    await failure;
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves new-world error observations for output without converting rejection to success", async () => {
+    const observation = { context: "fresh-world", connection: { ready: true } };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(apiResponse(JSON.stringify({
+      code: "WORLD_CHANGED", error: "World changed", observation,
+    }), { status: 409 })));
+    await expect(daemonRequest(record(), "/window/close", { method: "POST", body: "{}" }))
+      .rejects.toMatchObject({ code: "WORLD_CHANGED", observation });
+  });
+
   it("bounds an HTTP body and reports an unknown POST outcome without resending", async () => {
     let requests = 0;
     let resolveDisconnected!: () => void;
@@ -194,7 +220,8 @@ describe("daemon client", () => {
     const controlPort = await listen(createServer((request, response) => {
       requests++;
       expect(request.method).toBe("POST");
-      response.writeHead(200, { "Content-Type": "application/json", [API_VERSION_HEADER]: API_VERSION });
+      response.writeHead(200, { "Content-Type": "application/json",
+        [API_VERSION_HEADER]: API_VERSION });
       response.write('{"accepted":');
       response.once("close", resolveDisconnected);
     }));
@@ -210,7 +237,8 @@ describe("daemon client", () => {
     let resolveDisconnected!: () => void;
     const disconnected = new Promise<void>(resolve => { resolveDisconnected = resolve; });
     const controlPort = await listen(createServer((_request, response) => {
-      response.writeHead(503, { "Content-Type": "application/json", [API_VERSION_HEADER]: API_VERSION });
+      response.writeHead(503, { "Content-Type": "application/json",
+        [API_VERSION_HEADER]: API_VERSION });
       response.write('{"code":"DAEMON_ERROR",');
       response.once("close", resolveDisconnected);
     }));
@@ -224,7 +252,8 @@ describe("daemon client", () => {
     const controller = new AbortController();
     const reason = new DOMException("Cancelled by caller", "AbortError");
     const controlPort = await listen(createServer((_request, response) => {
-      response.writeHead(200, { "Content-Type": "application/json", [API_VERSION_HEADER]: API_VERSION });
+      response.writeHead(200, { "Content-Type": "application/json",
+        [API_VERSION_HEADER]: API_VERSION });
       response.write('{"value":');
       setTimeout(() => controller.abort(reason), 20);
     }));

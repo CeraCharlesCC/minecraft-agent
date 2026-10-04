@@ -1,2 +1,2 @@
-/** Collection and entity observation contracts changed; reject older running daemons. */
-export const API_VERSION = "3.2";
+/** Client continuation and operation observations require matching CLI/daemon versions. */
+export const API_VERSION = "3.3";

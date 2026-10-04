@@ -1,35 +1,22 @@
 # minecraft-agent
 
-`mc-agent` controls a Minecraft bot through [Mineflayer](https://github.com/PrismarineJS/mineflayer). A local daemon keeps the session between commands. Requires Node.js ≥22.12.0.
+`mc-agent` controls a persistent [Mineflayer](https://github.com/PrismarineJS/mineflayer) bot. Requires Node.js ≥22.12.0.
 
 ```sh
 npm install -g minecraft-agent
+export MC_AGENT_CLIENT_ID=player-one # stable per actor; normally set by the harness
 mc-agent session start --host localhost --username AgentBot --auth offline --auto-reconnect
 mc-agent --output json observe frame
+mc-agent --output json navigate goto --x 10 --y 64 --z 5 --wait 10000
+# Read data.state and data.observation before choosing the next action.
 ```
 
-`session start` streams new chat after startup; keep its process handle and run gameplay commands separately. Use `--no-listen` for one startup response or `chat listen` to attach. Closing the listener leaves the daemon running; `session stop` disconnects.
+Ready frame/find/inspect saves context for that client/session. Without a client ID, or with `--strict-context`, pass `--context`. `--no-observe` omits the attached frame. Only `completed` means success; `timedOut: true` leaves the action running. After world changes, explicitly observe again.
 
-Copy the observation's `data.context` into physical commands. Entity targets require a loaded `trackId` from `entity find`; pass handles unchanged.
+`session start` streams chat; retain its process handle. Use `--no-listen` to return once or `chat listen` to attach. Closing a listener leaves the daemon running; `session stop` disconnects. Stop old daemons with their matching CLI before upgrading to API 3.3.
 
-```sh
-mc-agent --output json navigate goto --x <x> --y <y> --z <z> --context <context> --wait 10000
-mc-agent --output json observe frame
-```
+Arguments: `mc-agent <group> <command> --help`. Agent loop: [skill](skills/minecraft/SKILL.md) or `skills get core`. Contracts: [reference](skills/minecraft/references/playbooks.md) or `skills get core --full`.
 
-Before dependent work, check action state: `completed` is success; `ok: true` means processed. `timedOut: true` leaves work running. Navigation starts with digging/placement disabled.
-
-Dropped items include their stack, and named entities include `customName` when known. Use `mc-agent entity inspect --track <track>` for one entity's item and equipment. `collect item` completes only after confirming this bot picked up the target; it does not guarantee the entire stack. Unavailable facts remain unknown.
-
-Arguments: `mc-agent <group> <command> --help`. Agent loop: [skill](skills/minecraft/SKILL.md) or `skills get core`. Observation, action, replay, and delta contracts: [reference](skills/minecraft/references/playbooks.md) or `skills get core --full`.
-
-```sh
-npm ci
-npm test
-npm run typecheck
-npm run build
-```
-
-`npm run measure:projection` compares synthetic response sizes with the pinned v2 baseline and requires this checkout's git history.
+Development: `npm ci`, `npm test`, `npm run typecheck`, `npm run build`.
 
 MIT · [LICENSE](LICENSE)

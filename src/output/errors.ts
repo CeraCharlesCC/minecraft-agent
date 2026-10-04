@@ -4,6 +4,7 @@ import { API_VERSION } from "../core/protocol.js";
 export type ErrorCode =
   | "BAD_INPUT"
   | "CONTEXT_REQUIRED"
+  | "CLIENT_BUSY"
   | "SESSION_NOT_FOUND"
   | "SESSION_ALREADY_RUNNING"
   | "COMMAND_BLOCKED"
@@ -26,6 +27,8 @@ export class CliError extends Error {
   readonly exitCode: number;
   readonly remediation: string;
   readonly details?: Record<string, unknown>;
+  observation?: unknown;
+  observationError?: { code: string; message: string };
 
   constructor(code: ErrorCode, message: string, remediation: string, exitCode = 1, details?: Record<string, unknown>) {
     super(message);

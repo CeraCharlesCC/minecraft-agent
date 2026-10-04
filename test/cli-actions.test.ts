@@ -54,6 +54,19 @@ afterEach(() => {
 });
 
 describe("CLI actions", () => {
+  it("transmits wait and observation preferences on the original gameplay POST", async () => {
+    const { handlers, mocks } = await loadActionsWithMocks();
+    mocks.loadSessionForClient.mockResolvedValue({ session: "default", controlPort: 3000, token: "secret" });
+    await handlers.navigateGoto({ session: "default", x: 1, y: 64, z: 2, range: 1,
+      context: "saved-context", wait: 10000, observe: false });
+    expect(mocks.daemonRequest).toHaveBeenCalledWith(expect.anything(), "/navigate/goto", {
+      method: "POST", body: JSON.stringify({ context: "saved-context", wait: 10000, observe: false, x: 1, y: 64, z: 2, range: 1 }),
+    });
+    await handlers.actionWait!({ session: "default", action: "r7:a1", timeout: 5000, observe: false });
+    expect(mocks.daemonRequest).toHaveBeenLastCalledWith(expect.anything(), "/actions/r7%3Aa1/wait?timeout=5000&observe=false", {
+      signal: expect.any(AbortSignal),
+    });
+  });
 
   it("waits for the original daemon process even when its session record disappears", async () => {
     const { handlers, mocks } = await loadActionsWithMocks();
@@ -117,10 +130,10 @@ describe("CLI actions", () => {
     const { handlers, mocks } = await loadActionsWithMocks();
     mocks.loadSessionForClient.mockResolvedValue({ token: "secret", controlPort: 3000 });
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("{\"trackId\":\"r7:p1\"}\n", { headers: { "X-MC-Agent-API": "3.2" } })));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("{\"trackId\":\"r7:p1\"}\n", { headers: { "X-MC-Agent-API": "3.3" } })));
     await handlers.observeWatch({ session: "default", since: 0, types: [], track: "r7:p1", fields: ["position", "velocity"], rate: 3 });
-    expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:3000/sample?track=r7%3Ap1&fields=position%2Cvelocity&rate=3", { signal: expect.any(AbortSignal), headers: { Authorization: "Bearer secret", "Content-Type": "application/json" } });
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: "RUNTIME_MISMATCH", error: "Old cursor", remediation: "Observe again", details: { runtimeId: "r8" } }), { status: 409, headers: { "X-MC-Agent-API": "3.2" } })));
+    expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:3000/sample?track=r7%3Ap1&fields=position%2Cvelocity&rate=3", { signal: expect.any(AbortSignal), headers: { Authorization: "Bearer secret", "Content-Type": "application/json", "X-MC-Agent-API": "3.3" } });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: "RUNTIME_MISMATCH", error: "Old cursor", remediation: "Observe again", details: { runtimeId: "r8" } }), { status: 409, headers: { "X-MC-Agent-API": "3.3" } })));
     await expect(handlers.observeWatch({ session: "default", since: "r7:s2", types: [] })).rejects.toMatchObject({ code: "RUNTIME_MISMATCH", details: { runtimeId: "r8" } });
   });
 
@@ -218,7 +231,7 @@ describe("CLI actions", () => {
   it("reports incompatible legacy watch routes", async () => {
     const { handlers, mocks } = await loadActionsWithMocks();
     mocks.loadSessionForClient.mockResolvedValue({ controlPort: 3000, token: "secret" });
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: "not found" }), { status: 404, headers: { "X-MC-Agent-API": "3.2" } })));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: "not found" }), { status: 404, headers: { "X-MC-Agent-API": "3.3" } })));
     await expect(handlers.observeWatch({ session: "default", since: 0, types: [], track: "r7:p1" })).rejects.toMatchObject({
       code: "DAEMON_INCOMPATIBLE", details: { path: "/sample" },
     });
@@ -470,7 +483,7 @@ describe("CLI actions", () => {
           controller.enqueue(new TextEncoder().encode('{"id":1}\n'));
           controller.close();
         },
-      }), { headers: { "X-MC-Agent-API": "3.2" } });
+      }), { headers: { "X-MC-Agent-API": "3.3" } });
     vi.stubGlobal(
       "fetch",
       vi.fn()
@@ -481,23 +494,23 @@ describe("CLI actions", () => {
     await handlers.observeWatch({ session: "default", since: "r7:s7", types: [] });
     expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:3000/watch?since=r7%3As7", {
       signal: expect.any(AbortSignal),
-      headers: { Authorization: "Bearer secret", "Content-Type": "application/json" },
+      headers: { Authorization: "Bearer secret", "Content-Type": "application/json", "X-MC-Agent-API": "3.3" },
     });
     expect(write).toHaveBeenCalledWith(Buffer.from('{"id":1}\n'));
 
     await handlers.observeWatch({ session: "default", since: "r7:s8", types: ["chat", "message"] });
     expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:3000/watch?since=r7%3As8&type=chat&type=message", {
       signal: expect.any(AbortSignal),
-      headers: { Authorization: "Bearer secret", "Content-Type": "application/json" },
+      headers: { Authorization: "Bearer secret", "Content-Type": "application/json", "X-MC-Agent-API": "3.3" },
     });
 
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 500, headers: { "X-MC-Agent-API": "3.2" } })));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 500, headers: { "X-MC-Agent-API": "3.3" } })));
     await expect(handlers.observeWatch({ session: "default", since: 0, types: [] })).rejects.toMatchObject({ code: "DAEMON_ERROR" });
   });
 
   it("passes now and self filtering directly to the daemon", async () => {
     const { handlers } = await loadActionsWithMocks();
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { headers: { "X-MC-Agent-API": "3.2" } })));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { headers: { "X-MC-Agent-API": "3.3" } })));
     await expect(handlers.observeWatch({ session: "default", since: "now", profile: "agent", types: ["chat.player", "chat.whisper", "chat.unverified"], excludeSelf: true })).rejects.toMatchObject({ code: "DAEMON_ERROR" });
     expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:3000/watch?since=now&profile=agent&type=chat.player&type=chat.whisper&type=chat.unverified&excludeSelf=true", expect.anything());
   });
@@ -508,7 +521,7 @@ describe("CLI actions", () => {
     vi.useFakeTimers();
     let controller!: ReadableStreamDefaultController<Uint8Array>;
     const cancel = vi.fn();
-    const response = new Response(new ReadableStream<Uint8Array>({ start(value) { controller = value; }, cancel }), { headers: { "X-MC-Agent-API": "3.2" } });
+    const response = new Response(new ReadableStream<Uint8Array>({ start(value) { controller = value; }, cancel }), { headers: { "X-MC-Agent-API": "3.3" } });
     const fetchMock = vi.fn().mockResolvedValue(response);
     vi.stubGlobal("fetch", fetchMock);
     const failure = new Error("stdout closed");
@@ -563,7 +576,7 @@ describe("CLI actions", () => {
     const { daemonIncompatible } = await import("../src/output/errors.js");
     mocks.daemonRequest.mockRejectedValue(daemonIncompatible("default", { actualApiVersion: "2" }));
     const result = await handlers.listSessions();
-    expect(result).toEqual({ sessions: [{ session: "default", alive: true, ready: false, connection: { state: "unresponsive", ready: false }, error: { code: "DAEMON_INCOMPATIBLE", message: expect.stringContaining("API v3.2") } }] });
+    expect(result).toEqual({ sessions: [{ session: "default", alive: true, ready: false, connection: { state: "unresponsive", ready: false }, error: { code: "DAEMON_INCOMPATIBLE", message: expect.stringContaining("API v3.3") } }] });
     expect(JSON.stringify(result)).not.toContain("private-account");
     expect(JSON.stringify(result)).not.toContain("secret-token");
   });
