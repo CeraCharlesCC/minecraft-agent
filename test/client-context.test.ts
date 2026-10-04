@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -27,6 +27,7 @@ function cli(handlers: Partial<CliHandlers> = {}) {
 let stateDir: string;
 beforeEach(async () => {
   stateDir = await mkdtemp(join(tmpdir(), "mc-client-context-"));
+  vi.stubEnv("MC_AGENT_SHARED_STATE", "false");
   vi.stubEnv("MC_AGENT_STATE_DIR", stateDir);
   vi.stubEnv("MC_AGENT_CLIENT_ID", "agent-a");
   delete process.env.MC_AGENT_STRICT_CONTEXT;
@@ -46,6 +47,30 @@ describe("persisted client context", () => {
     expect(close).toHaveBeenLastCalledWith({ session: "default", context, runtimeId: runtime, worldEpoch: 1, observe: false });
     const files = await readdir(clientContextDirectory("agent-a", "default"));
     expect(files).toEqual(["context.json"]);
+  });
+
+  it("shares all context directories and replacement files with the workspace group", async () => {
+    vi.stubEnv("MC_AGENT_SHARED_STATE", "true");
+    await observe();
+    await observe(changed);
+    const directory = clientContextDirectory("agent-a", "default");
+    const lease = await acquireClientContext("agent-a", "default");
+    expect(lease.context).toBe(changed);
+    await lease.release();
+    if (process.platform !== "win32") {
+      for (const dir of [stateDir, join(stateDir, "clients"), directory]) {
+        expect((await stat(dir)).mode & 0o7777).toBe(0o2770);
+      }
+      expect((await stat(join(directory, "context.json"))).mode & 0o777).toBe(0o660);
+    }
+  });
+
+  it("preserves a foreign namespace lease instead of treating its invisible PID as dead", async () => {
+    vi.stubEnv("MC_AGENT_SHARED_STATE", "true");
+    const directory = clientContextDirectory("agent-a", "default");
+    await mkdir(join(directory, "lease-999999-ns0-foreign"), { recursive: true });
+    await expect(acquireClientContext("agent-a", "default")).rejects.toMatchObject({ code: "CLIENT_BUSY" });
+    expect(await readdir(directory)).toEqual(["lease-999999-ns0-foreign"]);
   });
 
   it("keeps clients and sessions separate and requires ID-less commands to be explicit", async () => {

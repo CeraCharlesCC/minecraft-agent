@@ -1,7 +1,7 @@
 import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createSessionToken,
   getStateDir,
@@ -16,6 +16,7 @@ import {
 } from "../src/session/store.js";
 
 const tempDirs: string[] = [];
+beforeEach(() => vi.stubEnv("MC_AGENT_SHARED_STATE", "false"));
 
 async function makeTempDir() {
   const dir = await mkdtemp(join(tmpdir(), "mc-agent-session-"));
@@ -39,6 +40,7 @@ function record(overrides: Partial<SessionRecord> = {}): SessionRecord {
 }
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -92,6 +94,30 @@ describe("session store", () => {
     if (process.platform !== "win32") {
       expect(fileMode).toBe(0o600);
     }
+  });
+
+  it("retains group permissions after repeated atomic writes in shared state", async () => {
+    vi.stubEnv("MC_AGENT_SHARED_STATE", "true");
+    const dir = await makeTempDir();
+    const saved = record();
+    await writeSession(saved, dir);
+    await writeSession({ ...saved, stopping: true }, dir);
+    expect((await readSession("default", dir))?.stopping).toBe(true);
+    if (process.platform !== "win32") {
+      expect((await stat(dir)).mode & 0o7777).toBe(0o2770);
+      expect((await stat(sessionFilePath("default", dir))).mode & 0o777).toBe(0o660);
+    }
+  });
+
+  it("does not delete a live record from a different PID namespace", async () => {
+    const dir = await makeTempDir();
+    await writeSession(record({ pid: 999_999, pidNamespace: "pid:[foreign]" }), dir);
+    const alive = vi.fn(() => false);
+    const stored = await readSession("default", dir, alive);
+    expect(stored?.pidNamespace).toBe("pid:[foreign]");
+    expect(alive).not.toHaveBeenCalled();
+    expect(toPublicSession(stored!).alive).toBe(true);
+    expect((await listSessions(dir, alive)).length).toBe(1);
   });
 
   it("removes stale sessions when their pid is no longer alive", async () => {

@@ -17,6 +17,7 @@ async function loadActionsWithMocks() {
   const record = { ...startInput(), pid: process.pid, controlPort: 3000, token: "private-token", startedAt: "2026-10-04T00:00:00Z" };
   const mocks = {
     isProcessAlive: vi.fn().mockReturnValue(false),
+    samePidNamespace: vi.fn(store.samePidNamespace),
     daemonRequest: vi.fn(),
     loadSessionForClient: vi.fn().mockResolvedValue(record),
     runDaemon: vi.fn(),
@@ -36,6 +37,9 @@ async function loadActionsWithMocks() {
   vi.doMock("../src/daemon/spawn.js", () => ({ spawnSessionDaemon: mocks.spawnSessionDaemon }));
   vi.doMock("../src/session/store.js", () => ({
     isProcessAlive: mocks.isProcessAlive,
+    samePidNamespace: mocks.samePidNamespace,
+    isSessionProcessAlive: (record: import("../src/session/store.js").SessionRecord) =>
+      !mocks.samePidNamespace(record) || mocks.isProcessAlive(record.pid),
     listSessions: mocks.listSessions,
     readSession: mocks.readSession,
     removeSession: mocks.removeSession,
@@ -85,6 +89,20 @@ describe("CLI actions", () => {
     const completed = handlers.stopSession({ session: "default" });
     await vi.advanceTimersByTimeAsync(100);
     await expect(completed).resolves.toMatchObject({ session: "default", stopped: true, timedOut: false });
+  });
+
+  it("confirms foreign-namespace shutdown by record removal without checking an unrelated PID", async () => {
+    const { handlers, mocks } = await loadActionsWithMocks();
+    vi.useFakeTimers();
+    const original = { session: "default", pid: 123, token: "original", controlPort: 3000, pidNamespace: "pid:[foreign]" };
+    mocks.loadSessionForClient.mockResolvedValue(original);
+    mocks.samePidNamespace.mockReturnValue(false);
+    mocks.daemonRequest.mockResolvedValue({ stopping: true });
+    mocks.readSession.mockResolvedValueOnce(original).mockResolvedValue(undefined);
+    const pending = handlers.stopSession({ session: "default" });
+    await vi.advanceTimersByTimeAsync(200);
+    await expect(pending).resolves.toMatchObject({ stopped: true, timedOut: false });
+    expect(mocks.isProcessAlive).not.toHaveBeenCalled();
   });
 
   it("forwards recovery, compact frame, canonical species, profile, and action wait requests", async () => {

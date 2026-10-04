@@ -5,7 +5,7 @@ import { CliError, daemonIncompatible, sessionNotFound } from "../output/errors.
 import { daemonErrorCode, daemonRequest, daemonStreamRequest, loadSessionForClient } from "../daemon/client.js";
 import { runDaemon } from "../daemon/server.js";
 import { spawnSessionDaemon } from "../daemon/spawn.js";
-import { isProcessAlive, listSessions, readSession, removeSession, toPublicSession } from "../session/store.js";
+import { isSessionProcessAlive, samePidNamespace, listSessions, readSession, removeSession, toPublicSession } from "../session/store.js";
 
 function appendEventTypes(params: URLSearchParams, types: readonly string[]): void {
   for (const type of types) {
@@ -28,7 +28,7 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
     async startSession(input) {
       const existing = await readSession(input.session);
       if (existing) {
-        if (existing.stopping && isProcessAlive(existing.pid)) {
+        if (existing.stopping && isSessionProcessAlive(existing)) {
           throw new CliError("SESSION_ALREADY_RUNNING", `Session '${input.session}' is still stopping.`,
             "Wait for the original daemon to exit before starting this session again.", 1);
         }
@@ -48,7 +48,7 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
             1,
           );
         }
-        if (isProcessAlive(existing.pid)) {
+        if (isSessionProcessAlive(existing)) {
           throw new CliError("DAEMON_ERROR", `Session '${input.session}' is not responding, but its recorded process is still alive.`,
             "Retry session status or stop the original session before starting another daemon. The existing record was preserved.", 1,
             { session: input.session, pid: existing.pid });
@@ -99,7 +99,9 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       const deadline = Date.now() + 5000;
       while (Date.now() < deadline) {
         // Keep the original process identity even if the session record disappears or is replaced.
-        if (!isProcessAlive(record.pid)) return { session: input.session, stopped: true, timedOut: false };
+        const current = samePidNamespace(record) ? undefined : await readSession(input.session);
+        const stopped = samePidNamespace(record) ? !isSessionProcessAlive(record) : !current || current.token !== record.token;
+        if (stopped) return { session: input.session, stopped: true, timedOut: false };
         await new Promise(resolve => setTimeout(resolve, 100));
       }
       return { session: input.session, stopping: true, stopped: false, timedOut: true };

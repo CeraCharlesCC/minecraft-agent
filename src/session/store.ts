@@ -1,11 +1,13 @@
+import { readlinkSync } from "node:fs";
 import { randomBytes } from "node:crypto";
-import { chmod, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 
 export interface SessionRecord {
   session: string;
   pid: number;
+  pidNamespace?: string;
   controlPort: number;
   token: string;
   host: string;
@@ -35,6 +37,38 @@ const TOKEN_PATTERN = /^[A-Za-z0-9._~-]{5,}$/;
 
 export function getStateDir(): string {
   return process.env.MC_AGENT_STATE_DIR ?? join(homedir(), ".minecraft-agent", "sessions");
+}
+
+/** Opt in only for a workspace shared by trusted local users. */
+export function sharedState(): boolean {
+  const value = process.env.MC_AGENT_SHARED_STATE;
+  if (value === undefined || /^(false|0)$/i.test(value)) return false;
+  if (/^(true|1)$/i.test(value)) return true;
+  throw new Error("MC_AGENT_SHARED_STATE must be true or false.");
+}
+
+export function stateFileMode(): number { return sharedState() ? 0o660 : 0o600; }
+
+export async function ensureStateDirectory(directory: string): Promise<void> {
+  const mode = sharedState() ? 0o2770 : 0o700;
+  await mkdir(directory, { recursive: true, mode });
+  if (sharedState()) {
+    if (((await stat(directory)).mode & 0o7777) !== mode) await chmod(directory, mode);
+  } else { await chmodBestEffort(directory, mode); }
+}
+
+export function pidNamespace(): string | undefined {
+  try { return readlinkSync("/proc/self/ns/pid"); } catch { return undefined; }
+}
+
+export function samePidNamespace(record: SessionRecord): boolean {
+  const current = pidNamespace();
+  return !record.pidNamespace || !current || record.pidNamespace === current;
+}
+
+/** A foreign namespace cannot prove that the recorded process has exited. */
+export function isSessionProcessAlive(record: SessionRecord): boolean {
+  return !samePidNamespace(record) || isProcessAlive(record.pid);
 }
 
 export function createSessionToken(bytes = 32): string {
@@ -68,15 +102,17 @@ export async function writeSession(record: SessionRecord, stateDir = getStateDir
   validateSessionName(record.session);
   assertToken(record.token);
 
-  await mkdir(stateDir, { recursive: true, mode: 0o700 });
-  await chmodBestEffort(stateDir, 0o700);
+  await ensureStateDirectory(stateDir);
   const destination = sessionFilePath(record.session, stateDir);
   const temporary = `${destination}.${randomBytes(8).toString("hex")}.tmp`;
+  const stored = { ...record, pidNamespace: record.pidNamespace ?? pidNamespace() };
+  const mode = stateFileMode();
   try {
-    await writeFile(temporary, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+    await writeFile(temporary, `${JSON.stringify(stored, null, 2)}\n`, { mode });
+    await chmodBestEffort(temporary, mode);
     await rename(temporary, destination);
   } finally { await rm(temporary, { force: true }); }
-  await chmodBestEffort(destination, 0o600);
+  await chmodBestEffort(destination, mode);
 }
 
 export async function readSession(
@@ -90,7 +126,7 @@ export async function readSession(
     validateSessionName(record.session);
     assertToken(record.token);
 
-    if (!alive(record.pid)) {
+    if (samePidNamespace(record) && !alive(record.pid)) {
       await removeSession(record.session, stateDir);
       return undefined;
     }
@@ -143,7 +179,7 @@ export function isProcessAlive(pid: number): boolean {
 export function toPublicSession(record: SessionRecord, detail: "compact" | "full" = "compact"): PublicSessionRecord {
   return {
     session: record.session,
-    alive: isProcessAlive(record.pid),
+    alive: isSessionProcessAlive(record),
     ...(detail === "full" ? { pid: record.pid, controlPort: record.controlPort,
       host: record.host, port: record.port, auth: record.auth,
       ...(record.version !== undefined ? { version: record.version } : {}), startedAt: record.startedAt } : {}),

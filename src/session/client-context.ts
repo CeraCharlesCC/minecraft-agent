@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { decodeActionContext } from "../core/context.js";
 import { badInput, CliError } from "../output/errors.js";
-import { getStateDir, isProcessAlive, validateSessionName } from "./store.js";
+import { ensureStateDirectory, getStateDir, isProcessAlive, pidNamespace, sharedState, stateFileMode, validateSessionName } from "./store.js";
 
 interface SavedContext { version: 1; context: string; revision: string }
 
@@ -51,10 +51,13 @@ export interface ClientContextLease {
 /** Atomic tickets refuse overlap without queues. Dead-process tickets never replay work. */
 export async function acquireClientContext(clientId: string, session: string, stateDir = getStateDir()): Promise<ClientContextLease> {
   const directory = clientContextDirectory(clientId, session, stateDir);
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  const ticket = `lease-${process.pid}-${randomUUID()}`;
+  await ensureStateDirectory(stateDir);
+  await ensureStateDirectory(join(stateDir, "clients"));
+  await ensureStateDirectory(directory);
+  const namespace = pidNamespace()?.match(/\d+/)?.[0];
+  const ticket = `lease-${process.pid}-${namespace ? `ns${namespace}-` : ""}${randomUUID()}`;
   const ticketPath = join(directory, ticket);
-  await mkdir(ticketPath, { mode: 0o700 });
+  await ensureStateDirectory(ticketPath);
   let released = false;
   const release = async () => {
     if (released) return;
@@ -63,9 +66,10 @@ export async function acquireClientContext(clientId: string, session: string, st
   };
   try {
     for (const entry of await readdir(directory)) {
-      const match = /^lease-(\d+)-/.exec(entry);
+      const match = /^lease-(\d+)-(?:ns(\d+)-)?/.exec(entry);
       if (!match || entry === ticket) continue;
-      if (!isProcessAlive(Number(match[1]))) {
+      const comparable = match[2] ? match[2] === namespace : !sharedState();
+      if (comparable && !isProcessAlive(Number(match[1]))) {
         await rm(join(directory, entry), { recursive: true, force: true });
         continue;
       }
@@ -89,7 +93,9 @@ export async function acquireClientContext(clientId: string, session: string, st
         const replacement: SavedContext = { version: 1, context: value.context, revision: randomUUID() };
         const temporary = join(directory, `${replacement.revision}.tmp`);
         try {
-          await writeFile(temporary, `${JSON.stringify(replacement)}\n`, { mode: 0o600, flag: "wx" });
+          const mode = stateFileMode();
+          await writeFile(temporary, `${JSON.stringify(replacement)}\n`, { mode, flag: "wx" });
+          await chmod(temporary, mode);
           if (released) return undefined;
           await rename(temporary, join(directory, "context.json"));
           saved = replacement;
