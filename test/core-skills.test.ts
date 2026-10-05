@@ -1,9 +1,14 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import { EventStore } from "../src/core/events.js";
 import { getSkillContent } from "../src/core/skills.js";
+import { COMMAND_REFERENCE } from "../src/core/command-reference.js";
+import { buildProgram } from "../src/cli/program.js";
+import type { CliHandlers } from "../src/cli/handlers.js";
+import { renderCommandReference, renderReferenceFile, renderSkillFile } from "../scripts/generate-reference.js";
 
 describe("core skill content", () => {
-  it("returns compact guidance and optional discovery notes", () => {
+  it("keeps the entrypoint compact and includes syntax and contracts in full", () => {
     const compact = getSkillContent("core", false);
     const full = getSkillContent("core", true);
 
@@ -11,6 +16,15 @@ describe("core skill content", () => {
     expect(compact.length).toBeLessThan(1600);
     expect(full.startsWith(`${compact}\n\n`)).toBe(true);
     expect(full.length).toBeGreaterThan(compact.length);
+  });
+
+  it("keeps bundled syntax and distributed guidance current with the CLI", () => {
+    const program = buildProgram({} as CliHandlers, { stdout: process.stdout, stderr: process.stderr });
+    const syntax = renderCommandReference(program);
+    expect(COMMAND_REFERENCE).toBe(syntax);
+    expect(getSkillContent("core", true)).toContain(syntax);
+    expect(readFileSync(new URL("../skills/minecraft/SKILL.md", import.meta.url), "utf8")).toBe(renderSkillFile());
+    expect(readFileSync(new URL("../skills/minecraft/references/playbooks.md", import.meta.url), "utf8")).toBe(renderReferenceFile(syntax));
   });
 
   it("rejects unknown skill names", () => {

@@ -52,6 +52,7 @@
     "coverage": "vitest run --coverage",
     "prepack": "npm run build",
     "test": "vitest run",
+    "docs:generate": "tsx scripts/generate-reference.ts",
     "measure:projection": "tsx scripts/measure-v3-projection.ts",
     "typecheck": "tsc --noEmit",
     "measure:loop": "tsx scripts/measure-v33-loop.ts",

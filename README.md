@@ -19,10 +19,10 @@ Ready frame/surroundings/find/inspect saves context for that client/session. Wit
 
 `observe frame` reports inventory, controls, the current window, and the observed vehicle. Use `entity interact` to right-click, `entity mount` for confirmed riding, and `action stop` to stop resource owners and clear controls.
 
-Arguments: `mc-agent <group> <command> --help`. Agent loop: [skill](skills/minecraft/SKILL.md) or `skills get core`. Contracts: [reference](skills/minecraft/references/playbooks.md) or `skills get core --full`.
+Before play, read `mc-agent skills get core --full` once for command syntax and contracts; reuse it while in context and on the same CLI version. Use command `--help` for missing syntax or version mismatches. Short loop: [skill](skills/minecraft/SKILL.md) or `skills get core`. Full reference: [reference](skills/minecraft/references/playbooks.md).
 
 Nearby surfaces: `mc-agent observe surroundings [--range 32] [--detail] [--bounds=-8,-4,-8:8,4,8]`. This fresh scan uses fixed world axes; omitted surfaces mean unobserved, and visible floors do not establish safe routes.
 
-Development: `npm ci`, `npm test`, `npm run typecheck`, `npm run build`.
+Development: `npm ci`, `npm test`, `npm run typecheck`, `npm run build`. After changing CLI definitions or guidance, run `npm run docs:generate` to refresh the bundled syntax and skill/reference files.
 
 MIT · [LICENSE](LICENSE)
