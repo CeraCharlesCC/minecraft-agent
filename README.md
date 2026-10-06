@@ -1,28 +1,43 @@
-# @ceracharlescc/minecraft-agent
+# Minecraft Agent
 
-Fork of [justjavac/minecraft-agent](https://github.com/justjavac/minecraft-agent), maintained by [CeraCharlesCC](https://github.com/CeraCharlesCC). Source and issues: [CeraCharlesCC/minecraft-agent](https://github.com/CeraCharlesCC/minecraft-agent).
+A stateful Minecraft CLI for agents, powered by [Mineflayer](https://github.com/PrismarineJS/mineflayer). `mc-agent` keeps a bot connected between commands and provides structured observations and actions for navigation, inventory, and world interaction.
 
-`mc-agent` controls a persistent [Mineflayer](https://github.com/PrismarineJS/mineflayer) bot. Requires Node.js ≥22.12.0.
+## Quick start
+
+Requires **Node.js ≥22.12.0** and a Minecraft server the bot can join.
 
 ```sh
 npm install -g @ceracharlescc/minecraft-agent
-export MC_AGENT_CLIENT_ID=player-one # stable per actor; normally set by the harness
-mc-agent session start --host localhost --username AgentBot --auth offline --auto-reconnect
-mc-agent --output json observe frame
-mc-agent --output json navigate goto --x 10 --y 64 --z 5 --wait 10000
-# Read data.state and data.observation before choosing the next action.
 ```
 
-Ready frame/surroundings/find/inspect saves context for that client/session. Without a client ID, or with `--strict-context`, pass `--context`. `--no-observe` omits the attached frame. Only `completed` means success; `timedOut: true` leaves the action running. After world changes, explicitly observe again.
+Connect to a local server with offline authentication and inspect the bot's state:
 
-`session start` streams chat; retain its process handle. Use `--no-listen` to return once or `chat listen` to attach. Closing a listener leaves the daemon running; `session stop` disconnects.
+```sh
+mc-agent session start --host localhost --username AgentBot --auth offline --no-listen
+mc-agent --output json observe frame
+mc-agent session stop
+```
 
-`observe frame` reports inventory, controls, the current window, and the observed vehicle. Use `entity interact` to right-click, `entity mount` for confirmed riding, and `action stop` to stop resource owners and clear controls.
+## Documentation
 
-Before play, read `mc-agent skills get core --full` once for command syntax and contracts; reuse it while in context and on the same CLI version. Use command `--help` for missing syntax or version mismatches. Short loop: [skill](skills/minecraft/SKILL.md) or `skills get core`. Full reference: [reference](skills/minecraft/references/playbooks.md).
+- [Agent skill](skills/minecraft/SKILL.md) — operating instructions for agents.
+- [Command reference](skills/minecraft/references/playbooks.md) — command syntax, options, and behavior.
 
-Nearby surfaces: `mc-agent observe surroundings [--range 32] [--detail] [--bounds=-8,-4,-8:8,4,8]`. This fresh scan uses fixed world axes; omitted surfaces mean unobserved, and visible floors do not establish safe routes.
+The full guide is also available from the CLI via `mc-agent skills get core --full`.
 
-Development: `npm ci`, `npm test`, `npm run typecheck`, `npm run build`. After changing CLI definitions or guidance, run `npm run docs:generate` to refresh the bundled syntax and skill/reference files.
+## Development
 
-MIT · [LICENSE](LICENSE)
+```sh
+npm ci
+npm test
+npm run typecheck
+npm run build
+```
+
+After changing CLI definitions or guidance, run `npm run docs:generate` to refresh the bundled syntax and skill/reference files.
+
+## Credits and license
+
+Fork of [justjavac/minecraft-agent](https://github.com/justjavac/minecraft-agent), maintained by [CeraCharlesCC](https://github.com/CeraCharlesCC). [Source](https://github.com/CeraCharlesCC/minecraft-agent) · [Issues](https://github.com/CeraCharlesCC/minecraft-agent/issues).
+
+Released under the [MIT License](LICENSE).
