@@ -45,7 +45,7 @@ const transientTransportCodes = new Set(["EPIPE", "ECONNRESET", "ECONNREFUSED", 
 const terminalAuthCodes = new Set(["EAUTH", "AUTHENTICATION_FAILED", "INVALID_CREDENTIALS", "UNAUTHORIZED"]);
 
 type MineflayerBot = EventEmitter & {
-  _client?: { write(name: string, params: unknown): unknown };
+  _client?: { write(name: string, params: unknown): unknown } & Partial<Pick<EventEmitter, "rawListeners" | "removeListener">>;
   username?: string;
   entity?: MineflayerEntity;
   vehicle?: MineflayerEntity | null;
@@ -119,6 +119,7 @@ type MineflayerBot = EventEmitter & {
   recipesFor?(itemType: number, metadata: number | null, minResultCount: number | null, craftingTable: MineflayerBlock | boolean | null): unknown[];
   craft?(recipe: unknown, count?: number, craftingTable?: MineflayerBlock): Promise<void>;
   openContainer?(target: MineflayerBlock | MineflayerEntity, direction?: Vec3, cursorPos?: Vec3): Promise<MineflayerWindow>;
+  openVillager?(entity: MineflayerEntity): Promise<MineflayerWindow>;
   clickWindow?(slot: number, mouseButton: number, mode: number): Promise<void>;
   closeWindow?(window: MineflayerWindow): void;
   pathfinder?: {
@@ -1595,7 +1596,7 @@ export class BotController {
   async openWindowAt(x: number, y: number, z: number) {
     const verify = this.continuationGuard(["window"]);
     const block = this.getRequiredBlock(x, y, z);
-    const window = await this.openContainerObserved(block);
+    const window = await this.openWindowObserved(block, "openContainer");
     try { verify(); } catch (error) { window.close?.(); throw error; }
     return { opened: true, block: serializeBlock(block), window: serializeWindow(window) };
   }
@@ -1603,7 +1604,8 @@ export class BotController {
   async openEntityWindow(id: number | string) {
     const verify = this.continuationGuard(["window"]);
     const entity = this.getRequiredEntity(id);
-    const window = await this.openContainerObserved(entity);
+    const method = entitySpecies(entity, this.requireBot().registry) === "minecraft:villager" ? "openVillager" : "openContainer";
+    const window = await this.openWindowObserved(entity, method);
     try { verify(); if (typeof id === "string") this.getRequiredEntity(id); }
     catch (error) { window.close?.(); throw error; }
     return { opened: true, entity: this.publicEntity(entity), window: serializeWindow(window) };
@@ -1776,15 +1778,29 @@ export class BotController {
     };
   }
 
-  private async openContainerObserved(target: MineflayerBlock | MineflayerEntity): Promise<MineflayerWindow> {
+  private async openWindowObserved(target: MineflayerBlock | MineflayerEntity, method: "openContainer" | "openVillager"): Promise<MineflayerWindow> {
     const bot = this.requireBot();
     const before = new Set(bot.rawListeners("windowOpen"));
-    const result = this.requireMethod("openContainer").call(bot, target);
+    const client = bot._client;
+    // openVillager registers a persistent trade-list listener before awaiting
+    // windowOpen. Keep it on success for updates; remove it on failure or stop.
+    const tradeEvents = method === "openVillager" ? ["trade_list", "MC|TrList", "minecraft:trader_list"] : [];
+    const beforeTrades = tradeEvents.map(event => new Set(client?.rawListeners?.(event)));
+    const result = method === "openVillager"
+      ? this.requireMethod("openVillager").call(bot, target as MineflayerEntity)
+      : this.requireMethod("openContainer").call(bot, target);
     const added = bot.rawListeners("windowOpen").filter((listener) => !before.has(listener));
-    const cleanup = () => { for (const listener of added) bot.removeListener("windowOpen", listener); };
+    const addedTrades = tradeEvents.map((event, index) => (client?.rawListeners?.(event) ?? []).filter(listener => !beforeTrades[index]!.has(listener)));
+    const cleanup = (keepTrades = false) => {
+      for (const listener of added) bot.removeListener("windowOpen", listener);
+      if (!keepTrades) tradeEvents.forEach((event, index) => {
+        for (const listener of addedTrades[index]!) client?.removeListener?.(event, listener);
+      });
+    };
     this.pendingWindowListeners.add(cleanup);
-    try { return await result; }
-    finally { cleanup(); this.pendingWindowListeners.delete(cleanup); }
+    let opened = false;
+    try { const window = await result; opened = true; return window; }
+    finally { cleanup(opened); this.pendingWindowListeners.delete(cleanup); }
   }
 
   private requirePathfinder(): NonNullable<MineflayerBot["pathfinder"]> {
