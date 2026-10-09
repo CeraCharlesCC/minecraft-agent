@@ -23,7 +23,7 @@ function sendJson(response: ServerResponse, statusCode: number, body: unknown): 
 
 const controlNames = new Set(["forward", "back", "left", "right", "jump", "sprint", "sneak"]);
 const physicalRoutes = new Set([
-  "/navigate/goto", "/navigate/follow", "/collect/item",
+  "/navigate/goto", "/navigate/approach", "/navigate/follow", "/collect/item",
   "/control/tap", "/control/set", "/look/at", "/advanced/look", "/look/track",
   "/inventory/equip", "/inventory/unequip", "/inventory/quickbar", "/inventory/toss", "/inventory/consume",
   "/inventory/fish", "/inventory/activate-item", "/inventory/craft",
@@ -406,6 +406,11 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
         let continuous = false;
         switch (path) {
           case "/navigate/goto": { const [x,y,z] = coordinates(), r = range(1); resources = ["movement", "look"]; run = () => controller.goto(x,y,z,r); break; }
+          case "/navigate/approach": {
+            target = track(); const r = range(2);
+            if (body.bestEffort !== undefined && typeof body.bestEffort !== "boolean") throw badInput("Invalid bestEffort.");
+            resources = ["movement", "look"]; run = () => controller.approachTrack(target!, r, body.bestEffort === true); break;
+          }
           case "/collect/item": { target = track(); const r = range(1,8); resources = ["movement", "look"]; run = () => controller.collectItem(target!,r); break; }
           case "/control/tap": { const state = text("state"), ms = integer("durationMs",1,30000,500); if (!controlNames.has(state) || ms < 1 || ms > 30000) throw badInput("Invalid control or duration."); resources = ["movement"]; run = () => controller.tap(state,ms); break; }
           case "/control/set": { const state = text("state"); if (!controlNames.has(state) || typeof body.value !== "boolean") throw badInput("Invalid control."); resources = ["movement"]; continuous = body.value; run = () => controller.setControl(state, body.value as boolean); break; }

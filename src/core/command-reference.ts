@@ -37,6 +37,7 @@ Prefix each row with \`mc-agent\` (or the harness wrapper). \`<…>\` needs a va
 * look track --track <track>
 
 * navigate goto --x <number> --y <number> --z <number> [--range 1]
+* navigate approach --track <track> [--range 2] [--best-effort]
 * navigate follow --track <track> [--range 2]
 * navigate configure [--allow-dig] [--allow-place] [--no-place] [--no-dig] [--allow-sprinting] [--no-sprinting] [--allow-parkour] [--no-parkour] [--can-open-doors] [--max-drop-down <blocks>]
 

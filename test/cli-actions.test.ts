@@ -58,6 +58,15 @@ afterEach(() => {
 });
 
 describe("CLI actions", () => {
+  it("transmits partial-approach opt-in with context and response preferences", async () => {
+    const { handlers, mocks } = await loadActionsWithMocks();
+    await handlers.navigateApproach({ session: "default", track: "track", range: 1, bestEffort: true,
+      context: "context", wait: 1000, observe: false });
+    const [, path, options] = mocks.daemonRequest.mock.calls[0]!;
+    expect(path).toBe("/navigate/approach");
+    expect(options.method).toBe("POST");
+    expect(JSON.parse(options.body)).toEqual({ track: "track", range: 1, bestEffort: true, context: "context", wait: 1000, observe: false });
+  });
   it("transmits surroundings filters to a fresh read endpoint", async () => {
     const { handlers, mocks } = await loadActionsWithMocks();
     await handlers.observeSurroundings!({ session: "default", range: 8, detail: true, bounds: { min: [-2, -1, -2], max: [2, 4, 2] } });

@@ -117,6 +117,22 @@ afterEach(async () => {
 });
 
 describe("daemon server", () => {
+  it("serves finite track approach and rejects invalid direct HTTP options", async () => {
+    const daemon = await responseDaemon("approach");
+    try {
+      const frame = await daemon.get("/frame");
+      const track = frame.entities[0].trackId;
+      for (const body of [{ range: 0 }, { range: 33 }, { bestEffort: "true" }]) {
+        const response = await daemon.post("/navigate/approach", { context: daemon.context, track, ...body });
+        expect(response.status).toBe(400);
+        expect(await response.json()).toMatchObject({ code: "BAD_INPUT" });
+      }
+      const response = await daemon.post("/navigate/approach", { context: daemon.context, track, range: 2, bestEffort: true, wait: 1000 });
+      expect(await response.json()).toMatchObject({ kind: "navigate.approach", target: track, state: "completed", timedOut: false,
+        result: { completionReason: "already_within_range", goalSatisfied: true, distanceToTarget: 2 },
+        observation: { context: daemon.context } });
+    } finally { await daemon.close(); }
+  });
   it("separates movement policy from pathfinder tuning and keeps policy responses compact", async () => {
     const daemon = await responseDaemon("navigation-policy");
     const { bot, context, post } = daemon;

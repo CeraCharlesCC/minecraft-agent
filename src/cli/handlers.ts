@@ -130,6 +130,10 @@ export interface NavigateFollowInput extends SessionInput {
   range: number;
 }
 
+export interface NavigateApproachInput extends NavigateFollowInput {
+  bestEffort: boolean;
+}
+
 export interface NavigateConfigureInput extends SessionInput {
   allowDig?: boolean;
   allowPlace?: boolean;
@@ -264,6 +268,7 @@ export interface CliHandlers {
   worldBlockAtCursor(input: CursorBlockInput): Promise<unknown>;
   worldFindBlocks(input: FindBlocksInput): Promise<unknown>;
   navigateGoto(input: NavigateGotoInput): Promise<unknown>;
+  navigateApproach(input: NavigateApproachInput): Promise<unknown>;
   navigateFollow(input: NavigateFollowInput): Promise<unknown>;
   navigateConfigure(input: NavigateConfigureInput): Promise<unknown>;
   navigateTune(input: NavigateTuningInput): Promise<unknown>;

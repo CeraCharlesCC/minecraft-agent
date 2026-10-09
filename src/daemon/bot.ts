@@ -3,6 +3,8 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { createBot } from "mineflayer";
 import pathfinderPackage from "mineflayer-pathfinder";
+import type { PartiallyComputedPath } from "mineflayer-pathfinder";
+import { ApproachGoal } from "./approach.js";
 import { Vec3 } from "vec3";
 import { EventStore, detachData } from "../core/events.js";
 import { WorldModel, FrameOptions, projectItem, projectWindow, projectEntity, entitySpecies, observedDroppedItem } from "../core/world.js";
@@ -127,6 +129,9 @@ type MineflayerBot = EventEmitter & {
     tickTimeout?: number;
     searchRadius?: number;
     readonly movements?: PathfinderMovements;
+    getPathFromTo?(movements: PathfinderMovements, start: Vec3, goal: InstanceType<(typeof goals)["Goal"]>,
+      options: { timeout: number; tickTimeout: number; searchRadius: number; optimizePath: boolean }):
+      IterableIterator<{ result: PartiallyComputedPath }>;
     setMovements(movements: PathfinderMovements): void;
     goto(goal: PathfinderGoal): Promise<void>;
     setGoal(goal: PathfinderGoal | null, dynamic?: boolean): void;
@@ -1230,6 +1235,72 @@ export class BotController {
 
   async goto(x: number, y: number, z: number, range: number) {
     return this.navigateNear(x, y, z, range);
+  }
+
+  async approachTrack(track: string, range: number, bestEffort: boolean) {
+    const bot = this.requireBot(), pathfinder = this.requirePathfinder();
+    const movements = this.configurePathfinderMovements();
+    const guard = this.continuationGuard(["movement", "look"]);
+    let expired = false, pathStatus: string | undefined, attempts = 0;
+    const failure = (reason: string) => new CliError("NAVIGATION_FAILED", "Approach did not reach the requested range.",
+      "Inspect the target and terrain, or use --best-effort for partial approach.", 1,
+      { reason, trackId: track, pathStatus });
+    const verify = () => { guard(); if (expired) throw failure("TIMEOUT"); };
+    const evaluate = () => {
+      const targetPosition = observedEntityPosition(this.getRequiredEntity(track));
+      if (!targetPosition) throw commandBlocked("Target position is not yet observed.", "Observe the target before approaching.");
+      const finalPosition = { ...this.requireObservedSelfPosition() };
+      const distanceToTarget = distance(finalPosition, targetPosition)!;
+      return { finalPosition, targetPosition: { ...targetPosition }, distanceToTarget, goalSatisfied: distanceToTarget <= range };
+    };
+    const initial = evaluate();
+    const result = (completionReason: string) => {
+      const final = evaluate();
+      return { completionReason, trackId: track, range, startDistance: initial.distanceToTarget,
+        ...final, progress: final.distanceToTarget < initial.distanceToTarget - 0.01, pathStatus, attempts };
+    };
+    if (initial.goalSatisfied) return result("already_within_range");
+    if (!movements || !pathfinder.getPathFromTo) throw commandBlocked("Path planning is not available.", "Check the navigation runtime.");
+    const run = async () => {
+      // Re-read the target after movement, but never chase it indefinitely.
+      for (; attempts < 3;) {
+        verify();
+        const current = evaluate();
+        if (current.goalSatisfied) return result("within_range");
+        const goal = new ApproachGoal(current.targetPosition, range);
+        let plan: PartiallyComputedPath | undefined;
+        const search = pathfinder.getPathFromTo!(movements, new Vec3(current.finalPosition.x, current.finalPosition.y, current.finalPosition.z), goal, {
+          timeout: Math.min(pathfinder.thinkTimeout ?? 5000, 5000), tickTimeout: Math.min(pathfinder.tickTimeout ?? 40, 40),
+          searchRadius: pathfinder.searchRadius === undefined || pathfinder.searchRadius < 0 ? 64 : Math.min(pathfinder.searchRadius, 64),
+          optimizePath: false,
+        });
+        for (const step of search) {
+          verify(); plan = step.result;
+          if (plan.status !== "partial") break;
+          await new Promise<void>(resolve => setImmediate(resolve));
+        }
+        verify(); pathStatus = plan?.status;
+        if (!plan || (plan.status !== "success" && !bestEffort)) throw failure(plan?.status === "timeout" ? "TIMEOUT" : "NO_PATH");
+        const endpoint = plan.path.at(-1);
+        if (!endpoint || goal.nodeDistance(endpoint) >= current.distanceToTarget - 0.01) break;
+        attempts++;
+        // Give the reachable endpoint its own exact goal; noPath is not arrival.
+        await this.navigateNear(endpoint.x, endpoint.y, endpoint.z, 0);
+        verify();
+        const after = evaluate();
+        if (after.goalSatisfied) return result("within_range");
+        if (after.distanceToTarget >= current.distanceToTarget - 0.01) break;
+      }
+      verify();
+      if (bestEffort) return result("best_effort");
+      throw failure("GOAL_NOT_REACHED");
+    };
+    let timer: ReturnType<typeof setTimeout>;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => { expired = true; reject(failure("TIMEOUT")); }, 30_000);
+    });
+    try { return await Promise.race([run(), deadline]); }
+    finally { clearTimeout(timer!); }
   }
 
   private async navigateNear(x: number, y: number, z: number, range: number) {

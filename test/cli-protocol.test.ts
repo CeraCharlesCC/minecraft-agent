@@ -59,6 +59,18 @@ function makeProgram(version = "0.0.0") {
 describe("CLI protocol", () => {
 
   it.each([
+    { flags: [], range: 2, bestEffort: false },
+    { flags: ["--range", "1", "--best-effort"], range: 1, bestEffort: true },
+  ])("approaches a track with context and finite-action wait options %j", async ({ flags, range, bestEffort }) => {
+    const { program, handlers } = makeProgram();
+    const context = encodeActionContext(runtimeId, 2), track = `${runtimeTag}:e7`;
+    await program.parseAsync(["node", "mc-agent", "navigate", "approach", "--track", track, ...flags, "--context", context, "--wait", "1000", "--no-observe"]);
+    expect(handlers.navigateApproach).toHaveBeenCalledExactlyOnceWith({
+      session: "default", track, range, bestEffort, context, runtimeId, worldEpoch: 2, wait: 1000, observe: false,
+    });
+  });
+
+  it.each([
     { flags: [], resources: undefined },
     { flags: ["--resource", "movement,item", "--resource", "look,movement"], resources: ["movement", "item", "look"] },
   ])("stops the selected resources immediately with observation context %j", async ({ flags, resources }) => {
@@ -106,6 +118,7 @@ describe("CLI protocol", () => {
     ["world", "wake"],
     ["world", "dig", "--x", "bad", "--y", "64", "--z", "0"],
     ["navigate", "goto", "--x", "bad", "--y", "64", "--z", "0"],
+    ["navigate", "approach", "--track", "bad"],
     ["action", "cancel", "--action", "bad"],
   ])("reports missing context before physical argument validation %j", async (...args) => {
     const { program, handlers, stdout } = makeProgram();

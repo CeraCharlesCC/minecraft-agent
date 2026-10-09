@@ -306,6 +306,14 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       });
     },
 
+    async navigateApproach(input) {
+      const record = await loadSessionForClient(input.session);
+      return daemonRequest(record, "/navigate/approach", {
+        method: "POST",
+        body: JSON.stringify({ ...context(input), track: input.track, range: input.range, bestEffort: input.bestEffort }),
+      });
+    },
+
     async navigateFollow(input) {
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/navigate/follow", {

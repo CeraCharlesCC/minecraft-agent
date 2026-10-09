@@ -168,6 +168,8 @@ const navigateFollowSchema = physicalSchema.extend({
   range: z.coerce.number().positive().max(32).default(2),
 });
 
+const navigateApproachSchema = navigateFollowSchema.extend({ bestEffort: z.boolean().default(false) });
+
 const navigateConfigureSchema = physicalSchema.extend({
   allowDig: z.boolean().optional(),
   allowPlace: z.boolean().optional(),
@@ -624,6 +626,15 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .action((opts, cmd) => commandRunner(cmd, io, () => handlers.navigateGoto(navigateGotoSchema.parse(opts)))());
 
   navigate
+    .command("approach")
+    .description("Approach a loaded entity once; optionally stop at the best position found")
+    .requiredOption("--track <track>", "loaded track from observe frame")
+    .option("--range <blocks>", "distance between observed feet positions", "2")
+    .option("--best-effort", "allow partial approach when the requested range is unreachable", false)
+    .option("--session <name>", "session name", "default")
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.navigateApproach(navigateApproachSchema.parse(opts)))());
+
+  navigate
     .command("follow")
     .description("Continuously follow a loaded entity track")
     .requiredOption("--track <track>", "loaded track from observe frame")
@@ -1026,7 +1037,7 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
   const physicalCommands: Record<string, readonly string[]> = {
     control: ["tap", "set"],
     look: ["at", "track"],
-    navigate: ["goto", "follow", "configure"],
+    navigate: ["goto", "approach", "follow", "configure"],
     collect: ["item"],
     inventory: ["equip", "unequip", "quickbar", "toss", "consume", "fish", "activate-item", "craft"],
     world: ["dig", "place", "place-entity", "activate", "update-sign", "sleep", "wake", "elytra-fly"],
