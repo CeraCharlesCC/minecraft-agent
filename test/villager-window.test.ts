@@ -52,7 +52,13 @@ function runtime(species = "villager") {
   function open() {
     return controller.runAction("window.open-entity", ["window", "look"], () => controller.openEntityWindow(track), track);
   }
-  return { controller, bot, packetWrites, open, openWindow, sendTrades };
+  async function readyWindow() {
+    const action = open();
+    openWindow(); sendTrades();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(controller.actions.get(action.action).state).toBe("completed");
+  }
+  return { controller, bot, packetWrites, open, openWindow, sendTrades, readyWindow, Item, registry, trades };
 }
 
 describe("villager windows with installed Mineflayer plugins", () => {
@@ -70,7 +76,10 @@ describe("villager windows with installed Mineflayer plugins", () => {
     sendTrades();
     await vi.advanceTimersByTimeAsync(0);
     expect(controller.actions.get(action.action)).toMatchObject({ state: "completed", result: { opened: true, window: { type: "minecraft:merchant" } } });
-    expect(controller.frame()).toMatchObject({ window: { type: "minecraft:merchant" } });
+    expect(controller.frame()).toMatchObject({ window: { type: "minecraft:merchant", tradesKnown: true, trades: [{
+      index: 0, inputItem1: { name: "emerald", count: 1 }, outputItem: { name: "bread", count: 6 },
+      disabled: false, uses: 0, maxUses: 16, remainingUses: 16,
+    }] } });
     expect(bot.currentWindow.trades[0]).toMatchObject({ inputItem1: { name: "emerald" }, outputItem: { name: "bread" }, realPrice: 1 });
     expect(bot._client.listenerCount("trade_list")).toBe(1);
     bot.currentWindow.trades = [];
@@ -137,5 +146,100 @@ describe("villager windows with installed Mineflayer plugins", () => {
     expect(controller.actions.get(action.action)).toMatchObject({ state: "failed", reason: "COMMAND_BLOCKED" });
     expect(packetWrites).not.toHaveBeenCalled();
     expect(bot._client.listenerCount("trade_list")).toBe(0);
+  });
+
+  it("executes the requested number of trades using the installed villager API", async () => {
+    const { controller, bot, packetWrites, readyWindow, Item, registry } = runtime();
+    await readyWindow();
+    const window = bot.currentWindow;
+    const emerald = (count: number) => new Item(registry.itemsByName.emerald.id, count);
+    window.updateSlot(window.inventoryStart, emerald(2));
+    // Simulate server inventory updates when Mineflayer takes the output.
+    bot.putAway = vi.fn(async (slot: number) => {
+      expect(slot).toBe(2);
+      expect(window.slots[slot].name).toBe("bread");
+      const remaining = window.slots[0]?.count - 1;
+      window.updateSlot(0, remaining > 0 ? emerald(remaining) : null);
+      window.updateSlot(2, remaining > 0 ? new Item(registry.itemsByName.bread.id, 6) : null);
+      window.updateSlot(window.inventoryStart + 1, new Item(registry.itemsByName.bread.id, 6 * bot.putAway.mock.calls.length));
+    });
+    const action = controller.runAction("window.trade", ["window", "item"], () => controller.windowTrade(0, 2));
+    expect(packetWrites).toHaveBeenCalledWith("select_trade", { slot: 0 });
+    window.updateSlot(window.inventoryStart, null);
+    window.updateSlot(0, emerald(2));
+    window.updateSlot(2, new Item(registry.itemsByName.bread.id, 6));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(bot.putAway).toHaveBeenCalledTimes(2);
+    expect(controller.actions.get(action.action)).toMatchObject({ state: "completed", result: {
+      traded: true, index: 0, count: 2, window: { selectedTradeIndex: 0, trades: [{ uses: 2, remainingUses: 14 }] },
+    } });
+    expect(controller.frame()).toMatchObject({ window: { trades: [{ uses: 2 }], slots: [{ name: "bread", count: 12 }] } });
+    expect(bot.currentWindow).toBe(window);
+  });
+
+  it("blocks missing materials and sold-out offers before selecting a trade", async () => {
+    const { controller, bot, packetWrites, readyWindow } = runtime();
+    await readyWindow(); packetWrites.mockClear();
+    await expect(controller.windowTrade(0, 1)).rejects.toMatchObject({ code: "COMMAND_BLOCKED" });
+    const trade = bot.currentWindow.trades[0];
+    trade.tradeDisabled = true;
+    await expect(controller.windowTrade(0, 1)).rejects.toMatchObject({ code: "COMMAND_BLOCKED" });
+    trade.tradeDisabled = false; trade.nbTradeUses = 15;
+    await expect(controller.windowTrade(0, 2)).rejects.toMatchObject({ code: "COMMAND_BLOCKED" });
+    await expect(controller.windowTrade(1, 1)).rejects.toMatchObject({ code: "BAD_INPUT" });
+    for (const [index, count] of [[-1, 1], [0.5, 1], [0, 0], [0, 65]]) {
+      await expect(controller.windowTrade(index!, count!)).rejects.toMatchObject({ code: "BAD_INPUT" });
+    }
+    expect(packetWrites).not.toHaveBeenCalled();
+    controller.closeWindow();
+    await expect(controller.windowTrade(0, 1)).rejects.toMatchObject({ code: "COMMAND_BLOCKED" });
+  });
+
+  it("cancels a pending trade and prevents its later inventory packets", async () => {
+    const { controller, bot, packetWrites, readyWindow, Item, registry } = runtime();
+    await readyWindow();
+    const window = bot.currentWindow;
+    window.updateSlot(window.inventoryStart, new Item(registry.itemsByName.emerald.id, 1));
+    const action = controller.runAction("window.trade", ["window", "item"], () => controller.windowTrade(0, 1));
+    controller.actions.cancel(action.action);
+    packetWrites.mockClear();
+    window.updateSlot(0, new Item(registry.itemsByName.emerald.id, 1));
+    window.updateSlot(2, new Item(registry.itemsByName.bread.id, 6));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(controller.actions.get(action.action).state).toBe("cancelled");
+    expect(bot.currentWindow).toBeNull();
+    expect(packetWrites).not.toHaveBeenCalled();
+  });
+
+  it("uses server-adjusted prices and validates the second input through Mineflayer", async () => {
+    const { controller, bot, packetWrites, readyWindow, Item, registry, trades } = runtime();
+    trades[0]!.inputItem1 = Item.toNotch(new Item(registry.itemsByName.emerald.id, 2));
+    trades[0]!.inputItem2 = Item.toNotch(new Item(registry.itemsByName.book.id, 1));
+    trades[0]!.specialPrice = -1;
+    await readyWindow();
+    expect(controller.frame()).toMatchObject({ window: { trades: [{ inputItem1: { name: "emerald", count: 1 }, inputItem2: { name: "book", count: 1 } }] } });
+    bot.currentWindow.updateSlot(bot.currentWindow.inventoryStart, new Item(registry.itemsByName.emerald.id, 1));
+    packetWrites.mockClear();
+    await expect(controller.windowTrade(0, 1)).rejects.toMatchObject({ code: "COMMAND_BLOCKED" });
+    expect(packetWrites).not.toHaveBeenCalled();
+  });
+
+  it.each(["select_trade", "custom_payload"])("suppresses delayed %s selection after cancellation", async packet => {
+    const { controller, bot, packetWrites, readyWindow } = runtime();
+    await readyWindow();
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    bot.trade = async () => {
+      await pending;
+      bot._client.write(packet, packet === "select_trade" ? { slot: 0 } : { channel: "MC|TrSel", data: Buffer.alloc(4) });
+    };
+    const action = controller.runAction("window.trade", ["window", "item"], () => controller.windowTrade(0, 1));
+    expect(controller.actions.owner("item")).toBe(action.action);
+    expect(controller.actions.owner("window")).toBe(action.action);
+    controller.actions.cancel(action.action);
+    packetWrites.mockClear(); release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(controller.actions.get(action.action).state).toBe("cancelled");
+    expect(packetWrites).not.toHaveBeenCalled();
   });
 });

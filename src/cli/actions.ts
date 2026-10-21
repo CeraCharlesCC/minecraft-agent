@@ -526,6 +526,14 @@ export function createCliHandlers(entryPoint = fileURLToPath(import.meta.url)): 
       });
     },
 
+    async windowTrade(input) {
+      const record = await loadSessionForClient(input.session);
+      return daemonRequest(record, "/window/trade", {
+        method: "POST",
+        body: JSON.stringify({ ...context(input), index: input.index, count: input.count }),
+      });
+    },
+
     async windowClose(input) {
       const record = await loadSessionForClient(input.session);
       return daemonRequest(record, "/window/close", { method: "POST", body: JSON.stringify(context(input)) });

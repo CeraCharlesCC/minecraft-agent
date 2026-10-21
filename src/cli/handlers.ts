@@ -232,6 +232,11 @@ export interface WindowClickInput extends SessionInput {
   mode: number;
 }
 
+export interface WindowTradeInput extends SessionInput {
+  index: number;
+  count: number;
+}
+
 export interface DaemonRunInput extends StartSessionInput {
   controlPort: number;
 }
@@ -295,6 +300,7 @@ export interface CliHandlers {
   windowDeposit(input: WindowItemInput): Promise<unknown>;
   windowWithdraw(input: WindowItemInput): Promise<unknown>;
   windowClick(input: WindowClickInput): Promise<unknown>;
+  windowTrade(input: WindowTradeInput): Promise<unknown>;
   windowClose(input: SessionInput): Promise<unknown>;
   entityFind(input: EntityFindInput): Promise<unknown>;
   entityInspect(input: EntityInput): Promise<unknown>;

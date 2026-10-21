@@ -256,6 +256,11 @@ const windowClickSchema = physicalSchema.extend({
   mode: z.coerce.number().int().min(0).max(6).default(0),
 });
 
+const windowTradeSchema = physicalSchema.extend({
+  index: z.coerce.number().int().min(0).max(4096),
+  count: z.coerce.number().int().min(1).max(64).default(1),
+});
+
 const entityFindSchema = sessionSchema.extend({
   name: z.string().min(1).optional(),
   radius: z.coerce.number().positive().max(256).default(32),
@@ -910,6 +915,14 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     .action((opts, cmd) => commandRunner(cmd, io, () => handlers.windowClick(windowClickSchema.parse(opts)))());
 
   window
+    .command("trade")
+    .description("Execute a trade in the current villager window")
+    .requiredOption("--index <index>", "zero-based index from window.trades")
+    .option("--count <count>", "number of trade executions (1–64)", "1")
+    .option("--session <name>", "session name", "default")
+    .action((opts, cmd) => commandRunner(cmd, io, () => handlers.windowTrade(windowTradeSchema.parse(opts)))());
+
+  window
     .command("close")
     .description("Close the current window")
     .option("--session <name>", "session name", "default")
@@ -1041,7 +1054,7 @@ export function buildProgram(handlers: CliHandlers, io: CliIo, version = "0.0.0"
     collect: ["item"],
     inventory: ["equip", "unequip", "quickbar", "toss", "consume", "fish", "activate-item", "craft"],
     world: ["dig", "place", "place-entity", "activate", "update-sign", "sleep", "wake", "elytra-fly"],
-    window: ["open-block", "open-entity", "deposit", "withdraw", "close"],
+    window: ["open-block", "open-entity", "deposit", "withdraw", "trade", "close"],
     entity: ["interact", "attack", "mount", "dismount", "move-vehicle"],
     action: ["cancel", "stop"],
     advanced: ["look", "window-click", "navigate-configure"],

@@ -13,7 +13,7 @@ import { installSelfOxygen } from "./self-oxygen.js";
 import { CanonicalChat } from "../core/chat.js";
 import { ActionManager, ActionResource } from "../core/actions.js";
 import { decodeActionContext, encodeActionContext } from "../core/context.js";
-import { CliError, commandBlocked, contextRequired } from "../output/errors.js";
+import { CliError, badInput, commandBlocked, contextRequired } from "../output/errors.js";
 import { normalizeRegistryName } from "../core/registry.js";
 import { API_VERSION } from "../core/protocol.js";
 import { queryBlockRay } from "./ray-query.js";
@@ -166,6 +166,8 @@ type MineflayerWindow = {
   hotbarStart?: number;
   hotbarEnd?: number;
   selectedItem?: MineflayerItem | null;
+  trades?: { tradeDisabled?: boolean; nbTradeUses: number; maximumNbTradeUses: number }[] | null;
+  trade?(index: number, count: number): Promise<void>;
   close?(): void;
   deposit?(itemType: number, metadata: number | null, count: number | null): Promise<void>;
   withdraw?(itemType: number, metadata: number | null, count: number | null): Promise<void>;
@@ -1056,11 +1058,12 @@ export class BotController {
     if (!client) return;
     const write = client.write.bind(client);
     const mutations = new Set(["use_entity", "block_place", "block_dig", "window_click", "held_item_slot",
-      "arm_animation", "entity_action", "use_item", "vehicle_move", "steer_vehicle", "update_sign", "close_window"]);
+      "arm_animation", "entity_action", "use_item", "vehicle_move", "steer_vehicle", "update_sign", "close_window", "select_trade"]);
     client.write = (name, params) => {
       if (bot !== this.bot || generation !== this.generation) return;
       const context = this.execution.getStore();
-      if (context && mutations.has(name)) {
+      const legacyTradeSelection = name === "custom_payload" && (params as { channel?: string } | null)?.channel === "MC|TrSel";
+      if (context && (mutations.has(name) || legacyTradeSelection)) {
         // AsyncLocalStorage follows Mineflayer's internal promises and timers.
         // Already-sent operations remain server-owned, but a stale continuation
         // may not send the next operation after cancellation or rebinding.
@@ -1706,6 +1709,32 @@ export class BotController {
     const window = this.requireWindow();
     await this.requireMethod("clickWindow").call(this.requireBot(), slot, mouseButton, mode);
     return { clicked: true, slot, mouseButton, mode, window: serializeWindow(this.requireBot().currentWindow ?? window) };
+  }
+
+  async windowTrade(index: number, count: number) {
+    if (!Number.isSafeInteger(index) || index < 0 || index > 4096 || !Number.isSafeInteger(count) || count < 1 || count > 64) {
+      throw badInput("Trade index must be 0–4096 and count must be 1–64.");
+    }
+    const window = this.requireWindow();
+    if (!["minecraft:merchant", "minecraft:villager"].includes(window.type ?? "") || !window.trade || !Array.isArray(window.trades)) {
+      throw commandBlocked("Current window does not support trading or its offers are not ready.", "Open a villager with window open-entity and wait for its trade list.");
+    }
+    const trade = window.trades[index];
+    if (!trade) throw badInput("Trade index is not present in the current window.");
+    if (trade.tradeDisabled || trade.maximumNbTradeUses - trade.nbTradeUses < count) {
+      throw commandBlocked("The selected trade is disabled or has too few uses remaining.", "Observe the current trade list.");
+    }
+    const verify = this.continuationGuard(["window", "item"]);
+    try { await window.trade(index, count); }
+    catch (error) {
+      if (error instanceof Error && /^Not enough item [12] to trade$/.test(error.message)) {
+        throw commandBlocked("Not enough input items for the requested trade count.", "Observe inventory and the current trade prices.");
+      }
+      throw error;
+    }
+    verify();
+    if (this.requireBot().currentWindow !== window) throw commandBlocked("The trading window changed during the action.", "Observe a fresh frame.");
+    return { traded: true, index, count, window: serializeWindow(window) };
   }
 
   closeWindow() {

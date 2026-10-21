@@ -58,6 +58,14 @@ afterEach(() => {
 });
 
 describe("CLI actions", () => {
+  it("transmits the selected trade and count with context and response preferences", async () => {
+    const { handlers, mocks } = await loadActionsWithMocks();
+    await handlers.windowTrade({ session: "default", index: 0, count: 2, context: "context", wait: 1000, observe: false });
+    const [, path, options] = mocks.daemonRequest.mock.calls[0]!;
+    expect(path).toBe("/window/trade");
+    expect(options.method).toBe("POST");
+    expect(JSON.parse(options.body)).toEqual({ index: 0, count: 2, context: "context", wait: 1000, observe: false });
+  });
   it("transmits partial-approach opt-in with context and response preferences", async () => {
     const { handlers, mocks } = await loadActionsWithMocks();
     await handlers.navigateApproach({ session: "default", track: "track", range: 1, bestEffort: true,

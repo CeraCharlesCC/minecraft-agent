@@ -69,6 +69,7 @@ Prefix each row with \`mc-agent\` (or the harness wrapper). \`<…>\` needs a va
 * window open-entity --track <track>
 * window deposit --item <name> [--count 1]
 * window withdraw --item <name> [--count 1]
+* window trade --index <index> [--count 1]
 * window close
 
   entity find [--name <name>] [--types <species>] [--radius 32] [--limit 50]

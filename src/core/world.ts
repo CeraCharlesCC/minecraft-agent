@@ -218,12 +218,36 @@ function publicSlots(input: ReturnType<typeof slotObservation>, detail: "compact
   }
   return { known: true, ...(input.slotCount !== null ? { slotCount: input.slotCount } : {}), slots };
 }
+function projectTrade(input: unknown, index: number, detail: "compact" | "full") {
+  const trade = input as Record<string, unknown> | null;
+  if (!trade || typeof trade !== "object") return { index };
+  const result: Record<string, unknown> = { index };
+  for (const key of ["inputItem1", "inputItem2", "outputItem"]) {
+    const item = projectItem(trade[key], detail);
+    if (!item?.name) continue;
+    // Mineflayer's realPrice includes demand and reputation adjustments.
+    if (key === "inputItem1" && typeof trade.realPrice === "number" && Number.isFinite(trade.realPrice)) item.count = trade.realPrice;
+    result[key] = item;
+  }
+  if (typeof trade.tradeDisabled === "boolean") result.disabled = trade.tradeDisabled;
+  for (const [source, target] of [["nbTradeUses", "uses"], ["maximumNbTradeUses", "maxUses"]] as const) {
+    if (typeof trade[source] === "number" && Number.isSafeInteger(trade[source])) result[target] = trade[source];
+  }
+  if (typeof result.uses === "number" && typeof result.maxUses === "number") {
+    result.remainingUses = Math.max(0, result.maxUses - result.uses);
+  }
+  return result;
+}
 function observeWindow(input: unknown): unknown {
   if (!input || typeof input !== "object") return null;
   const window = input as Record<string, unknown>;
   const fallback = typeof window.items === "function" ? window.items.call(window) : typeof window.containerItems === "function" ? window.containerItems.call(window) : undefined;
   const title = typeof window.title === "string" ? window.title : window.title && typeof window.title === "object" && window.title.toString !== Object.prototype.toString ? String(window.title) : undefined;
+  const merchant = window.type === "minecraft:merchant" || window.type === "minecraft:villager";
+  const trades = Array.isArray(window.trades) ? window.trades.map((trade, index) => projectTrade(trade, index, "full")) : undefined;
+  const selectedTradeIndex = Array.isArray(window.trades) ? window.trades.indexOf(window.selectedTrade) : -1;
   return { id: window.id, type: window.type, title,
+    ...(merchant ? { tradesKnown: trades !== undefined, ...(trades ? { trades } : {}), ...(selectedTradeIndex >= 0 ? { selectedTradeIndex } : {}) } : {}),
     observation: slotObservation(window.slots, fallback, true), inventoryStart: window.inventoryStart, inventoryEnd: window.inventoryEnd,
     hotbarStart: window.hotbarStart, hotbarEnd: window.hotbarEnd, selectedItem: projectItem(window.selectedItem, "full") };
 }
@@ -232,6 +256,13 @@ function projectWindowObservation(input: unknown, detail: "compact" | "full"): R
   const window = input as Record<string, unknown>, result: Record<string, unknown> = {};
   for (const key of ["id", "inventoryStart", "inventoryEnd", "hotbarStart", "hotbarEnd"]) if (typeof window[key] === "number" && Number.isFinite(window[key])) result[key] = window[key];
   for (const key of ["type", "title"]) if (typeof window[key] === "string") result[key] = window[key];
+  if (typeof window.tradesKnown === "boolean") result.tradesKnown = window.tradesKnown;
+  if (Array.isArray(window.trades)) result.trades = window.trades.map(value => {
+    const trade = { ...value };
+    for (const key of ["inputItem1", "inputItem2", "outputItem"]) if (trade[key]) trade[key] = projectItem(trade[key], detail);
+    return trade;
+  });
+  if (typeof window.selectedTradeIndex === "number") result.selectedTradeIndex = window.selectedTradeIndex;
   const selectedItem = projectItem(window.selectedItem, detail);
   return { ...result, ...publicSlots(window.observation as ReturnType<typeof slotObservation>, detail), ...(selectedItem ? { selectedItem } : {}) };
 }

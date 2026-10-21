@@ -117,6 +117,31 @@ afterEach(async () => {
 });
 
 describe("daemon server", () => {
+  it("serves villager trades as window/item actions with the updated offers in observations", async () => {
+    const daemon = await responseDaemon("villager-trade");
+    const offer = { inputItem1: { name: "emerald", count: 1 }, realPrice: 1, outputItem: { name: "bread", count: 6 },
+      tradeDisabled: false, nbTradeUses: 0, maximumNbTradeUses: 16 };
+    const trade = vi.fn(async (_index: number, count: number) => { offer.nbTradeUses += count; });
+    Object.assign(daemon.bot.currentWindow, { type: "minecraft:merchant", trades: [offer], trade });
+    try {
+      const denied = await daemon.post("/window/trade", { index: 0 });
+      expect(await denied.json()).toMatchObject({ code: "CONTEXT_REQUIRED" });
+      for (const body of [{ index: -1 }, { index: 0.5 }, { index: 4097 }, { index: 0, count: 0 }, { index: 0, count: 65 }]) {
+        const response = await daemon.post("/window/trade", { context: daemon.context, ...body });
+        expect(response.status).toBe(400);
+        expect(await response.json()).toMatchObject({ code: "BAD_INPUT" });
+      }
+      expect(trade).not.toHaveBeenCalled();
+      const response = await daemon.post("/window/trade", { context: daemon.context, index: 0, count: 2, wait: 1000 });
+      expect(await response.json()).toMatchObject({ kind: "window.trade", state: "completed", timedOut: false,
+        result: { traded: true, index: 0, count: 2, window: { trades: [{ uses: 2, remainingUses: 14 }] } },
+        observation: { window: { tradesKnown: true, trades: [{ uses: 2, remainingUses: 14 }] } } });
+      const single = await daemon.post("/window/trade", { context: daemon.context, index: 0, wait: 1000, observe: false });
+      expect(await single.json()).toMatchObject({ state: "completed", result: { count: 1 } });
+      expect(trade.mock.calls).toEqual([[0, 2], [0, 1]]);
+    } finally { await daemon.close(); }
+  });
+
   it("serves finite track approach and rejects invalid direct HTTP options", async () => {
     const daemon = await responseDaemon("approach");
     try {

@@ -58,6 +58,20 @@ function makeProgram(version = "0.0.0") {
 
 describe("CLI protocol", () => {
 
+  it.each([{ flags: [], count: 1 }, { flags: ["--count", "3"], count: 3 }])("trades with observation context and bounded wait %j", async ({ flags, count }) => {
+    const { program, handlers } = makeProgram();
+    const context = encodeActionContext(runtimeId, 2);
+    await program.parseAsync(["node", "mc-agent", "window", "trade", "--index", "0", ...flags, "--context", context, "--wait", "1000", "--no-observe"]);
+    expect(handlers.windowTrade).toHaveBeenCalledExactlyOnceWith({ session: "default", index: 0, count, context, runtimeId, worldEpoch: 2, wait: 1000, observe: false });
+  });
+
+  it.each([["-1", "1"], ["0.5", "1"], ["4097", "1"], ["0", "0"], ["0", "65"]])("rejects invalid trade index/count %s/%s", async (index, count) => {
+    const { program, handlers } = makeProgram();
+    await expect(program.parseAsync(["node", "mc-agent", "window", "trade", "--index", index, "--count", count,
+      "--context", encodeActionContext(runtimeId, 2)])).rejects.toMatchObject({ code: "BAD_INPUT" });
+    expect(handlers.windowTrade).not.toHaveBeenCalled();
+  });
+
   it.each([
     { flags: [], range: 2, bestEffort: false },
     { flags: ["--range", "1", "--best-effort"], range: 1, bestEffort: true },
@@ -116,6 +130,7 @@ describe("CLI protocol", () => {
 
   it.each([
     ["world", "wake"],
+    ["window", "trade", "--index", "0"],
     ["world", "dig", "--x", "bad", "--y", "64", "--z", "0"],
     ["navigate", "goto", "--x", "bad", "--y", "64", "--z", "0"],
     ["navigate", "approach", "--track", "bad"],

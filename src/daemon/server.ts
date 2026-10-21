@@ -29,7 +29,7 @@ const physicalRoutes = new Set([
   "/inventory/fish", "/inventory/activate-item", "/inventory/craft",
   "/world/dig", "/world/place", "/world/place-entity", "/world/activate", "/world/update-sign",
   "/world/sleep", "/world/wake", "/world/elytra-fly", "/window/open-block", "/window/open-entity",
-  "/window/deposit", "/window/withdraw", "/advanced/window-click", "/window/close", "/entity/interact",
+  "/window/deposit", "/window/withdraw", "/window/trade", "/advanced/window-click", "/window/close", "/entity/interact",
   "/entity/attack", "/entity/mount", "/entity/dismount", "/entity/move-vehicle",
 ]);
 
@@ -436,6 +436,7 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
           case "/window/open-entity": target = track(); resources = ["window", "look"]; run = () => controller.openEntityWindow(target!); break;
           case "/window/deposit": { const item = text("item"), count = integer("count",1,2304,1); resources = ["window", "item"]; run = () => controller.windowDeposit(item,count); break; }
           case "/window/withdraw": { const item = text("item"), count = integer("count",1,2304,1); resources = ["window", "item"]; run = () => controller.windowWithdraw(item,count); break; }
+          case "/window/trade": { const index = integer("index",0,4096), count = integer("count",1,64,1); resources = ["window", "item"]; run = () => controller.windowTrade(index,count); break; }
           case "/advanced/window-click": { const slot = integer("slot",0,4096), button = integer("mouseButton",0,1,0), mode = integer("mode",0,6,0); resources = ["window", "item"]; run = () => controller.windowClick(slot,button,mode); break; }
           case "/window/close": resources = ["window"]; run = () => controller.closeWindow(); break;
           case "/entity/interact": target = track(); resources = ["look", "item"]; run = () => controller.interactEntity(target!); break;

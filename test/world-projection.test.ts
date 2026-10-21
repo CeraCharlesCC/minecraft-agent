@@ -60,6 +60,36 @@ describe("v3 public world projection", () => {
     expect(projectWindow({ items: () => [{ name: "apple", count: 1, slot: 37 }] })).toEqual({ known: true, slots: [{ name: "apple", count: 1, slot: 37 }] });
   });
 
+  it("projects current merchant prices, second inputs and enchanted outputs without retaining live data", () => {
+    const bot = fixture(), world = new WorldModel(new EventStore());
+    const trade = { inputItem1: { name: "emerald", count: 20 }, realPrice: 12,
+      inputItem2: { name: "book", count: 1 }, outputItem: { name: "enchanted_book", count: 1, enchants: [{ name: "mending", lvl: 1 }], nbt: { private: true } },
+      tradeDisabled: false, nbTradeUses: 2, maximumNbTradeUses: 12 };
+    const window = { type: "minecraft:merchant", slots: [], trades: [trade], selectedTrade: trade };
+    bot.currentWindow = window;
+    const expected = { type: "minecraft:merchant", known: true, slotCount: 0, slots: [], tradesKnown: true, selectedTradeIndex: 0,
+      trades: [{ index: 0, inputItem1: { name: "emerald", count: 12 }, inputItem2: { name: "book", count: 1 },
+        outputItem: { name: "enchanted_book", count: 1, enchants: [{ name: "mending", lvl: 1 }] },
+        disabled: false, uses: 2, maxUses: 12, remainingUses: 10 }] };
+    for (const detail of ["compact", "full"] as const) {
+      expect(world.frame(bot, ready, { detail }).window).toEqual(expected);
+      expect(projectWindow(window, detail)).toEqual(expected);
+    }
+    const baseline = world.frame(bot, ready);
+    trade.realPrice = 15; trade.nbTradeUses = 12; trade.tradeDisabled = true;
+    expect(baseline.window).toEqual(expected);
+    expect(trade.inputItem1.count).toBe(20);
+    expect(world.frame(bot, ready, { since: baseline.frame })).toMatchObject({ type: "delta", delta: { changed: {
+      window: { trades: [{ inputItem1: { count: 15 }, disabled: true, remainingUses: 0 }] },
+    } } });
+  });
+
+  it("distinguishes an unreceived merchant trade list from an empty list", () => {
+    expect(projectWindow({ type: "minecraft:merchant", trades: null })).toEqual({ type: "minecraft:merchant", known: false, tradesKnown: false });
+    expect(projectWindow({ type: "minecraft:villager", trades: [] })).toEqual({ type: "minecraft:villager", known: false, tradesKnown: true, trades: [] });
+    expect(projectWindow({ type: "minecraft:chest" })).not.toHaveProperty("tradesKnown");
+  });
+
   it("observes current vehicle through a loaded track and distinguishes unacquired state", () => {
     const bot = fixture(), world = new WorldModel(new EventStore());
     const vehicle = { id: 7, name: "boat", type: "object", position: { x: 2, y: 64, z: 0 } };
